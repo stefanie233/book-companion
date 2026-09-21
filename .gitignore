@@ -1,0 +1,82 @@
+# Secrets
+.env
+
+# Design docs (kept local, not versioned)
+docs/
+
+# Data (gitignored — user data)
+data/config/
+data/sessions/
+data/memory/
+data/bookbank/
+data/.input_history
+data/book-companion.db
+data/book-companion.db-*
+data/wingman.db
+data/wingman.db-*
+data/memory.db
+data/memory.db-*
+data/books.db
+data/books.db-*
+data/sessions.db
+data/sessions.db-*
+data/context_log.db
+data/context_log.db-*
+data/graphs/
+data/fixtures/
+data/logs/
+data/watch/
+data/.migrated_to_sqlite
+
+# User-uploaded content
+roles/avatars/
+
+# Generated role cards (regenerable from BookGraph)
+roles/graph_*.md
+
+# Generated voice files
+data/voice/
+data/scenes/
+
+# Local AI models
+data/models/
+
+# Local tokenizer files (vendor presets — heavy, machine-local)
+data/tokenizers/
+
+# Code intelligence indices
+.codegraph/
+.understand-anything/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Test artifacts
+data/test_*/
+agents/
+refinement/
+
+# Scratch
+_write_plan.py
+book-companion-share-*.tar.gz
+
+# Local settings
+.claude/settings.local.json
+
+# Claude Code tooling (not project code)
+.claude/skills/
+.impeccable/
+# settings.json 里攒的是本机一次性 Bash 授权（绝对路径 + C:\tmp 临时脚本），
+# 换台机器全部失效。要共享的权限规则请先清理再手动 git add -f。
+.claude/settings.json
+
+# Plan-mode design docs (work in progress)
+.claude/plans/

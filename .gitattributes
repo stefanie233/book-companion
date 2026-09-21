@@ -1,0 +1,12 @@
+# 行尾（EOL）钉死规则 —— 背景见 .claude/CLAUDE.md「批处理文件三条硬约束」
+#
+# 本仓库 core.autocrlf=true：入库时 CRLF→LF，检出时 LF→CRLF。这台机器上
+# .bat 往返正常，但 autocrlf=false 的环境（Linux/macOS clone，或 Windows
+# 上装 git 时选了 "Checkout as-is"）检出会拿到裸 LF —— cmd.exe 按错误的
+# 行边界劈行吞行，且报错信息完全指不到真正原因。
+#
+# eol=crlf 不依赖每台机器的 autocrlf 设置：规则跟着仓库走，检出必为 CRLF。
+# 刻意不写 `* text=auto` —— 那会波及全部文件、产生一次性大 diff，而
+# .py/.js/.md 对两种行尾都能吃，没有必要。
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -1,0 +1,911 @@
+/* Console page (driver switching) — isolated from the 4.5k-line style.css.
+   All colors/sizes reference the global token system, so day/night theming
+   follows automatically. Loaded by index.html after style.css.
+
+   Layout (v4): slot status band → two-tier filter (capability × vendor)
+   → provider card grid. Replaces the old cramped summary/slot/row stack. */
+
+/* Opaque bg covers the home shelf's fixed .scene-atmosphere layer
+   (same convention as #page-notes). Column layout mirrors #page-graph:
+   secondary nav bar spans the top, the active view fills the rest. */
+#page-console {
+  background: var(--bg-base);
+  flex-direction: column;
+}
+
+.console-view {
+  flex: 1;
+  min-height: 0;
+  display: flex;            /* JS toggle sets display:'' → falls back here */
+  justify-content: center;  /* centers the 1080px panel column */
+  overflow: hidden;
+}
+
+.console-panel {
+  flex: 1 1 auto;
+  max-width: 1080px;
+  overflow-y: auto;
+  padding: var(--space-xl) var(--space-2xl) var(--space-3xl);
+  min-width: 0;
+}
+
+.console-hint {
+  margin: 0 0 var(--space-xl);
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+}
+
+/* ── Slot status band ─────────────────────────────────────────────── */
+
+.console-band {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: var(--space-md);
+  margin-bottom: var(--space-xl);
+}
+
+.console-band-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-md) var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  cursor: pointer;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+.console-band-card:hover {
+  border-color: var(--accent-soft);
+  background: var(--bg-raised);
+}
+
+.console-band-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.console-sum-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  flex-shrink: 0; background: var(--accent);
+}
+.console-sum-dot.env {
+  background: transparent;
+  border: 1.5px solid var(--text-muted);
+}
+
+.console-band-label {
+  font-weight: 600;
+  font-size: var(--fs-heading);
+  color: var(--text-strong);
+}
+
+.console-band-value {
+  font-size: var(--fs-secondary);
+  color: var(--text-secondary);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.console-band-model {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 5px 8px;
+  font-size: var(--fs-caption);
+  color: var(--text-primary);
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* ── Band model picker: WPS-font-style dropdown panel ─────────────── */
+
+.console-band-acwrap {
+  position: relative;
+  display: flex;
+  gap: 4px;
+}
+.console-band-acwrap .console-band-model { flex: 1; min-width: 0; }
+
+.console-band-caret {
+  flex-shrink: 0;
+  width: 26px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.console-band-caret:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.console-band-ac {
+  display: none;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  z-index: 50;
+}
+.console-band-ac.open {
+  display: flex;
+  flex-direction: column;
+}
+
+.console-ac-search {
+  margin: 8px 8px 4px;
+  padding: 5px 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-caption);
+  font-family: inherit;
+  color: var(--text-primary);
+  flex-shrink: 0;
+  box-sizing: border-box;
+  width: calc(100% - 16px);
+}
+.console-ac-search:focus { outline: none; border-color: var(--accent-soft); }
+
+.console-ac-list {
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0 4px 6px;
+}
+
+.console-ac-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  padding: 6px 10px;
+  font-size: var(--fs-caption);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.console-ac-item:hover { background: var(--accent-soft); }
+
+.console-ac-model {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.console-ac-vendor {
+  flex-shrink: 0;
+  color: var(--text-muted);
+}
+
+.console-ac-empty {
+  padding: 12px;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+}
+
+.console-band-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+  margin-top: auto;
+}
+.console-band-foot .console-test-out { margin-right: auto; }
+
+/* ── Two-tier filter ──────────────────────────────────────────────── */
+
+.console-filterbar {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  padding: var(--space-sm) 0;
+  margin-bottom: var(--space-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.console-frow {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+  flex-wrap: wrap;
+  padding: 4px 0;
+}
+
+.console-flabel {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  flex-shrink: 0;
+  width: 3.5em;
+}
+
+.console-fopt {
+  font-size: var(--fs-secondary);
+  padding: 3px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+.console-fopt:hover { background: var(--bg-raised); }
+.console-fopt.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.console-grid-meta {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  margin: var(--space-xs) 0 var(--space-md);
+}
+
+/* ── Provider card grid ───────────────────────────────────────────── */
+
+.console-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: var(--space-md);
+  margin-bottom: var(--space-lg);
+}
+
+.console-pcard {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color 0.15s ease;
+}
+.console-pcard:hover { border-color: var(--accent-soft); }
+
+.console-pcard-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  flex-wrap: wrap;
+}
+
+.console-pcard-vendor {
+  font-weight: 600;
+  font-size: var(--fs-heading);
+  color: var(--text-strong);
+}
+
+.console-pcard-name {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+}
+
+.console-pcard-model {
+  font-size: var(--fs-secondary);
+  color: var(--text-secondary);
+  font-weight: 600;
+}
+
+.console-pcard-meta {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.console-pcard-foot {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+  flex-wrap: wrap;
+}
+.console-pcard-foot .console-test-out { flex: 1 1 100%; }
+
+.console-pcard-actions {
+  display: flex;
+  gap: var(--space-xs);
+  margin-left: auto;
+  flex-wrap: wrap;
+}
+
+.console-kind-chip {
+  font-size: var(--fs-caption);
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--bg-raised);
+  color: var(--text-muted);
+}
+
+.console-bind-tag {
+  font-size: var(--fs-caption);
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+/* ── Source badge ─────────────────────────────────────────────────── */
+
+.console-src {
+  font-size: var(--fs-caption);
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  white-space: nowrap;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.console-src-on {
+  color: var(--accent);
+  border-color: transparent;
+  background: var(--accent-soft);
+}
+
+/* ── Model rows (editor catalog + provider cards) ─────────────────── */
+
+.console-madd {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+
+.console-mrows {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.console-dialog .console-mrows {
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+/* Card catalog: capped area budget so a 200-model vendor (百炼…) can't
+   stretch the card; contain keeps wheel scrolls from chaining to the page. */
+.console-pcard .console-mrows {
+  max-height: 240px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.console-mrow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--fs-caption);
+  color: var(--text-primary);
+  padding: 3px 0;
+}
+
+.console-mrow-ck {
+  flex-shrink: 0;
+  accent-color: var(--accent);
+}
+
+.console-mrow-id {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 2px 4px;
+  font-family: inherit;
+  font-size: var(--fs-caption);
+  color: var(--text-primary);
+}
+.console-mrow-id::placeholder { color: var(--text-muted); }
+.console-mrow-id:focus {
+  outline: none;
+  border-color: var(--border);
+  background: var(--bg-raised);
+}
+.console-mrow.on .console-mrow-id {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Card rows are click-to-pick (bind buttons consume the pick); the editor
+   dialog reuses .console-mrow, so pointer affordance is scoped to cards. */
+.console-pcard .console-mrow {
+  cursor: pointer;
+  padding: 3px 4px;
+  border-radius: var(--radius-sm);
+}
+.console-pcard .console-mrow:hover { background: var(--bg-raised); }
+.console-pcard .console-mrow.sel { background: var(--accent-soft); }
+.console-pcard .console-mrow.sel .console-mrow-id { color: var(--accent); }
+
+.console-mkind {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 2px 4px;
+  font-size: var(--fs-caption);
+  color: var(--text-primary);
+  flex-shrink: 0;
+}
+
+/* ── Fields ───────────────────────────────────────────────────────── */
+
+.console-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--fs-caption);
+  color: var(--text-secondary);
+}
+
+.console-field input,
+.console-field select {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  font-size: var(--fs-body);
+  color: var(--text-primary);
+}
+.console-field input:disabled { opacity: 0.45; }
+
+.console-effective {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  line-height: var(--lh-tight);
+  word-break: break-all;
+  grid-column: 1 / -1;
+}
+
+.console-test-out { font-size: var(--fs-caption); min-height: 1em; }
+.console-test-out.ok { color: var(--accent); }
+.console-test-out.bad { color: var(--danger); }
+
+/* ── Buttons ──────────────────────────────────────────────────────── */
+
+.console-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 5px 12px;
+  font-size: var(--fs-secondary);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.console-btn:hover { background: var(--accent-soft); border-color: var(--accent-soft); }
+.console-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.console-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.console-btn-primary:hover { background: var(--accent-hover); }
+.console-btn-bind { color: var(--accent); border-color: var(--accent-soft); }
+.console-btn-danger { color: var(--danger); }
+.console-btn-danger:hover { background: var(--danger-soft); border-color: var(--danger-soft); }
+
+/* ── Add card ─────────────────────────────────────────────────────── */
+
+.console-add-card {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-xs);
+  width: 100%;
+  padding: var(--space-md);
+  background: transparent;
+  border: 1.5px dashed var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  font-size: var(--fs-secondary);
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.console-add-card:hover { border-color: var(--accent); color: var(--accent); }
+
+/* ── Editor overlay + toast ───────────────────────────────────────── */
+
+.console-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.console-overlay.open { display: flex; }
+
+.console-dialog {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-xl);
+  width: min(480px, 92vw);
+  box-sizing: border-box;
+  max-height: 90vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-md);
+}
+
+.console-dialog h3 { margin: 0; color: var(--text-strong); }
+.console-dialog .console-field input,
+.console-dialog .console-field select { width: 100%; box-sizing: border-box; }
+
+.console-err { color: var(--danger); font-size: var(--fs-caption); min-height: 1em; }
+
+.console-toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--text-strong);
+  color: var(--bg-base);
+  padding: 8px 16px;
+  border-radius: 999px;
+  font-size: var(--fs-secondary);
+  z-index: 1200;
+  display: none;
+}
+.console-toast.err { background: var(--danger); color: #fff; }
+
+/* ── Console secondary nav (驱动控制台 / 用量分析) ───────────────────── */
+/* Mirrors graph-secnav (style.css): adjacent tab blocks, 2px accent
+   underline, border-top strip. Two deliberate deltas from the graph
+   version's legacy styles: cursor stays pointer (graph's not-allowed was
+   a placeholder) and hover keeps text-primary. */
+.console-secondary-nav {
+  display: flex;
+  gap: 0;
+  padding: 0 var(--space-lg);
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.console-secnav-tab {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: var(--fs-secondary);
+  padding: 8px 16px;
+  transition: color var(--duration-fast) var(--ease-out),
+              border-color var(--duration-fast) var(--ease-out);
+}
+.console-secnav-tab:hover { color: var(--text-primary); }
+.console-secnav-tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* ── Usage view (用量分析) ───────────────────────────────────────────── */
+.usage-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-lg);
+  margin-top: var(--space-lg);
+  position: relative;   /* 总图 tooltip 浮层的定位锚 */
+}
+.usage-card h3 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--fs-secondary);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 var(--space-md);
+}
+/* 模型分类色板:dataviz 校验通过(light/night 两 surface 上 ΔE 达标)。
+   不用 --accent 透明度阶梯——透明度只能编码量级,不能编码模型身份。 */
+#page-console {
+  --chart-c1: #2a78d6;  /* 蓝 */
+  --chart-c2: #eb6834;  /* 橙 */
+  --chart-c3: #1baf7a;  /* 青绿 */
+  --chart-c4: #eda100;  /* 黄 */
+  --chart-c5: #e87ba4;  /* 品红 */
+  --chart-c6: #008300;  /* 绿 */
+  --chart-other: #b3a894; /* 溢出折叠/未记录 — 中性灰,非系列色 */
+}
+html[data-theme="night"] #page-console {
+  --chart-c1: #3987e5;
+  --chart-c2: #d95926;
+  --chart-c3: #199e70;
+  --chart-c4: #c98500;
+  --chart-c5: #d55181;
+  --chart-c6: #008300;
+  --chart-other: #514a42;
+}
+
+/* 统计卡 ×3(请求次数 / tokens 总量 / 错误次数) */
+.usage-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-md);
+  margin-top: var(--space-lg);
+}
+.usage-stat {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md) var(--space-lg);
+}
+.usage-stat-label {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  display: block;
+}
+.usage-stat-value {
+  font-size: var(--fs-heading);
+  font-weight: 600;
+  color: var(--text-strong);
+}
+.usage-stat-sub { font-size: var(--fs-caption); color: var(--text-secondary); }
+
+/* 档案表内的次要标记（如「兜底」） */
+.est { color: var(--text-muted); font-size: var(--fs-caption); }
+
+/* 每日用量堆叠柱状图:列 = flex column 底对齐;段按模型 slot 顺序自下而上
+   堆叠,段高 = 当日该模型 tokens / 当月 max_day × 100%;段间 2px 表面间隙 */
+.usage-chart-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-md);
+}
+.usage-chart-title { font-size: var(--fs-body); color: var(--text-primary); }
+.usage-legend {
+  display: flex;
+  gap: var(--space-md);
+  flex-wrap: wrap;
+  margin-left: auto;
+  font-size: var(--fs-caption);
+  color: var(--text-secondary);
+}
+.usage-legend-dot { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+
+/* 柱状图主体:31 列 flex,底对齐;列即堆叠容器 */
+.usage-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 180px;
+}
+.usage-chart-col {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 2px;
+}
+.usage-chart-seg {
+  border-radius: 2px 2px 0 0;
+  min-height: 2px;
+  animation: usageGrow .5s cubic-bezier(.2, .7, .3, 1) backwards;
+}
+.usage-chart-col.empty .usage-chart-seg { visibility: hidden; }
+.usage-chart-days {
+  display: flex;
+  gap: 3px;
+  margin-top: var(--space-xs);
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+}
+.usage-chart-days span { flex: 1; min-width: 0; text-align: center; }
+.usage-prof-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-caption);
+}
+.usage-prof-table td { padding: 4px 6px; vertical-align: middle; }
+.usage-prof-table input[type="text"],
+.usage-prof-table input:not([type]),
+.usage-prof-table input[type="number"] {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: var(--fs-caption);
+  padding: 4px 6px;
+}
+.usage-prof-actions {
+  display: flex;
+  gap: var(--space-sm);
+  margin-top: var(--space-md);
+}
+.usage-tok-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  margin-top: var(--space-md);
+}
+.usage-tok-row input:not([type="checkbox"]) { flex: 1; }
+
+/* ── 模型细则:每模型一组「调用次数曲线 + tokens 柱状」双图(DeepSeek 式)── */
+.usage-models { display: block; margin-top: var(--space-lg); }
+.usage-msection {
+  position: relative;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-md) var(--space-lg);
+  margin-top: var(--space-md);
+}
+.usage-msection-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  font-size: var(--fs-secondary);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: var(--space-sm);
+}
+.usage-merr {
+  margin-left: auto;
+  font-size: var(--fs-caption);
+  font-weight: 400;
+  color: var(--text-muted);
+}
+/* 双图并排:左=调用次数曲线,右=tokens 柱;窄屏叠为单列 */
+.usage-mcharts { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md); }
+@media (max-width: 720px) { .usage-mcharts { grid-template-columns: 1fr; } }
+/* DeepSeek 式浅色内衬底板:每张小图自带柔和面板,与外层卡片拉开层次 */
+.usage-mchart {
+  background: color-mix(in srgb, var(--text-muted) 5%, transparent);
+  border-radius: var(--radius-md);
+  padding: 12px 12px 8px;
+}
+/* 标题与绘图区留足空隙:y 轴顶部标签上溢约 5px,靠这 12px 呼吸 */
+.usage-mchart-title {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  margin-bottom: 12px;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* ── Onboarding（首次运行引导弹窗）─────────────────────────────────── */
+
+.onboarding-dialog {
+  width: min(430px, 92vw);
+  position: relative;
+}
+.onboarding-sub {
+  margin: 0;
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+.onboarding-keyrow {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.onboarding-keyrow input { flex: 1; min-width: 0; }
+.onboarding-keyrow .console-btn { flex-shrink: 0; padding: 5px 10px; }
+.onboarding-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.onboarding-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 4px;
+  line-height: 1;
+}
+.onboarding-close:hover { color: var(--text-strong); }
+
+/* 输入区「连接 AI 服务」重入按钮：mode-toggle 药丸样式 + 主题色提示 */
+.mode-toggle.onboard-entry {
+  color: var(--accent);
+  border-color: var(--accent-soft);
+}
+.usage-mchart-title b { color: var(--text-strong); font-weight: 600; margin-left: 0; font-size: var(--fs-secondary); }
+/* 输入/输出细分信息独占一行,不再与数值挤在同一行 */
+.usage-mchart-title .sub { margin-left: auto; }
+/* 曲线/柱状共用骨架:y 轴标签 + 满宽 plot + 网格线 */
+.u-line { display: flex; gap: 6px; height: 136px; }
+.u-line-yaxis { position: relative; flex: none; width: 38px; }
+.u-line-yaxis span {
+  position: absolute;
+  right: 0;
+  transform: translateY(-50%);
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+/* 三个刻度标签分别对齐顶部/中部/底部网格线——缺失 top 会导致全部叠在顶端 */
+.u-line-yaxis span:nth-child(1) { top: 0; }
+.u-line-yaxis span:nth-child(2) { top: 50%; }
+.u-line-yaxis span:nth-child(3) { top: 100%; }
+.u-line-plot {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+}
+.u-line-plot svg { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.u-line-gline { position: absolute; left: 0; right: 0; height: 1px; background: var(--border); pointer-events: none; }
+.usage-line-area { opacity: 0.16; }
+.usage-line-svg { animation: usageReveal 0.7s ease-out backwards; }
+.usage-bars { position: absolute; inset: 0; display: flex; align-items: flex-end; gap: 2px; }
+/* DeepSeek 式分段量能柱:单日一根柱,输入(浅)在下、输出(深)在上,颜色同模型色 */
+.usage-bar-col {
+  flex: 1; min-width: 0; height: 100%;
+  display: flex; flex-direction: column; justify-content: flex-end;
+  border-radius: 2px;
+}
+.usage-bar-col.hl { background: color-mix(in srgb, var(--text-muted) 10%, transparent); }
+.usage-bar-col i { display: block; animation: usageGrow 0.5s cubic-bezier(0.2, 0.7, 0.3, 1) backwards; }
+/* hover 指示:竖虚线 + 曲线数据点(模型细则图,DeepSeek 式) */
+.u-hover-line {
+  position: absolute; top: 0; bottom: 0; width: 0;
+  border-left: 1px dashed color-mix(in srgb, var(--text-muted) 55%, transparent);
+  opacity: 0; pointer-events: none; transition: opacity 0.12s ease;
+}
+.u-hover-line.show { opacity: 1; }
+.u-hover-dot {
+  position: absolute; width: 8px; height: 8px; border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 2px solid var(--bg-surface);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  opacity: 0; pointer-events: none; transition: opacity 0.12s ease;
+}
+.u-hover-dot.show { opacity: 1; }
+.usage-mchart-days { display: flex; margin-top: var(--space-xs); font-size: 10px; color: var(--text-muted); }
+.usage-mchart-days span { flex: 1; min-width: 0; text-align: center; }
+/* 总图 hover:列高亮指示带 */
+.usage-chart-col:not(.empty):hover { background: color-mix(in srgb, var(--text-muted) 14%, transparent); border-radius: 3px; }
+
+/* 浮动 tooltip 卡片(替代原生 title) */
+.usage-tip { position: absolute; left: 0; top: 0; z-index: 30; background: var(--bg-raised); border: 1px solid var(--border); border-radius: var(--radius-sm); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14); padding: 10px 12px; min-width: 150px; max-width: 260px; pointer-events: none; opacity: 0; visibility: hidden; transition: opacity 0.15s ease, transform 0.16s ease-out, visibility 0s linear 0.16s; }
+.usage-tip.show { opacity: 1; visibility: visible; transition: opacity 0.15s ease, transform 0.16s ease-out; }
+.usage-tip-date { font-size: var(--fs-caption); color: var(--text-secondary); }
+.usage-tip-total { font-size: var(--fs-body); font-weight: 600; color: var(--text-strong); margin: 2px 0 6px; }
+.usage-tip-row { display: flex; align-items: center; gap: 6px; font-size: var(--fs-caption); color: var(--text-secondary); margin-top: 3px; }
+.usage-tip-row i { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+.usage-tip-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.usage-tip-row b { margin-left: auto; padding-left: 12px; color: var(--text-primary); font-weight: 600; }
+/* 入场动画:柱生长 / 曲线自左向右展开 */
+@keyframes usageGrow {
+  from { height: 0; }
+  to { height: var(--h); }
+}
+@keyframes usageReveal {
+  from { clip-path: inset(0 100% 0 0); }
+  to { clip-path: inset(0 0 0 0); }
+}

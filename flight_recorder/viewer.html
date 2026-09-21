@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html lang="zh" data-theme="day">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>飞行记录仪 - Book Companion</title>
+<link rel="icon" href="data:,"><!-- suppress /favicon.ico 404 -->
+<style>
+  :root {
+    --bg-sunken:     #ede7db;
+    --bg-base:       #f7f3ec;
+    --bg-surface:    #ffffff;
+    --bg-raised:     #f5f0e7;
+    --text-muted:    #9a8e7a;
+    --text-secondary:#6b6050;
+    --text-primary:  #2c2416;
+    --text-strong:   #1a1410;
+    --border:        #d5cec0;
+    --accent:        #b45a2d;
+    --accent-soft:   #b45a2d22;
+    --accent-hover:  #9a4a22;
+    --code-bg:       #f0ebe0;
+    --think-bg:      #e8e0f0;
+    --tool-bg:       #e0ecf0;
+  }
+  html[data-theme="night"] {
+    --bg-sunken:     #141210;
+    --bg-base:       #1b1815;
+    --bg-surface:    #252220;
+    --bg-raised:     #2e2a27;
+    --text-muted:    #6b6458;
+    --text-secondary:#8a8278;
+    --text-primary:  #c8c0b8;
+    --text-strong:   #e8e2da;
+    --border:        #3d3832;
+    --accent:        #e2a45c;
+    --accent-soft:   #e2a45c22;
+    --accent-hover:  #f0b878;
+    --code-bg:       #1e1b18;
+    --think-bg:      #2a2435;
+    --tool-bg:       #1a2528;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* Type scale: 11px (meta) → 13px (body) → 16px (titles) → 19px (page) */
+  body {
+    font-family: "Cascadia Code", "JetBrains Mono", "Consolas", "Microsoft YaHei", monospace;
+    font-size: 14px;
+    background: var(--bg-base);
+    color: var(--text-primary);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+  /* Header */
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 16px;
+    background: var(--bg-surface);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .header h1 { font-size: 24px; color: var(--text-strong); white-space: nowrap; }
+  .header .spacer { flex: 1; }
+  .header button {
+    font: inherit;
+    font-size: 14px;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-surface);
+    color: var(--text-secondary);
+    cursor: pointer;
+  }
+  .header button:hover { background: var(--bg-raised); color: var(--text-primary); }
+  .header button.danger { color: var(--accent); border-color: var(--accent-soft); }
+  .header button.danger:hover { background: var(--accent-soft); }
+  .header .poll-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--accent); opacity: 0.3;
+    transition: opacity 0.3s;
+  }
+  .header .poll-dot.active { opacity: 1; }
+  /* Main layout */
+  .main { display: flex; flex: 1; overflow: hidden; }
+  /* Panels */
+  .panel { display: flex; flex-direction: column; overflow: hidden; }
+  .panel-header {
+    padding: 6px 10px;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    background: var(--bg-sunken);
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .panel-body { flex: 1; overflow-y: auto; }
+  /* Session list */
+  .sessions { width: 240px; border-right: 1px solid var(--border); }
+  .session-item {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .session-item:hover { background: var(--bg-raised); }
+  .session-item.active { background: var(--accent-soft); }
+  .session-item .sid { font-size: 10px; color: var(--text-secondary); word-break: break-all; }
+  .session-item .meta { font-size: 10px; color: var(--text-muted); margin-top: 2px; display: flex; gap: 8px; }
+  /* Round list */
+  .rounds { width: 320px; border-right: 1px solid var(--border); }
+  .round-item {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+  .round-item:hover { background: var(--bg-raised); }
+  .round-item.active { background: var(--accent-soft); }
+  .round-item .r-title { font-size: 18px; color: var(--text-primary); }
+  .round-item .r-title .badge {
+    display: inline-block; font-size: 10px; padding: 1px 5px;
+    border-radius: 3px; margin-left: 4px;
+    background: var(--accent-soft); color: var(--accent);
+  }
+  .round-item .r-meta { font-size: 10px; color: var(--text-muted); margin-top: 3px; display: flex; gap: 8px; flex-wrap: wrap; }
+  /* Detail */
+  .detail { flex: 1; }
+  .detail-body { padding: 12px 16px; }
+  .section {
+    margin-bottom: 16px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .section-title {
+    padding: 6px 10px;
+    font-size: 18px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background: var(--bg-sunken);
+    cursor: pointer;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .section-title:hover { background: var(--bg-raised); }
+  .section-title .arrow { transition: transform 0.2s; font-size: 10px; }
+  .section.collapsed .arrow { transform: rotate(-90deg); }
+  .section.collapsed .section-content { display: none; }
+  .section-content { padding: 10px 12px; max-height: 500px; overflow-y: auto; }
+  /* Message cards -- differentiated by background, not side border */
+  .msg-card {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    background: var(--bg-surface);
+    border-radius: 4px;
+  }
+  .msg-card .role {
+    font-size: 10px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 3px;
+  }
+  .msg-card.role-user { background: var(--accent-soft); }
+  .msg-card.role-assistant { background: var(--bg-raised); }
+  .msg-card.role-tool { background: var(--tool-bg); }
+  .msg-card .content {
+    font-size: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  /* Think blocks */
+  .think-block {
+    background: var(--think-bg);
+    padding: 6px 10px;
+    border-radius: 3px;
+    margin-bottom: 6px;
+    font-size: 14px;
+    color: var(--text-secondary);
+    font-style: italic;
+    white-space: pre-wrap;
+  }
+  .think-label { font-size: 10px; color: var(--text-muted); font-style: normal; margin-bottom: 3px; }
+  /* Tool results -- background-only, no side accent */
+  .tool-result {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    background: var(--tool-bg);
+    border-radius: 4px;
+  }
+  .tool-result .t-name { font-size: 14px; color: var(--accent); margin-bottom: 3px; }
+  .tool-result .t-args { font-size: 10px; color: var(--text-muted); margin-bottom: 3px; word-break: break-all; }
+  .tool-result .t-out { font-size: 14px; white-space: pre-wrap; word-break: break-word; max-height: 200px; overflow-y: auto; }
+  /* Code blocks */
+  pre.json {
+    background: var(--code-bg);
+    padding: 8px 10px;
+    border-radius: 4px;
+    font-size: 14px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 400px;
+    overflow-y: auto;
+    line-height: 1.5;
+  }
+  /* Empty state */
+  .empty {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-muted);
+    font-size: 14px;
+  }
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+
+  /* ── Navigation tabs ─────────────────────────────── */
+  .tabs { display:flex; gap:6px; padding:8px 14px; border-bottom:1px solid var(--border); background:var(--bg-surface); }
+  .tab { padding:5px 16px; border:1px solid var(--border); border-radius:6px; background:var(--bg-base); color:var(--text-secondary); cursor:pointer; font-size:12px; transition:background .15s,color .15s; }
+  .tab:hover { background:var(--bg-raised); color:var(--text-primary); }
+  .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>✈ 上下文飞行记录仪</h1>
+  <div class="poll-dot" id="pollDot"></div>
+  <span style="font-size:10px;color:var(--text-muted)" id="pollStatus">自动刷新 3s</span>
+  <div class="spacer"></div>
+  <button id="btnRefresh" title="手动刷新">↻ 刷新</button>
+  <button id="btnPoll" title="切换自动刷新">⏸ 暂停</button>
+  <button id="btnClear" class="danger" title="清空所有记录">🗑 清空</button>
+</div>
+
+<div class="tabs">
+  <button class="tab active" data-tab="sessions" onclick="switchTab('sessions')">✈ 会话</button>
+  <button class="tab" data-tab="graph" onclick="switchTab('graph')">🕸 图谱</button>
+</div>
+
+<div class="main" id="tab-sessions">
+  <!-- Session list -->
+  <div class="panel sessions">
+    <div class="panel-header">会话 (<span id="sessionCount">0</span>)</div>
+    <div class="panel-body" id="sessionList">
+      <div class="empty">无记录</div>
+    </div>
+  </div>
+  <!-- Round list -->
+  <div class="panel rounds">
+    <div class="panel-header" id="roundHeader">轮次</div>
+    <div class="panel-body" id="roundList">
+      <div class="empty">选择会话</div>
+    </div>
+  </div>
+  <!-- Detail -->
+  <div class="panel detail">
+    <div class="panel-header" id="detailHeader">详情</div>
+    <div class="panel-body" id="detailBody">
+      <div class="empty">选择轮次</div>
+    </div>
+  </div>
+</div>
+
+<div class="main" id="tab-graph" style="display:none">
+  <!-- Extraction run list -->
+  <div class="panel" style="width:320px">
+    <div class="panel-header">提取运行 (<span id="graphRunCount">0</span>)</div>
+    <div class="panel-body" id="graphRunList">
+      <div class="empty">无记录</div>
+    </div>
+  </div>
+  <!-- LLM call list -->
+  <div class="panel rounds">
+    <div class="panel-header" id="graphCallHeader">LLM 调用</div>
+    <div class="panel-body" id="graphCallList">
+      <div class="empty">选择运行</div>
+    </div>
+  </div>
+  <!-- Call detail (prompt / response) -->
+  <div class="panel detail">
+    <div class="panel-header" id="graphDetailHeader">详情</div>
+    <div class="panel-body" id="graphDetailBody">
+      <div class="empty">选择调用</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// Use absolute URL when opened via file://, relative when served by api_server
+const API = (location.protocol === 'http:' || location.protocol === 'https:') ? '' : 'http://127.0.0.1:8765';
+let selectedSession = null;
+let selectedRound = null;
+let polling = true;
+let pollTimer = null;
+
+// ── Helpers ────────────────────────────────────────────
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+  return r.json();
+}
+
+function fmtTime(s) {
+  if (!s) return '';
+  // SQLite datetime('now') stores UTC; convert to local time
+  const d = new Date(s.replace(' ', 'T') + 'Z');
+  if (isNaN(d)) return s.substring(11, 19) || s;
+  return d.toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function fmtChars(n) {
+  if (!n) return '0';
+  if (n < 1024) return n + 'B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + 'K';
+  return (n / 1048576).toFixed(1) + 'M';
+}
+
+// ── Render: Session list ───────────────────────────────
+async function loadSessions() {
+  try {
+    const data = await fetchJSON(`${API}/api/context-log`);
+    const list = document.getElementById('sessionList');
+    const count = data.sessions.length;
+    document.getElementById('sessionCount').textContent = count;
+
+    if (count === 0) {
+      list.innerHTML = '<div class="empty">无记录</div>';
+      return;
+    }
+
+    list.innerHTML = data.sessions.map(s => `
+      <div class="session-item ${s.session_id === selectedSession ? 'active' : ''}"
+           onclick="selectSession('${s.session_id}')">
+        <div class="sid">${s.source ? `<span class="badge">${s.source}</span> ` : ''}${s.session_id.substring(0, 20)}…</div>
+        <div class="meta">
+          <span>${s.round_count} 轮</span>
+          <span>${s.mode || ''}</span>
+          <span>${fmtTime(s.last_at)}</span>
+          <span>${fmtChars(s.total_chars)}</span>
+        </div>
+      </div>
+    `).join('');
+  } catch (e) {
+    console.error('loadSessions:', e);
+  }
+}
+
+// ── Render: Round list ─────────────────────────────────
+async function loadRounds() {
+  if (!selectedSession) return;
+  try {
+    const data = await fetchJSON(`${API}/api/context-log/${selectedSession}`);
+    const list = document.getElementById('roundList');
+    document.getElementById('roundHeader').textContent =
+      `轮次 (${data.rounds.length})`;
+
+    if (data.rounds.length === 0) {
+      list.innerHTML = '<div class="empty">无轮次</div>';
+      return;
+    }
+
+    list.innerHTML = data.rounds.map(r => {
+      const hasTools = (r.tool_calls_len || 0) > 0;
+      const toolBadge = hasTools ? `<span class="badge">🔧 ${r.tool_results_len ? '→' : ''}</span>` : '';
+      return `
+        <div class="round-item ${r.id === selectedRound ? 'active' : ''}"
+             onclick="selectRound(${r.id})">
+          <div class="r-title">
+            T${r.turn_index} R${r.react_round} ${toolBadge}
+          </div>
+          <div class="r-meta">
+            <span>${fmtTime(r.created_at)}</span>
+            <span>${fmtChars(r.char_count)}</span>
+            ${r.response_len ? `<span>resp ${fmtChars(r.response_len)}</span>` : ''}
+            ${r.tools_count ? `<span>${r.tools_count} tools</span>` : ''}
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (e) {
+    console.error('loadRounds:', e);
+  }
+}
+
+// ── Render: Detail ─────────────────────────────────────
+async function loadDetail() {
+  if (!selectedRound) return;
+  try {
+    const r = await fetchJSON(`${API}/api/context-log/${selectedSession}/${selectedRound}`);
+    document.getElementById('detailHeader').textContent =
+      `T${r.turn_index} R${r.react_round} · ${r.mode || ''} · ${fmtTime(r.created_at)}`;
+
+    const body = document.getElementById('detailBody');
+    let html = '<div class="detail-body">';
+
+    // System Prompt
+    html += section('system', `System Prompt (${fmtChars(r.system_prompt?.length || 0)})`,
+      `<pre class="json">${esc(r.system_prompt || '')}</pre>`);
+
+    // Messages
+    let msgsHtml = '';
+    let msgs = [];
+    try {
+      msgs = JSON.parse(r.messages_json || '[]');
+      msgsHtml = msgs.map(m => {
+        const role = m.role || '?';
+        let content = m.content || '';
+        if (typeof content !== 'string') content = JSON.stringify(content, null, 2);
+        // Check for tool_calls in assistant messages
+        let tcHtml = '';
+        if (m.tool_calls) {
+          tcHtml = m.tool_calls.map(tc =>
+          `<div class="tool-result"><div class="t-name">🔧 ${tc.function?.name || tc.name || ''}</div>` +
+          `<div class="t-args">${esc(tc.function?.arguments || tc.arguments || '')}</div></div>`
+        ).join('');
+      }
+        return `<div class="msg-card role-${role}">
+          <div class="role">${role}${m.tool_call_id ? ' · ' + m.tool_call_id.substring(0,8) : ''}</div>
+          <div class="content">${esc(content)}</div>
+          ${tcHtml}
+        </div>`;
+      }).join('');
+    } catch (e) { msgsHtml = '<pre class="json">' + esc(r.messages_json || '') + '</pre>'; }
+    html += section('messages', `Messages (${msgs.length || 0})`, msgsHtml);
+
+    // Response (with think extraction)
+    if (r.response_text) {
+      let respHtml = '';
+      let remaining = r.response_text;
+      while (true) {
+        const ts = remaining.indexOf('<think>');
+        if (ts === -1) {
+          if (remaining) respHtml += `<div class="content">${esc(remaining)}</div>`;
+          break;
+        }
+        if (ts > 0) respHtml += `<div class="content">${esc(remaining.substring(0, ts))}</div>`;
+        const te = remaining.indexOf('</think>', ts + 7);
+        if (te === -1) {
+          respHtml += `<div class="think-block"><div class="think-label">💭 思考</div>${esc(remaining.substring(ts + 7))}</div>`;
+          break;
+        }
+        respHtml += `<div class="think-block"><div class="think-label">💭 思考</div>${esc(remaining.substring(ts + 7, te))}</div>`;
+        remaining = remaining.substring(te + 8);
+      }
+      html += section('response', `Response (${fmtChars(r.response_text.length)})`, respHtml);
+    }
+
+    // Tool calls
+    if (r.tool_calls_json) {
+      let tcHtml = '';
+      try {
+        const tcs = JSON.parse(r.tool_calls_json);
+        tcHtml = tcs.map(tc => `<div class="tool-result">
+          <div class="t-name">🔧 ${tc.name || tc.function?.name || ''}</div>
+          <div class="t-args">${esc(tc.arguments || tc.function?.arguments || '')}</div>
+        </div>`).join('');
+      } catch (e) { tcHtml = `<pre class="json">${esc(r.tool_calls_json)}</pre>`; }
+      html += section('tool_calls', 'Tool Calls', tcHtml);
+    }
+
+    // Tool results
+    if (r.tool_results_json) {
+      let trHtml = '';
+      try {
+        const trs = JSON.parse(r.tool_results_json);
+        trHtml = trs.map(tr => `<div class="tool-result">
+          <div class="t-name">✓ ${tr.name}</div>
+          <div class="t-args">${esc(tr.arguments || '')}</div>
+          <div class="t-out">${esc(tr.result || '')}</div>
+        </div>`).join('');
+      } catch (e) { trHtml = `<pre class="json">${esc(r.tool_results_json)}</pre>`; }
+      html += section('tool_results', 'Tool Results', trHtml);
+    }
+
+    html += '</div>';
+    body.innerHTML = html;
+
+    // Wire section collapse
+    body.querySelectorAll('.section-title').forEach(t => {
+      t.onclick = () => t.parentElement.classList.toggle('collapsed');
+    });
+  } catch (e) {
+    console.error('loadDetail:', e);
+  }
+}
+
+function section(id, title, content) {
+  return `<div class="section" id="sec-${id}">
+    <div class="section-title"><span class="arrow">▼</span> ${title}</div>
+    <div class="section-content">${content}</div>
+  </div>`;
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Selection ──────────────────────────────────────────
+function selectSession(sid) {
+  selectedSession = sid;
+  selectedRound = null;
+  loadSessions();
+  loadRounds();
+  document.getElementById('detailBody').innerHTML = '<div class="empty">选择轮次</div>';
+  document.getElementById('detailHeader').textContent = '详情';
+}
+
+function selectRound(rid) {
+  selectedRound = rid;
+  loadRounds();
+  loadDetail();
+}
+
+// ── Graph tab (BookGraph LLM call logs) ────────────────
+let currentTab = 'sessions';
+let selectedGraphRun = null;
+let selectedGraphCall = null;
+
+function switchTab(name) {
+  currentTab = name;
+  document.querySelectorAll('.tab').forEach(t =>
+    t.classList.toggle('active', t.dataset.tab === name));
+  document.getElementById('tab-sessions').style.display = name === 'sessions' ? '' : 'none';
+  document.getElementById('tab-graph').style.display = name === 'graph' ? '' : 'none';
+  // 清空/暂停/轮询控件只作用于会话 tab
+  ['btnClear', 'btnPoll', 'pollStatus', 'pollDot'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.style.display = name === 'sessions' ? '' : 'none';
+  });
+  if (name === 'graph') loadGraphRuns();
+}
+
+function fmtStatus(s) {
+  const map = { ok: 'ok', timeout: '超时', api_error: 'API错误',
+                parse_failed: '解析失败', exhausted_retries: '重试耗尽' };
+  return map[s] || s || '?';
+}
+
+function highlightGraphSelection() {
+  document.querySelectorAll('#graphRunList .session-item').forEach(el =>
+    el.classList.toggle('active', el.getAttribute('data-run') === selectedGraphRun));
+  document.querySelectorAll('#graphCallList .round-item').forEach(el =>
+    el.classList.toggle('active', el.getAttribute('data-call') === String(selectedGraphCall)));
+}
+
+async function loadGraphRuns() {
+  const list = document.getElementById('graphRunList');
+  try {
+    const data = await fetchJSON(`${API}/api/graph/llm-runs`);
+    const runs = data.runs || [];
+    document.getElementById('graphRunCount').textContent = runs.length;
+    if (!runs.length) { list.innerHTML = '<div class="empty">无提取记录</div>'; return; }
+    list.innerHTML = runs.map(r => `
+      <div class="session-item" data-run="${r.run_id}"
+           onclick="selectGraphRun('${r.run_id}')">
+        <div class="sid">${esc(r.book_title || r.book_id)}</div>
+        <div class="meta">
+          <span>${r.call_count} 调用</span>
+          ${r.fail_count ? `<span class="badge">✗ ${r.fail_count}</span>` : '<span class="badge">✓</span>'}
+          <span>${(r.phases || []).join('/')}</span>
+        </div>
+        <div class="meta" style="font-size:10px;color:var(--text-muted)">${esc(r.run_id)} · ${fmtTime(r.last_at)}</div>
+      </div>
+    `).join('');
+    highlightGraphSelection();
+  } catch (e) {
+    list.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function selectGraphRun(runId) {
+  selectedGraphRun = runId;
+  selectedGraphCall = null;
+  highlightGraphSelection();
+  const list = document.getElementById('graphCallList');
+  const header = document.getElementById('graphCallHeader');
+  try {
+    const data = await fetchJSON(`${API}/api/graph/llm-runs/${runId}/calls`);
+    header.textContent = `LLM 调用 (${data.calls.length})`;
+    if (!data.calls.length) { list.innerHTML = '<div class="empty">无调用</div>'; return; }
+    list.innerHTML = data.calls.map(c => {
+      const bad = c.status !== 'ok';
+      const badge = bad ? `<span class="badge">✗ ${fmtStatus(c.status)}</span>` : '<span class="badge">✓</span>';
+      return `
+        <div class="round-item" data-call="${c.id}"
+             onclick="selectGraphCall('${runId}', ${c.id})">
+          <div class="r-title">${c.phase}${c.batch_index ? ' #' + c.batch_index : ''} ${badge}</div>
+          <div class="r-meta">
+            <span>${fmtTime(c.created_at)}</span>
+            ${c.latency_ms != null ? `<span>${(c.latency_ms / 1000).toFixed(1)}s</span>` : ''}
+            ${c.tokens_in ? `<span>${c.tokens_in}t</span>` : ''}
+            ${c.attempt > 1 ? `<span>重试${c.attempt}</span>` : ''}
+            ${c.error_detail ? `<span>${esc(String(c.error_detail).slice(0, 20))}</span>` : ''}
+          </div>
+        </div>
+      `;
+    }).join('');
+    highlightGraphSelection();
+  } catch (e) {
+    list.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function selectGraphCall(runId, callId) {
+  selectedGraphCall = callId;
+  highlightGraphSelection();
+  const body = document.getElementById('graphDetailBody');
+  const header = document.getElementById('graphDetailHeader');
+  try {
+    const c = await fetchJSON(`${API}/api/graph/llm-runs/${runId}/calls/${callId}`);
+    header.textContent = `详情 · ${c.phase}${c.batch_index ? ' #' + c.batch_index : ''} ${fmtStatus(c.status)}`;
+    const meta = [
+      c.model, c.status,
+      c.latency_ms != null ? (c.latency_ms / 1000).toFixed(1) + 's' : '',
+      c.tokens_in != null ? `in ${c.tokens_in}` : '',
+      c.tokens_out != null ? `out ${c.tokens_out}` : '',
+      c.attempt > 1 ? `attempt ${c.attempt}/${c.max_attempts}` : '',
+    ].filter(Boolean).join(' · ');
+    body.innerHTML =
+      `<div style="padding:8px 12px;font-size:12px;color:var(--text-secondary)">${esc(meta)}</div>` +
+      section('g-prompt', 'Prompt', `<pre class="json">${esc(c.prompt || '')}</pre>`) +
+      section('g-response', 'Response', `<pre class="json">${esc(c.response || '')}</pre>`) +
+      (c.error_detail ? section('g-error', '错误', `<pre class="json">${esc(c.error_detail)}</pre>`) : '');
+    body.querySelectorAll('.section-title').forEach(t => {
+      t.onclick = () => t.parentElement.classList.toggle('collapsed');
+    });
+  } catch (e) {
+    body.innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+// ── Polling ────────────────────────────────────────────
+function poll() {
+  loadSessions();
+  if (selectedSession) loadRounds();
+}
+
+function startPolling() {
+  polling = true;
+  document.getElementById('btnPoll').textContent = '⏸ 暂停';
+  document.getElementById('pollStatus').textContent = '自动刷新 3s';
+  document.getElementById('pollDot').classList.add('active');
+  pollTimer = setInterval(poll, 3000);
+}
+
+function stopPolling() {
+  polling = false;
+  document.getElementById('btnPoll').textContent = '▶ 继续';
+  document.getElementById('pollStatus').textContent = '已暂停';
+  document.getElementById('pollDot').classList.remove('active');
+  clearInterval(pollTimer);
+}
+
+// ── Theme ──────────────────────────────────────────────
+try {
+  const t = localStorage.getItem('bc_shelf_scene');
+  if (t === 'day' || t === 'night') document.documentElement.dataset.theme = t;
+} catch (e) {}
+
+// ── Wire buttons ───────────────────────────────────────
+document.getElementById('btnRefresh').onclick = () => {
+  if (currentTab === 'graph') { loadGraphRuns(); return; }
+  poll();
+  if (selectedRound) loadDetail();
+};
+document.getElementById('btnPoll').onclick = () => polling ? stopPolling() : startPolling();
+document.getElementById('btnClear').onclick = async () => {
+  if (!confirm('清空所有飞行记录？此操作不可撤销。')) return;
+  try {
+    await fetch(`${API}/api/context-log`, { method: 'DELETE' });
+    selectedSession = null;
+    selectedRound = null;
+    poll();
+    document.getElementById('roundList').innerHTML = '<div class="empty">选择会话</div>';
+    document.getElementById('detailBody').innerHTML = '<div class="empty">选择轮次</div>';
+  } catch (e) { alert('清空失败: ' + e.message); }
+};
+
+// ── Init ───────────────────────────────────────────────
+startPolling();
+poll();
+</script>
+</body>
+</html>

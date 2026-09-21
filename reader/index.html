@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="zh" data-theme="day">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Book Companion — 阅读器</title>
+<link rel="icon" href="data:,"><!-- suppress /favicon.ico 404 -->
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="console.css">
+<script>
+  // Apply saved day/night theme before paint to avoid flash of wrong theme.
+  try {
+    var t = localStorage.getItem('bc_shelf_scene');
+    if (t === 'day' || t === 'night') document.documentElement.dataset.theme = t;
+  } catch (e) {}
+</script>
+</head>
+<body>
+
+<!-- Inline SVG sprite for custom icons -->
+<svg style="display:none" aria-hidden="true">
+  <symbol id="icon-graph" viewBox="0 0 24 24">
+    <style>
+      #icon-graph .gpx-a { animation-play-state: var(--gpx-play, paused); }
+      #icon-graph .gpx-hub { transform-box: fill-box; transform-origin: center; animation: gpx-hub 3.6s ease-in-out infinite; }
+      #icon-graph .gpx-rip { transform-box: fill-box; transform-origin: center; vector-effect: non-scaling-stroke; opacity: 0; animation: gpx-rip 3.6s cubic-bezier(.25,.6,.35,1) infinite; }
+      #icon-graph .gpx-rip2 { animation-delay: 1.8s; }
+      #icon-graph .gpx-sp { opacity: .8; animation: gpx-sp 3.6s ease-in-out infinite; }
+      #icon-graph .gpx-nd { transform-box: fill-box; transform-origin: center; opacity: .92; animation: gpx-nd 3.6s cubic-bezier(.3,.7,.4,1) infinite; }
+      #icon-graph .gpx-sat { transform-box: fill-box; transform-origin: center; opacity: .5; animation: gpx-sat 2.8s ease-in-out .9s infinite; }
+      #icon-graph .gpx-d2 { animation-delay: .22s; }
+      #icon-graph .gpx-d3 { animation-delay: .44s; }
+      #icon-graph .gpx-d4 { animation-delay: .66s; }
+      #icon-graph .gpx-d5 { animation-delay: .88s; }
+      #icon-graph .gpx-d6 { animation-delay: 1.1s; }
+      #icon-graph .gpx-d7 { animation-delay: 1.32s; }
+      @keyframes gpx-hub { 0%,100% { transform: scale(1); } 50% { transform: scale(1.14); } }
+      @keyframes gpx-rip { 0% { transform: scale(.24); opacity: .5; } 75% { opacity: 0; } 100% { transform: scale(1); opacity: 0; } }
+      @keyframes gpx-sp { 0% { opacity: .8; } 6% { opacity: 1; } 15%,100% { opacity: .8; } }
+      @keyframes gpx-nd { 0% { transform: scale(1); opacity: .92; } 5% { transform: scale(1.45); opacity: 1; } 9% { transform: scale(.94); opacity: .55; } 14%,100% { transform: scale(1); opacity: .92; } }
+      @keyframes gpx-sat { 0%,100% { transform: scale(1); opacity: .35; } 50% { transform: scale(1.18); opacity: .95; } }
+      @media (prefers-reduced-motion: reduce) { #icon-graph .gpx-a { animation: none !important; } }
+    </style>
+    <circle class="gpx-a gpx-rip" cx="11.4" cy="12.6" r="10.6" fill="none" stroke="currentColor" stroke-width="0.5"/>
+    <circle class="gpx-a gpx-rip gpx-rip2" cx="11.4" cy="12.6" r="10.6" fill="none" stroke="currentColor" stroke-width="0.5"/>
+    <g fill="none" stroke="currentColor" stroke-width="0.42" stroke-linecap="round" opacity="0.32">
+      <line x1="19.4" y1="8.2" x2="17.6" y2="15.8"/>
+      <line x1="17.6" y1="15.8" x2="13.4" y2="19.9"/>
+      <line x1="13.4" y1="19.9" x2="7.4" y2="18.6"/>
+      <line x1="7.4" y1="18.6" x2="4.6" y2="12"/>
+      <line x1="4.6" y1="12" x2="6.8" y2="5.9"/>
+      <line x1="6.8" y1="5.9" x2="13.6" y2="4.4"/>
+      <line x1="13.6" y1="4.4" x2="19.4" y2="8.2"/>
+      <line x1="13.6" y1="4.4" x2="17.6" y2="15.8"/>
+    </g>
+    <line x1="17.6" y1="15.8" x2="21.6" y2="19.4" fill="none" stroke="currentColor" stroke-width="0.4" stroke-linecap="round" stroke-dasharray="1.1 1.5" opacity="0.45"/>
+    <g fill="currentColor">
+      <path class="gpx-a gpx-sp" d="M12.5 12.11 Q17.55 10.15 19.01 9.21 A0.7 0.7 0 0 1 18.34 7.98 Q16.77 8.71 12.4 11.93 Z"/>
+      <path class="gpx-a gpx-sp gpx-d2" d="M12.42 13.24 Q15.62 15.37 16.88 15.94 A0.45 0.45 0 0 1 17.29 15.14 Q16.1 14.44 12.51 13.06 Z"/>
+      <path class="gpx-a gpx-sp gpx-d3" d="M11.62 13.78 Q12.41 17.97 12.91 19.55 A0.38 0.38 0 0 1 13.64 19.35 Q13.27 17.74 11.81 13.73 Z"/>
+      <path class="gpx-a gpx-sp gpx-d4" d="M10.65 13.54 Q7.98 16.56 7.28 17.76 A0.56 0.56 0 0 1 8.22 18.38 Q9.06 17.28 10.82 13.65 Z"/>
+      <path class="gpx-a gpx-sp gpx-d5" d="M10.21 12.39 Q6.54 11.73 5.1 11.66 A0.38 0.38 0 0 1 5.03 12.42 Q6.47 12.61 10.2 12.59 Z"/>
+      <path class="gpx-a gpx-sp gpx-d6" d="M10.8 11.55 Q8.59 7.43 7.57 6.1 A0.52 0.52 0 0 1 6.71 6.69 Q7.59 8.12 10.64 11.67 Z"/>
+      <path class="gpx-a gpx-sp gpx-d7" d="M11.81 11.47 Q13.47 6.83 13.88 5.02 A0.43 0.43 0 0 1 13.05 4.79 Q12.5 6.57 11.61 11.42 Z"/>
+      <circle class="gpx-a gpx-nd" cx="19.4" cy="8.2" r="1.5"/>
+      <circle class="gpx-a gpx-nd gpx-d2" cx="17.6" cy="15.8" r="1.05"/>
+      <circle class="gpx-a gpx-nd gpx-d3" cx="13.4" cy="19.9" r="0.85"/>
+      <circle class="gpx-a gpx-nd gpx-d4" cx="7.4" cy="18.6" r="1.15"/>
+      <circle class="gpx-a gpx-nd gpx-d5" cx="4.6" cy="12" r="0.85"/>
+      <circle class="gpx-a gpx-nd gpx-d6" cx="6.8" cy="5.9" r="1.1"/>
+      <circle class="gpx-a gpx-nd gpx-d7" cx="13.6" cy="4.4" r="0.95"/>
+      <circle class="gpx-a gpx-hub" cx="11.4" cy="12.6" r="1.85"/>
+      <circle class="gpx-a gpx-sat" cx="21.6" cy="19.4" r="0.6"/>
+    </g>
+  </symbol>
+</svg>
+
+<!-- ── Sidebar ────────────────────────────────────────────────── -->
+<aside class="sidebar" id="sidebar">
+  <div class="tab active" onclick="switchTab('home')" title="主页">
+    <i data-lucide="home"></i><span class="tab-label">主页</span>
+  </div>
+  <div class="tab" onclick="switchTab('reader')" title="阅读">
+    <i data-lucide="book-open"></i><span class="tab-label">阅读</span>
+  </div>
+  <div class="tab" onclick="switchTab('theme')" title="主题">
+    <i data-lucide="palette"></i><span class="tab-label">主题</span>
+  </div>
+  <div class="tab" onclick="switchTab('graph')" title="图谱">
+    <svg class="icon-custom"><use href="#icon-graph"/></svg><span class="tab-label">图谱</span>
+  </div>
+  <div class="tab" onclick="switchTab('notes')" title="笔记">
+    <i data-lucide="sticky-note"></i><span class="tab-label">笔记</span>
+  </div>
+  <div class="tab" onclick="switchTab('console')" title="控制台">
+    <i data-lucide="sliders-horizontal"></i><span class="tab-label">控制台</span>
+  </div>
+</aside>
+
+<!-- 场景氛围层：fixed 在视口，不随 #page-home 滚动 -->
+<div class="scene-atmosphere" aria-hidden="true">
+  <div class="scene-wall scene-nightwall"></div>
+  <div class="scene-wall scene-daywall"></div>
+  <div class="scene-light-cone"></div>
+  <div class="scene-dust">
+    <span></span><span></span><span></span><span></span><span></span><span></span>
+    <span></span><span></span><span></span><span></span><span></span><span></span>
+  </div>
+</div>
+
+<div class="main-content">
+
+<div class="content-left" id="contentLeft">
+
+<!-- ── Home page (shelf scene) ──────────────────────────────────── -->
+<div class="page active" id="page-home">
+  <div class="shelf-container shelf-scene scene-day" id="shelfScene">
+    <div class="shelf-sticky-head">
+    <div class="shelf-section" id="continueSection" style="display:none">
+      <h2 class="shelf-section-title"><i data-lucide="pin"></i> 继续阅读</h2>
+      <div class="continue-card" id="continueCard" onclick="">
+        <img class="continue-cover" id="continueCover" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==" alt="" />
+        <div class="continue-info">
+          <div class="continue-title" id="continueTitle"></div>
+          <div class="continue-author" id="continueAuthor"></div>
+          <div class="continue-progress" id="continueProgress"></div>
+        </div>
+      </div>
+    </div>
+      <div class="shelf-section-header" id="shelfStickyHeader">
+        <h2 class="shelf-section-title"><i data-lucide="library"></i> 全部藏书 <span class="shelf-count" id="shelfCount"></span></h2>
+        <div class="shelf-header-actions">
+          <button class="scene-toggle" id="sceneToggle" onclick="toggleShelfScene()" title="切换到夜晚"><i data-lucide="moon"></i></button>
+          <div class="shelf-sort-bar" id="shelfSortBar">
+            <button class="sort-btn" data-key="time" onclick="setSort('time')">
+              <span class="sort-label">时间</span>
+              <span class="sort-dir" id="sort-dir-time"></span>
+            </button>
+            <button class="sort-btn" data-key="title" onclick="setSort('title')">
+              <span class="sort-label">书名</span>
+              <span class="sort-dir" id="sort-dir-title"></span>
+            </button>
+            <button class="sort-btn" data-key="author" onclick="setSort('author')">
+              <span class="sort-label">作家</span>
+              <span class="sort-dir" id="sort-dir-author"></span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div><!-- end .shelf-sticky-head -->
+      <div class="shelf-grid" id="shelfGrid"></div>
+      <div class="scene-journal-art"><img id="journalSticker" src="assets/journal-corner.png" alt="" /></div>
+      <div class="shelf-empty" id="shelfEmpty" style="display:none">
+        <p>书库是空的</p>
+        <p class="shelf-empty-hint">点击右下角 <i data-lucide="download"></i> 导入书籍，或把文件放到 data/watch/ 目录自动导入</p>
+    </div>
+  </div>
+</div>
+
+<!-- ── Reader page ─────────────────────────────────────────────── -->
+<div class="page" id="page-reader">
+
+<div class="left">
+  <div class="reader-header">
+    <div class="reader-title-row">
+      <h2><i data-lucide="book-open"></i> 阅读器</h2>
+      <!-- 标注交互已迁至"选中即弹"浮动操作条（annotations.js native 层） -->
+    </div>
+    <div class="controls">
+      <label>书:</label>
+      <select id="bookSelect" onchange="selectBook()"><option value="">加载中...</option></select>
+      <button onclick="refreshBooks()" title="刷新书库"><i data-lucide="refresh-cw"></i></button>
+      <button onclick="openNotesPanel()" title="本章笔记浮窗"><i data-lucide="panel-right"></i></button>
+      <label>章:</label>
+      <select id="chapterSelect" onchange="selectChapter()"><option value="0">0</option></select>
+      <span class="chunk-nav">
+        <button onclick="prevChunk()" id="btnPrev" title="上一段"><i data-lucide="chevron-left"></i></button>
+        <span class="chunk-pos" id="chunkPos">0 / 0</span>
+        <button onclick="nextChunk()" id="btnNext" title="下一段"><i data-lucide="chevron-right"></i></button>
+      </span>
+    </div>
+    <div class="meta" id="positionMeta"></div>
+    <div class="search-area">
+      <input type="text" id="searchInput" placeholder="搜索..."
+             onkeydown="if(event.key==='Enter')searchBook()">
+      <button onclick="searchBook()" title="搜索"><i data-lucide="search"></i></button>
+      <button id="btnProximitySearch" class="search-mode-btn" onclick="setSearchMode('proximity')" title="就近搜索：章节按距离当前位置排序"><i data-lucide="map-pin"></i> 就近</button>
+      <button id="btnChapterSearch" class="search-mode-btn" onclick="setSearchMode('chapter')" title="章节搜索：先选择章节再搜索"><i data-lucide="list-ordered"></i> 章节</button>
+    </div>
+    <div class="search-results" id="searchResults">
+      <div class="search-left" id="searchLeft"></div>
+      <div class="search-right" id="searchRight"></div>
+    </div>
+    <div class="search-info" id="searchInfo"></div>
+  </div>
+  <div class="book-page" id="bookPage"><div class="book-page-inner" id="bookPageInner">载入中...</div></div>
+  <!-- Native EPUB renderer host (epub.js scrolled flow); #bookPage holds the fallback chunk view -->
+  <div class="book-page book-page-native" id="bookPageNative" hidden></div>
+</div>
+</div><!-- end #page-reader -->
+
+		<!-- Graph page -->
+		<div class="page" id="page-graph">
+		  <div class="graph-secondary-nav" id="graphSecNav">
+		    <button class="graph-secnav-tab active" data-view="graph" onclick="window.switchGraphView('graph')">图谱</button>
+		    <button class="graph-secnav-tab" data-view="manage" onclick="window.switchGraphView('manage')">管理</button>
+		  </div>
+		  <div class="graph-toolbar" id="graphToolbar">
+		    <select id="graphBookSelect" onchange="window.onGraphBookChange()">
+		      <option value="">选择书籍...</option>
+		    </select>
+		    <button id="graphLayoutToggle" onclick="window.toggleGraphLayout()" title="切换布局"><i data-lucide="layout-grid"></i> 布局: 力导向</button>
+		  </div>
+		  <div class="graph-page-layout" id="graphPageLayout">
+		    <div class="graph-type-wheel" id="graphTypeWheel">
+		      <div class="graph-type-wheel-empty">加载中...</div>
+		    </div>
+		    <div class="graph-canvas-wrap" id="graphCanvasWrap">
+		      <div class="graph-canvas-inner" id="graphCanvas"></div>
+	      <div class="graph-loading-overlay" id="graphLoadingOverlay">
+	        <svg class="icon-custom graph-loading-icon"><use href="#icon-graph"/></svg>
+	        <span>加载图谱...</span>
+	      </div>
+	      <div class="graph-empty-state" id="graphEmptyState" style="display:none">
+	        <div class="graph-empty-icon"><svg class="icon-custom"><use href="#icon-graph"/></svg></div>
+		        <p>未提取图谱</p>
+		        <p class="graph-empty-hint">点击下方按钮开始提取。提取过程会分析全书内容，构建人物、地点、事件、关系的知识图谱。</p>
+		        <button class="graph-start-btn" id="graphStartExtractBtn">开始图谱分析</button>
+		      </div>
+		      <div class="graph-error-state" id="graphErrorState" style="display:none">
+		        <p>加载失败</p>
+		        <button onclick="window.loadGraphForCurrentBook()">重试</button>
+		      </div>
+		    </div>
+		    <div class="graph-detail-panel" id="graphDetailPanel">
+		      <div class="graph-detail-header">
+		        <h3 id="graphDetailName"></h3>
+		      </div>
+		      <div class="graph-detail-body" id="graphDetailBody"></div>
+		    </div>
+		    <button class="graph-detail-toggle" id="graphDetailToggle" onclick="window.toggleGraphDetail()" title="展开/收起详情"><i data-lucide="panel-right"></i></button>
+		  </div>
+		  <div class="graph-manage-panel" id="graphManagePanel" style="display:none">
+		    <div class="graph-manage-body" id="graphManageBody">加载中...</div>
+		  </div>
+		</div><!-- end #page-graph -->
+
+		<!-- Notes & bookmarks page -->
+<div class="page" id="page-notes">
+  <div class="notes-page">
+    <div class="notes-page-header">
+      <div class="notes-page-title-row">
+        <h2><i data-lucide="book-open"></i> 我的笔记</h2>
+        <button class="notes-export-btn" onclick="exportNotes()" title="导出笔记为 Markdown"><i data-lucide="upload"></i> 导出</button>
+      </div>
+      <div class="notes-subtabs">
+        <button class="subtab active" data-subtab="notes" onclick="switchNotesSubtab('notes')"><i data-lucide="message-square"></i> 批注</button>
+        <button class="subtab" data-subtab="bookmarks" onclick="switchNotesSubtab('bookmarks')"><i data-lucide="underline"></i> 收藏</button>
+      </div>
+      <div class="notes-page-tools">
+        <input type="text" id="notesSearchInput" placeholder="搜索内容..." oninput="onNotesSearchInput()">
+        <button id="notesSearchClear" onclick="clearNotesSearch()" style="display:none" title="清除搜索"><i data-lucide="x"></i></button>
+        <select id="notesFilterBook" onchange="onBookFilterChange()">
+          <option value="">全部书籍</option>
+        </select>
+        <select id="notesFilterColor" onchange="onNotesFilterChange()">
+          <option value="">全部颜色</option>
+          <option value="#FFD54F">金黄</option>
+          <option value="#64B5F6">天蓝</option>
+          <option value="#81C784">薄荷绿</option>
+          <option value="#FF8A65">珊瑚橙</option>
+          <option value="#CE93D8">薰衣草紫</option>
+          <option value="#FF6B6B">书签红</option>
+        </select>
+      </div>
+      <div class="notes-sort-row" id="notesSortRow">
+        <button id="sortBtnBook" class="sort-btn active" onclick="setNotesSort('book')" title="按书名排序"><i data-lucide="book-open"></i> A->Z</button>
+        <button id="sortBtnTime" class="sort-btn" onclick="setNotesSort('time')" title="按时间排序"><i data-lucide="clock"></i> 最新</button>
+        <button id="sortBtnLength" class="sort-btn" onclick="setNotesSort('length')" title="按字数排序"><i data-lucide="ruler"></i> 字数</button>
+        <button id="sortBtnChapter" class="sort-btn" onclick="setNotesSort('chapter')" title="按章节排序"><i data-lucide="list-ordered"></i> 章节</button>
+      </div>
+    </div>
+    <div class="notes-page-body">
+      <div class="notes-list" id="notesList">
+        <div class="notes-empty">点击侧边栏「<i data-lucide="sticky-note"></i> 笔记」查看</div>
+      </div>
+      <div class="bookmarks-list" id="bookmarksList" style="display:none">
+        <div class="notes-empty">加载中...</div>
+      </div>
+    </div>
+  </div>
+</div><!-- end #page-notes -->
+
+<!-- Theme settings page -->
+		<div class="page" id="page-theme">
+		  <div class="theme-panel">
+		    <div class="theme-left">
+		      <h2><i data-lucide="palette"></i> 主题设置</h2>
+		      <p class="theme-hint">所有设置自动保存，重启不丢失。右侧实时预览调整效果。</p>
+		      <section class="theme-section" onclick="switchPreview('reader')">
+		        <h3><i data-lucide="book-open"></i> 阅读页</h3>
+	        <div class="theme-row"><label>字号</label>
+	          <select id="tReaderFontSize" onchange="onThemeChange()">
+	            <option value="14">14px</option><option value="15">15px</option>
+	            <option value="16">16px</option><option value="17" selected>17px (默认)</option>
+	            <option value="18">18px</option><option value="19">19px</option>
+	            <option value="20">20px</option><option value="21">21px</option>
+	            <option value="22">22px</option><option value="23">23px</option>
+	            <option value="24">24px</option>
+	            <option value="26">26px</option><option value="28">28px</option>
+	            <option value="30">30px</option><option value="32">32px</option>
+	          </select></div>
+	        <div class="theme-row"><label>字体</label>
+	          <select id="tReaderFontFamily" onchange="onThemeChange()">
+	            <option value="mono" selected>等距 (默认)</option>
+	            <option value="song">宋体</option>
+	            <option value="kai">楷体</option>
+	            <option value="hei">黑体</option>
+	            <option value="fangsong">仿宋</option>
+	          </select></div>
+	        <div class="theme-row"><label>字色</label>
+	          <input type="color" id="tReaderFontColor" value="#a8b0a0" onchange="onThemeChange()">
+	          <span class="color-val" id="tReaderFontColorVal">#a8b0a0</span></div>
+	        <div class="theme-row"><label>字体亮度</label>
+	          <input type="range" min="0.6" max="1.4" step="0.05" value="1" id="tReaderFontBrightness" oninput="onThemeChange()">
+	          <span class="range-val" id="tReaderFontBrightnessVal">1.0</span></div>
+	        <div class="theme-row"><label>背景色</label>
+	          <input type="color" id="tReaderBgColor" value="#141a14" onchange="onThemeChange()">
+	          <span class="color-val" id="tReaderBgColorVal">#141a14</span></div>
+	        <div class="theme-row"><label>背景亮度</label>
+	          <input type="range" min="0.6" max="1.4" step="0.05" value="1" id="tReaderBgBrightness" oninput="onThemeChange()">
+	          <span class="range-val" id="tReaderBgBrightnessVal">1.0</span></div>
+	        <div class="theme-row"><label>选中字色</label>
+	          <input type="color" id="tReaderSelectionColor" value="#e8f0e0" onchange="onThemeChange()">
+	          <span class="color-val" id="tReaderSelectionColorVal">#e8f0e0</span></div>
+	        <div class="theme-row"><label>翻页阻尼</label>
+	          <input type="range" min="1" max="8" step="1" value="2" id="tPageTurnThreshold" oninput="onThemeChange()">
+	          <span class="range-val" id="tPageTurnThresholdVal">2 格</span>
+	          <span class="theme-hint-inline">滚到边界后继续滚 N 格才翻页</span></div>
+	      </section>
+
+	      <section class="theme-section" onclick="switchPreview('chat')">
+	        <h3><i data-lucide="message-square"></i> 交互页</h3>
+	        <div class="theme-row"><label>字号</label>
+	          <select id="tChatFontSize" onchange="onThemeChange()">
+	            <option value="11">11px</option><option value="12">12px</option>
+	            <option value="13" selected>13px (默认)</option><option value="14">14px</option>
+	            <option value="15">15px</option>
+	          </select></div>
+	        <div class="theme-row"><label>字色</label>
+	          <input type="color" id="tChatFontColor" value="#c8c0b8" onchange="onThemeChange()">
+	          <span class="color-val" id="tChatFontColorVal">#c8c0b8</span></div>
+	        <div class="theme-row"><label>选中字色</label>
+	          <input type="color" id="tSelectionColor" value="#ffffff" onchange="onThemeChange()">
+	          <span class="color-val" id="tSelectionColorVal">#ffffff</span></div>
+	      </section>
+
+	      <section class="theme-section" onclick="switchPreview('notes')">
+	        <h3><i data-lucide="sticky-note"></i> 笔记浮窗</h3>
+	        <div class="theme-row"><label>字号</label>
+	          <select id="tNotesFontSize" onchange="onThemeChange()">
+	            <option value="11">11px</option><option value="12">12px</option>
+	            <option value="13" selected>13px (默认)</option><option value="14">14px</option>
+	            <option value="15">15px</option>
+	          </select></div>
+	      </section>
+
+	      <button class="danger" onclick="resetTheme()">恢复默认设置</button>
+	    </div>
+
+	    <div class="theme-right" id="themePreview">
+	      <!-- Reader preview stage -->
+	      <div class="preview-stage active" id="previewReader">
+	        <div class="preview-stage-label"><i data-lucide="book-open"></i> 阅读页预览</div>
+	        <div class="book-page" style="flex:1;margin:0;border-radius:0;background-image:none;">
+	          <div class="book-page-inner" style="min-height:0;display:flex;align-items:center;justify-content:center;">
+	            打开一本书即可在此预览实际排版效果
+	          </div>
+	        </div>
+	      </div>
+	      <!-- Chat preview stage -->
+	      <div class="preview-stage" id="previewChat">
+	        <div class="preview-stage-label"><i data-lucide="message-square"></i> 交互页预览</div>
+	        <div class="preview-chat-body">
+	          <div class="msg agent" style="margin-bottom:6px;">书伴：你好！打开一本书，选中一段文字，可以直接提问。</div>
+	          <div class="msg user" style="margin-bottom:6px;">这段文字的核心观点是什么？</div>
+	          <div class="msg agent">这段话主要表达了作者对现代性的深刻反思...</div>
+	        </div>
+	      </div>
+	      <!-- Notes preview stage -->
+	      <div class="preview-stage" id="previewNotes">
+	        <div class="preview-stage-label"><i data-lucide="sticky-note"></i> 笔记浮窗预览</div>
+	        <div class="notes-panel" style="position:static;width:auto;max-height:none;box-shadow:none;border-radius:0;">
+	          <div class="notes-header" style="cursor:default;">
+	            <span class="notes-title" style="color:var(--np-accent)"><i data-lucide="sticky-note"></i> 读书笔记</span>
+	          </div>
+	          <div class="notes-body" style="max-height:280px;">
+	            <div class="notes-list" style="padding:var(--space-sm);">
+	              <div class="note-card" style="cursor:default;border-left-color:#FFD54F;">
+	                <div class="note-quote">引用自书中某段落的文字示例</div>
+	                <div class="note-text">这是用户写的笔记正文，支持 <b>粗体</b> 和 <i>斜体</i>。</div>
+	                <div class="note-meta"><span style="color:#FFD54F">●</span> 6月24日 14:35:22</div>
+	              </div>
+	              <div class="note-card" style="cursor:default;border-left-color:#64B5F6;">
+	                <div class="note-quote">另一段被标注的引用文字</div>
+	                <div class="note-text">另一条笔记内容预览。</div>
+	                <div class="note-meta"><span style="color:#64B5F6">●</span> 6月23日 09:12:05</div>
+	              </div>
+	            </div>
+	          </div>
+	        </div>
+	      </div>
+	    </div>
+	  </div>
+	</div>
+
+<!-- ── Console page (driver switching + usage analytics) ─────────── -->
+<div class="page" id="page-console">
+  <div class="console-secondary-nav" id="consoleSecNav">
+    <button class="console-secnav-tab active" data-view="drivers" onclick="window.switchConsoleView('drivers')">驱动控制台</button>
+    <button class="console-secnav-tab" data-view="usage" onclick="window.switchConsoleView('usage')">用量分析</button>
+  </div>
+  <div class="console-view" id="consoleViewDrivers">
+    <div class="console-panel">
+      <p class="console-hint">切换即时生效，无需重启。点击槽位卡可筛选对应能力的连接档案；未绑定的槽位沿用 .env 配置（只读继承）。</p>
+      <div class="console-band" id="consoleBand"><!-- slot status cards rendered by console.js --></div>
+      <div class="console-filterbar" id="consoleFilterBar"><!-- two-tier filter rendered by console.js --></div>
+      <div class="console-grid-meta" id="consoleCount"></div>
+      <div class="console-grid" id="consoleProviders"><!-- provider cards rendered by console.js --></div>
+      <button class="console-add-card" onclick="ConsoleUI.openEditor()">
+        <i data-lucide="plus"></i> 新增连接
+      </button>
+    </div>
+  </div>
+  <div class="console-view" id="consoleViewUsage" style="display:none">
+    <div class="console-panel">
+      <div class="usage-stats" id="usageStats"><!-- 统计卡 ×3 rendered by usage.js --></div>
+      <div class="usage-card">
+        <h3><i data-lucide="bar-chart-3"></i> 每日用量</h3>
+        <div class="usage-chart-nav" id="usageChartNav"><!-- ‹ 月 › + 图例 rendered by usage.js --></div>
+        <div class="usage-chart" id="usageChart"></div>
+        <div class="usage-chart-days" id="usageChartDays"></div>
+      </div>
+      <div class="usage-models" id="usageModels"><!-- 模型细则双图 rendered by usage.js --></div>
+      <div class="usage-card">
+        <h3><i data-lucide="database"></i> 模型档案</h3>
+        <p class="console-hint">上下文窗口（tokens）用于水位占比换算；分词器按厂商自动匹配，未命中时用兜底路径。</p>
+        <table class="usage-prof-table"><tbody id="usageProfilesBody"></tbody></table>
+        <div class="usage-prof-actions">
+          <button class="console-btn" onclick="UsageUI.addProfileRow()">+ 添加模型</button>
+          <button class="console-btn console-btn-bind" onclick="UsageUI.saveProfiles()">保存档案</button>
+        </div>
+        <p class="console-hint">厂商分词器 —— 匹配词支持逗号分隔多别名（如 glm,zhipu），按模型名子串匹配</p>
+        <table class="usage-prof-table"><tbody id="usageVendorBody"></tbody></table>
+        <div class="usage-prof-actions">
+          <button class="console-btn" onclick="UsageUI.addVendorRow()">+ 添加厂商</button>
+        </div>
+        <div class="usage-tok-row">
+          <input id="usageTokPath" placeholder="兜底 tokenizer.json 路径">
+          <label><input type="checkbox" id="usageTokEnabled"> 启用分词器</label>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</div><!-- end .content-left -->
+
+
+
+<div class="splitter" id="splitter"></div>
+
+<div class="right" id="chatPanel">
+  <div class="chat-header">
+    <h2><i data-lucide="message-square"></i> 书伴</h2>
+    <button class="chat-toggle-btn" id="chatToggleBtn" onclick="toggleChatPanel()" title="收起/展开对话"><svg viewBox="0 0 24 24" aria-hidden="true"><path></path></svg></button>
+  </div>
+  <div class="chat-body" id="chatBody">
+    <div class="chat-log" id="chatLog">
+      <div class="msg agent">书伴加载中...</div>
+    </div>
+    <div class="selection-ref" id="selectionTag">
+      <span class="ref-icon"><i data-lucide="pin"></i></span>
+      <span>引用</span><span id="selTagSrc">书中</span><span>:</span>
+      <span class="ref-text" id="selTagText"></span>
+      <button class="ref-clear" onclick="clearSelectionRef()" title="取消引用"><i data-lucide="x"></i></button>
+    </div>
+    <div class="chat-input-area">
+      <div class="chat-mode-bar">
+        <button id="roleplayEntryBtn" class="mode-toggle roleplay-entry" onclick="startRolePlaySetup()" title="与书中角色对话">
+          <span class="mode-icon"><i data-lucide="drama"></i></span>
+          <span class="mode-label">角色对话</span>
+        </button>
+        <button id="modeToggle" class="mode-toggle" onclick="toggleModePicker()" title="切换阅读模式">
+          <span class="mode-icon"><i data-lucide="book-open"></i></span>
+          <span class="mode-label" id="modeLabel">沉浸伴读</span>
+          <span class="mode-caret"><i data-lucide="chevron-down"></i></span>
+        </button>
+        <div class="mode-picker" id="modePicker">
+          <div class="mode-option" data-mode="immersive" onclick="setMode('immersive')">
+            <span class="mo-name">沉浸伴读</span>
+            <span class="mo-desc">不剧透，同步节奏，共情陪伴</span>
+          </div>
+          <div class="mode-option" data-mode="overview" onclick="setMode('overview')">
+            <span class="mo-name">俯瞰分析</span>
+            <span class="mo-desc">全局视角，结构化分析，可剧透</span>
+          </div>
+          <div class="mode-option" data-mode="divergent" onclick="setMode('divergent')">
+            <span class="mo-name">发散探索</span>
+            <span class="mo-desc">跨领域联想，外部视角</span>
+          </div>
+        </div>
+        <button id="ctxUsageBtn" class="mode-toggle ctx-usage-toggle" onclick="toggleCtxUsage()" title="上下文用量">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+            <circle class="ctx-ring-track" cx="12" cy="12" r="9" fill="none" stroke-width="3"/>
+            <circle class="ctx-ring-tick" cx="12" cy="12" r="9" fill="none" stroke-width="3"/>
+            <circle class="ctx-ring-value" cx="12" cy="12" r="9" fill="none" stroke-width="3" stroke-linecap="round" transform="rotate(-90 12 12)"/>
+          </svg>
+        </button>
+        <div class="ctx-pop" id="ctxUsagePop"></div>
+        <button id="sessionToggle" class="mode-toggle session-toggle" onclick="toggleSessionPanel()" title="历史会话">
+          <span class="mode-icon"><i data-lucide="message-square"></i></span>
+          <span class="mode-label" id="sessionLabel">会话</span>
+          <span class="mode-caret"><i data-lucide="chevron-down"></i></span>
+        </button>
+        <div class="session-panel" id="sessionPanel">
+          <div class="session-panel-header">
+            <span>历史会话</span>
+            <button class="sp-new-btn" onclick="newSession()" title="开始新会话">＋ 新会话</button>
+          </div>
+          <div class="session-subnav" id="sessionSubnav">
+            <button class="subnav-tab active" data-tab="all" onclick="switchSubnavTab('all')">全部</button>
+            <button class="subnav-tab" data-tab="books" onclick="switchSubnavTab('books')">按书籍</button>
+            <button class="subnav-tab" data-tab="characters" onclick="switchSubnavTab('characters')">按角色</button>
+          </div>
+          <div class="session-panel-body" id="sessionList">加载中...</div>
+        </div>
+      </div>
+      <div class="chat-input-row" id="chatInputRow">
+        <button class="mic-btn" id="micBtn" onclick="window.toggleRecording()" title="语音输入"><i data-lucide="mic"></i></button>
+        <textarea id="chatInput" rows="1" placeholder="输入问题...（可先选中书页文字）"
+                  onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}"></textarea>
+        <button class="send-btn" onclick="sendMessage()">发送</button>
+      </div>
+    </div>
+
+    <!-- Hidden file input for avatar upload -->
+    <input type="file" id="avatarFileInput"
+           accept="image/png,image/jpeg,image/gif,image/webp"
+           style="display:none">
+
+    <!-- Role-play setup overlay -->
+    <div class="roleplay-overlay" id="roleplayOverlay">
+      <div class="roleplay-dialog">
+        <div class="roleplay-header">
+          <span><i data-lucide="drama"></i> 扮演模式</span>
+          <button class="roleplay-close" onclick="cancelRolePlaySetup()"><i data-lucide="x"></i></button>
+        </div>
+        <div class="roleplay-body" id="rpBody">
+          <!-- Dynamically filled: book list → character list → mode selector -->
+        </div>
+        <div class="roleplay-footer" id="rpFooter" style="display:none">
+          <button class="rp-btn-secondary" onclick="cancelRolePlaySetup()">取消</button>
+          <button class="rp-btn-primary" id="rpConfirmBtn" onclick="confirmRolePlay()">开始扮演</button>
+        </div>
+      </div>
+    </div>
+    </div>
+  </div><!-- end #chatPanel -->
+</div><!-- end .main-content -->
+
+<script src="lib/cytoscape.min.js"></script>
+<script src="lib/layout-base.js"></script>
+<script src="lib/cose-base.js"></script>
+<script src="lib/cytoscape-fcose.js"></script>
+<script src="lib/lucide.min.js"></script>
+<!-- jszip (JSZip external for epub.js) must load before epub.min.js -->
+<script src="lib/jszip.min.js"></script>
+<!-- epub.js (0.3.93 fork) native EPUB rendering — needs window.JSZip above -->
+<script src="lib/epub.min.js"></script>
+<script type="module" src="js/context-usage.js"></script>
+<script type="module" src="js/app.js"></script>
+<script type="module" src="js/console.js"></script>
+<script type="module" src="js/usage.js"></script>
+<script type="module" src="js/graph-progress-ui.js"></script>
+<script type="module" src="js/graph-viz.js"></script>
+<script type="module" src="annotations.js"></script>
+<script type="module" src="notes-panel.js"></script>
+<script type="module" src="graph-panel.js"></script>
+<script type="module" src="tags-panel.js"></script>
+<script>
+// Lucide icons - auto-refresh on DOM change (debounced).
+// MutationObserver catches dynamically inserted [data-lucide] elements
+// so JS modules don't need manual refreshIcons() calls after innerHTML.
+window.refreshIcons = function () {
+  if (!window.lucide) return;
+  var icons = window.lucide.icons;
+  if (!icons) return;
+  // Lucide v1.x uses PascalCase keys (e.g. "BookOpen"), but we write
+  // data-lucide="book-open" (kebab-case). Add kebab aliases once.
+  if (!window._lucideKebabAliased) {
+    Object.keys(icons).forEach(function (key) {
+      var kebab = key.replace(/([A-Z0-9])/g, '-$1').toLowerCase().replace(/^-/, '');
+      if (kebab !== key && !(kebab in icons)) icons[kebab] = icons[key];
+    });
+    window._lucideKebabAliased = true;
+  }
+  window.lucide.createIcons({ icons: icons });
+};
+var _iconTimer = null;
+function _scheduleIconRefresh() {
+  if (_iconTimer) clearTimeout(_iconTimer);
+  _iconTimer = setTimeout(function () {
+    window.refreshIcons();
+    _iconTimer = null;
+  }, 50);
+}
+document.addEventListener('DOMContentLoaded', function () {
+  window.refreshIcons();
+  var observer = new MutationObserver(function (mutations) {
+    for (var i = 0; i < mutations.length; i++) {
+      var added = mutations[i].addedNodes;
+      for (var j = 0; j < added.length; j++) {
+        var node = added[j];
+        if (node.nodeType === 1 &&
+            ((node.hasAttribute && node.hasAttribute('data-lucide')) ||
+             (node.querySelector && node.querySelector('[data-lucide]')))) {
+          _scheduleIconRefresh();
+          return;
+        }
+      }
+    }
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "model": "deepseek-v4-flash",
+  "max_iterations": 50,
+  "compact": {
+    "preserve_recent_messages": 4,
+    "max_estimated_tokens": 10000,
+    "auto_threshold": 100000
+  },
+  "memory": {
+    "char_limit": 2200,
+    "user_char_limit": 1375
+  }
+}
