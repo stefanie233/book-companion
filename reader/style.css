@@ -1981,6 +1981,11 @@ button.danger:hover { background: var(--danger); color: #fff; }
   display: flex;
   align-items: center;
   gap: 6px;
+  /* 交互栏嵌在限宽（45%）的聊天面板里，药丸行 nowrap 时最右侧的「会话」
+     会被裁到屏幕外。允许换行——宽度够时仍是单行，不够时折成两行而不是
+     丢按钮。三个浮层（mode-picker/ctx-pop 为 fixed，session-panel 为
+     bottom:100% 锚定）都不受换行影响。 */
+  flex-wrap: wrap;
 }
 
 /* Book import button — home page chat */

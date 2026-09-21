@@ -451,7 +451,7 @@ function renderProfilesTable() {
   const rows = Object.entries(PROFILES.models).map(([name, p]) => `
     <tr>
       <td><input class="up-model" value="${esc(name)}" ${name === '*' ? 'readonly' : ''}></td>
-      <td><input class="up-window" type="number" min="1" value="${p.context_window || 128000}"></td>
+      <td><input class="up-window" type="number" min="1" value="${p.context_window || 1048576}"></td>
       <td><input class="up-tok" placeholder="分词器覆盖（可选）" value="${esc(p.tokenizer_path || '')}"></td>
       <td>${name === '*' ? '<span class="est">兜底</span>' : `<button class="console-btn" onclick="UsageUI.delProfileRow(this)">删</button>`}</td>
     </tr>`).join('');
@@ -491,7 +491,7 @@ function addProfileRow() {
   body.insertAdjacentHTML('beforeend', `
     <tr>
       <td><input class="up-model" placeholder="模型名"></td>
-      <td><input class="up-window" type="number" min="1" value="128000"></td>
+      <td><input class="up-window" type="number" min="1" value="1048576"></td>
       <td><input class="up-tok" placeholder="分词器覆盖（可选）"></td>
       <td><button class="console-btn" onclick="UsageUI.delProfileRow(this)">删</button></td>
     </tr>`);
@@ -507,7 +507,7 @@ function collectProfiles() {
     const name = tr.querySelector('.up-model')?.value.trim();
     if (!name) return;
     const entry = {
-      context_window: parseInt(tr.querySelector('.up-window')?.value, 10) || 128000,
+      context_window: parseInt(tr.querySelector('.up-window')?.value, 10) || 1048576,
     };
     const override = tr.querySelector('.up-tok')?.value.trim();
     if (override) entry.tokenizer_path = override;

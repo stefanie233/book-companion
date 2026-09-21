@@ -21,10 +21,15 @@ STORE_VERSION = 2
 # 厂商分词器预设：key 为逗号分隔的匹配别名（子串匹配、大小写不敏感），
 # 这样 ZHIPU/GLM-5.3-Flash、vanchin/deepseek-v4-pro 这类带前缀的模型名也能命中。
 # 默认路径为空 —— 不随代码分发本机绝对路径。真实分词器路径由控制台
-# 「用量分析」配置,落盘在 data/config/model_profiles.json（gitignored，
-# 各机器自行配置本地路径）。无配置时 resolve_tokenizer() 返回 ""，
+# 「用量分析」配置,落盘在 data/config/model_profiles.json（gitignored,
+# 用户本机为 D:\tokenizers\...）。无配置时 resolve_tokenizer() 返回 ""，
 # 走 chars//4 估算兜底。
 _DEFAULT_VENDORS: dict[str, str] = {}
+
+# 出厂默认上下文窗口。旗舰模型普遍 1M 起步（128K 是上一代口径），兜底按 1M 算，
+# 免得圆环把 1M 窗口的模型按 128K 报成 800% 用量。单模型可在「用量分析」页或
+# data/config/model_profiles.json 里覆写真实窗口。
+DEFAULT_CONTEXT_WINDOW = 1_048_576
 
 
 def _default_profiles() -> dict:
@@ -40,7 +45,7 @@ def _default_profiles() -> dict:
                 "context_window": 1048576,
                 "note": "预置：窗口 1M",
             },
-            "*": {"context_window": 128000},
+            "*": {"context_window": DEFAULT_CONTEXT_WINDOW},
         },
     }
 
@@ -113,7 +118,7 @@ class ModelProfileStore:
                 raise ValueError("模型名不能为空")
             if not isinstance(prof, dict):
                 raise ValueError(f"模型 {key} 的档案必须是对象")
-            window = prof.get("context_window", 128000)
+            window = prof.get("context_window", DEFAULT_CONTEXT_WINDOW)
             if not isinstance(window, int) or isinstance(window, bool) or window <= 0:
                 raise ValueError(f"模型 {key} 的 context_window 必须是正整数")
             entry = {"context_window": window}
@@ -154,7 +159,7 @@ class ModelProfileStore:
         models = self._data["models"]
         prof = models.get(model) or models.get("*")
         if prof is None:
-            prof = {"context_window": 128000}
+            prof = {"context_window": DEFAULT_CONTEXT_WINDOW}
         return dict(prof)
 
     def _resolve_to_project(self, p: str) -> str:

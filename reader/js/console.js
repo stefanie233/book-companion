@@ -6,6 +6,8 @@
 // v2: a provider is a kind-less vendor connection; every model entry
 // carries its own kind ({id, kind}), and slots bind to (provider, model).
 
+import { refreshOnboardingState } from './onboarding.js';
+
 const SLOT_META = {
   main_llm:  { label: '主模型 LLM', short: '主模型', kind: 'llm', desc: '对话 + 全部后台管线（图谱/记忆/清洗）', modelOptional: false },
   embedding: { label: 'Embedding', short: 'Embedding', kind: 'embedding', desc: '语义检索（预留，消费端接入后生效）', modelOptional: false },
@@ -100,6 +102,8 @@ async function load() {
   renderBand();
   renderFilter();
   renderGrid();
+  // 配置引导生命周期：主 LLM 在这里配好后，摘掉交互页那颗「连接 AI 服务」药丸
+  refreshOnboardingState();
 }
 
 function renderBand() {

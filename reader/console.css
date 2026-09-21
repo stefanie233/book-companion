@@ -810,11 +810,85 @@ html[data-theme="night"] #page-console {
 }
 .onboarding-keyrow input { flex: 1; min-width: 0; }
 .onboarding-keyrow .console-btn { flex-shrink: 0; padding: 5px 10px; }
+
+/* 模型下拉面板：与「拉取」配套。固定约 5 行高、超出滚动——模型数 > 5
+   时的行为对齐控制台的模型清单（.console-mrows）。 */
+.onboard-modelwrap { position: relative; flex: 1; min-width: 0; }
+.onboard-modelwrap input { width: 100%; box-sizing: border-box; }
+.onboard-models {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 2px);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+  max-height: 135px;              /* ≈5 行 */
+  overflow-y: auto;
+  overscroll-behavior: contain;   /* 滚到底不把滚动链给页面 */
+  z-index: 10;
+}
+.onboard-models.open { display: block; }
+.onboard-mitem {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: var(--fs-caption);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.onboard-mitem:hover { background: var(--accent-soft); color: var(--text-strong); }
+/* 勾选框：纯视觉（点击由整行处理，避免行/框各触发一次） */
+.onboard-mitem .mi-ck {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 9px;
+  line-height: 1;
+  color: transparent;
+}
+.onboard-mitem.on .mi-ck {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.onboard-mitem .mi-name {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 「主」= 会被绑到 main_llm 的那个（勾选顺序里的第一个） */
+.onboard-mitem .mi-main {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  line-height: 15px;
+}
+.onboard-mitem.on .mi-name { color: var(--text-strong); }
+
+/* 多选摘要：只在选了 2 个以上时出现 */
+.onboard-sel { display: none; font-size: var(--fs-caption); color: var(--text-muted); line-height: 1.5; }
+.onboard-sel.open { display: block; }
+
 .onboarding-actions {
   display: flex;
   gap: 8px;
   align-items: center;
 }
+.onboarding-actions .onboarding-adv { margin-left: auto; }
 .onboarding-close {
   position: absolute;
   top: 10px;
@@ -829,10 +903,12 @@ html[data-theme="night"] #page-console {
 }
 .onboarding-close:hover { color: var(--text-strong); }
 
-/* 输入区「连接 AI 服务」重入按钮：mode-toggle 药丸样式 + 主题色提示 */
+/* 输入区「连接 AI 服务」重入按钮：仅图标（标签会把 mode-bar 撑爆，
+   把最右侧的「会话」顶出屏幕）+ 主题色提示。语义靠 title/aria-label。 */
 .mode-toggle.onboard-entry {
   color: var(--accent);
   border-color: var(--accent-soft);
+  padding: 6px 10px;
 }
 .usage-mchart-title b { color: var(--text-strong); font-weight: 600; margin-left: 0; font-size: var(--fs-secondary); }
 /* 输入/输出细分信息独占一行,不再与数值挤在同一行 */

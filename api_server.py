@@ -4439,7 +4439,7 @@ async def handle_usage_overview(request: web.Request) -> web.Response:
 # ── Startup ─────────────────────────────────────────────────────────────
 
 
-def run_server(db, host: str = "127.0.0.1", port: int = 8765,
+def run_server(db, host: str = "127.0.0.1", port: int = 8766,
                session_service=None, context_recorder=None):
     """Blocking convenience - run the API server."""
     app = create_app(db, session_service=session_service,
@@ -4474,7 +4474,7 @@ if __name__ == "__main__":
         print(f"Warning: session service unavailable ({exc}). Chat history will not persist.")
         session_service = None
 
-    print(f"Book Companion API starting on http://127.0.0.1:8765")
+    print(f"Book Companion API starting on http://127.0.0.1:8766")
     print(f"Endpoints:")
     print(f"  POST /api/sync              — page-turn position update")
     print(f"  GET  /api/books/<id>/context — book reading map")

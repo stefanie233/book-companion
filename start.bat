@@ -27,14 +27,14 @@ set /a tries=0
 :wait
 rem ping 代替 timeout 当 sleep：timeout 在输入被重定向时会直接报错退出
 ping -n 2 127.0.0.1 >nul
-curl -s http://127.0.0.1:8765/api/health >nul 2>&1
+curl -s http://127.0.0.1:8766/api/health >nul 2>&1
 if not errorlevel 1 goto ready
 set /a tries+=1
 if %tries% lss 60 goto wait
 
 echo.
 echo [错误] 60 秒内服务未就绪。
-echo        常见原因：依赖未安装（先运行 setup.bat），或端口 8765 被占用。
+echo        常见原因：依赖未安装（先运行 setup.bat），或端口 8766 被占用。
 echo        手动排查：在本目录运行  python main.py  查看具体报错。
 echo.
 pause
@@ -43,7 +43,7 @@ exit /b 1
 :ready
 :: 3. 打开前端
 echo 启动前端...
-start "" "http://127.0.0.1:8765/"
+start "" "http://127.0.0.1:8766/"
 
 echo.
 echo 书伴已就绪！浏览器已打开前端页面。

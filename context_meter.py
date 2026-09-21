@@ -25,7 +25,8 @@ logger = logging.getLogger(__name__)
 BLOCK_KEYS = ("system", "tools", "conversation", "context", "input")
 
 ALERT_RATIO_DEFAULT = 0.35
-_WINDOW_FALLBACK = 128_000
+# 窗口兜底值统一走 model_profiles.DEFAULT_CONTEXT_WINDOW（现为 1M），
+# 避免两处各写一个魔数再次跑偏。
 
 
 @dataclass
@@ -163,11 +164,11 @@ def resolve_profile(model: str, config: object = None) -> dict:
     分词器按模型选路（显式覆盖 → 厂商别名 → 全局兜底），见
     ``ModelProfileStore.resolve_tokenizer``。
     """
-    from model_profiles import get_profiles_store
+    from model_profiles import DEFAULT_CONTEXT_WINDOW, get_profiles_store
     store = get_profiles_store(config)
     prof = store.resolve(model)
     return {
-        "window": int(prof.get("context_window") or _WINDOW_FALLBACK),
+        "window": int(prof.get("context_window") or DEFAULT_CONTEXT_WINDOW),
         "tokenizer_path": store.resolve_tokenizer(model),
     }
 

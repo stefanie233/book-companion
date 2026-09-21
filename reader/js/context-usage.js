@@ -108,8 +108,12 @@ export function toggleCtxUsage() {
   if (!pop || !btn) return;
   if (!pop.classList.contains('visible')) {
     const rect = btn.getBoundingClientRect();
+    // 药丸行在窄面板下会折成两行（.chat-mode-bar 的 flex-wrap）。只锚按钮的话，
+    // 按钮落到第二行时面板会压住第一行药丸——锚到整条 bar 的上沿，永远让开。
+    const bar = btn.closest('.chat-mode-bar');
+    const top = bar ? Math.min(rect.top, bar.getBoundingClientRect().top) : rect.top;
     pop.style.position = 'fixed';
-    pop.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+    pop.style.bottom = (window.innerHeight - top + 6) + 'px';
     pop.style.right = (window.innerWidth - rect.right) + 'px';
     pop.style.left = 'auto';
     if (_usage) renderPop(_usage);

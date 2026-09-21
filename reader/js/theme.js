@@ -4,18 +4,19 @@ import { S } from './state.js';
 import * as EpubReader from './epub-reader.js';
 
 const THEME_DEFAULTS = {
-  readerFontFamily: 'mono',
-  readerFontSize: '17',
-  readerFontColor: '#a8b0a0',
-  readerFontBrightness: '1',
-  readerBgColor: '#141a14',
+  // 出厂默认阅读主题：象牙暖底 + 深墨绿字 + 楷体（用户实际在用的配色）。
+  readerFontFamily: 'kai',
+  readerFontSize: '18',
+  readerFontColor: '#183422',
+  readerFontBrightness: '0.7',
+  readerBgColor: '#ddb56e',
   readerBgBrightness: '1',
-  chatFontSize: '13',
+  chatFontSize: '14',
   chatFontColor: '#9a8e7a',
   selectionColor: '#ffffff',
-  readerSelectionColor: '#e8f0e0',
+  readerSelectionColor: '#7da9d8',
   notesFontSize: '13',
-  pageTurnThreshold: '2',  // wheel ticks needed to turn page at edge
+  pageTurnThreshold: '1',  // wheel ticks needed to turn page at edge
 };
 
 // Font-family stacks for each readerFontFamily option.

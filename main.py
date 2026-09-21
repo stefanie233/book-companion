@@ -518,9 +518,9 @@ async def main_async() -> None:
 
     api_runner = web.AppRunner(api_app)
     await api_runner.setup()
-    api_site = web.TCPSite(api_runner, "127.0.0.1", 8765, reuse_address=True)
+    api_site = web.TCPSite(api_runner, "127.0.0.1", 8766, reuse_address=True)
     await api_site.start()
-    print(f"  API server: http://127.0.0.1:8765")
+    print(f"  API server: http://127.0.0.1:8766")
 
     # ── ASR 后台预热（服务已在监听，此处不阻塞）──────────────────────
     # 排在 api_site.start() 之后：/api/health 立刻可应答，start.bat 随即

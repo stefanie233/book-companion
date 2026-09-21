@@ -302,8 +302,8 @@
 	        <div class="theme-row"><label>字号</label>
 	          <select id="tReaderFontSize" onchange="onThemeChange()">
 	            <option value="14">14px</option><option value="15">15px</option>
-	            <option value="16">16px</option><option value="17" selected>17px (默认)</option>
-	            <option value="18">18px</option><option value="19">19px</option>
+	            <option value="16">16px</option><option value="17">17px</option>
+	            <option value="18" selected>18px (默认)</option><option value="19">19px</option>
 	            <option value="20">20px</option><option value="21">21px</option>
 	            <option value="22">22px</option><option value="23">23px</option>
 	            <option value="24">24px</option>
@@ -312,30 +312,30 @@
 	          </select></div>
 	        <div class="theme-row"><label>字体</label>
 	          <select id="tReaderFontFamily" onchange="onThemeChange()">
-	            <option value="mono" selected>等距 (默认)</option>
+	            <option value="mono">等距</option>
 	            <option value="song">宋体</option>
-	            <option value="kai">楷体</option>
+	            <option value="kai" selected>楷体 (默认)</option>
 	            <option value="hei">黑体</option>
 	            <option value="fangsong">仿宋</option>
 	          </select></div>
 	        <div class="theme-row"><label>字色</label>
-	          <input type="color" id="tReaderFontColor" value="#a8b0a0" onchange="onThemeChange()">
-	          <span class="color-val" id="tReaderFontColorVal">#a8b0a0</span></div>
+	          <input type="color" id="tReaderFontColor" value="#183422" onchange="onThemeChange()">
+	          <span class="color-val" id="tReaderFontColorVal">#183422</span></div>
 	        <div class="theme-row"><label>字体亮度</label>
-	          <input type="range" min="0.6" max="1.4" step="0.05" value="1" id="tReaderFontBrightness" oninput="onThemeChange()">
-	          <span class="range-val" id="tReaderFontBrightnessVal">1.0</span></div>
+	          <input type="range" min="0.6" max="1.4" step="0.05" value="0.7" id="tReaderFontBrightness" oninput="onThemeChange()">
+	          <span class="range-val" id="tReaderFontBrightnessVal">0.7</span></div>
 	        <div class="theme-row"><label>背景色</label>
-	          <input type="color" id="tReaderBgColor" value="#141a14" onchange="onThemeChange()">
-	          <span class="color-val" id="tReaderBgColorVal">#141a14</span></div>
+	          <input type="color" id="tReaderBgColor" value="#ddb56e" onchange="onThemeChange()">
+	          <span class="color-val" id="tReaderBgColorVal">#ddb56e</span></div>
 	        <div class="theme-row"><label>背景亮度</label>
 	          <input type="range" min="0.6" max="1.4" step="0.05" value="1" id="tReaderBgBrightness" oninput="onThemeChange()">
 	          <span class="range-val" id="tReaderBgBrightnessVal">1.0</span></div>
 	        <div class="theme-row"><label>选中字色</label>
-	          <input type="color" id="tReaderSelectionColor" value="#e8f0e0" onchange="onThemeChange()">
-	          <span class="color-val" id="tReaderSelectionColorVal">#e8f0e0</span></div>
+	          <input type="color" id="tReaderSelectionColor" value="#7da9d8" onchange="onThemeChange()">
+	          <span class="color-val" id="tReaderSelectionColorVal">#7da9d8</span></div>
 	        <div class="theme-row"><label>翻页阻尼</label>
-	          <input type="range" min="1" max="8" step="1" value="2" id="tPageTurnThreshold" oninput="onThemeChange()">
-	          <span class="range-val" id="tPageTurnThresholdVal">2 格</span>
+	          <input type="range" min="1" max="8" step="1" value="1" id="tPageTurnThreshold" oninput="onThemeChange()">
+	          <span class="range-val" id="tPageTurnThresholdVal">1 格</span>
 	          <span class="theme-hint-inline">滚到边界后继续滚 N 格才翻页</span></div>
 	      </section>
 
@@ -344,12 +344,12 @@
 	        <div class="theme-row"><label>字号</label>
 	          <select id="tChatFontSize" onchange="onThemeChange()">
 	            <option value="11">11px</option><option value="12">12px</option>
-	            <option value="13" selected>13px (默认)</option><option value="14">14px</option>
+	            <option value="13">13px</option><option value="14" selected>14px (默认)</option>
 	            <option value="15">15px</option>
 	          </select></div>
 	        <div class="theme-row"><label>字色</label>
-	          <input type="color" id="tChatFontColor" value="#c8c0b8" onchange="onThemeChange()">
-	          <span class="color-val" id="tChatFontColorVal">#c8c0b8</span></div>
+	          <input type="color" id="tChatFontColor" value="#9a8e7a" onchange="onThemeChange()">
+	          <span class="color-val" id="tChatFontColorVal">#9a8e7a</span></div>
 	        <div class="theme-row"><label>选中字色</label>
 	          <input type="color" id="tSelectionColor" value="#ffffff" onchange="onThemeChange()">
 	          <span class="color-val" id="tSelectionColorVal">#ffffff</span></div>

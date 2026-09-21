@@ -10,7 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from model_profiles import ModelProfileStore
+from model_profiles import DEFAULT_CONTEXT_WINDOW, ModelProfileStore
 
 
 def main() -> None:
@@ -22,7 +22,7 @@ def main() -> None:
         profs = store.get_profiles()
         assert profs["tokenizer"]["path"] == ""  # 默认无预设，走估算兜底；真实路径需配置
         assert profs["models"]["glm-5.3-flash"]["context_window"] == 1048576
-        assert profs["models"]["*"]["context_window"] == 128000
+        assert profs["models"]["*"]["context_window"] == DEFAULT_CONTEXT_WINDOW
 
         # save + reload (cross-instance persistence)
         store.save_profiles(
@@ -31,7 +31,7 @@ def main() -> None:
         )
         again = ModelProfileStore(tmp / "config" / "model_profiles.json")
         assert again.resolve("m1")["context_window"] == 200000
-        assert again.resolve("unknown")["context_window"] == 128000  # no '*' → hard default
+        assert again.resolve("unknown")["context_window"] == DEFAULT_CONTEXT_WINDOW  # no '*' → hard default
         print("  roundtrip + persistence: ok")
 
         # corrupt file quarantined to .bak, defaults restored
