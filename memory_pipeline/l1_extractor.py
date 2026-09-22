@@ -1,6 +1,4 @@
 """L1 memory extractor: single LLM call for scene segmentation + memory extraction.
-
-Adapted from TencentDB Agent Memory 2.0 (MemoryCore/src/core/record/l1-extractor.ts).
 """
 
 from __future__ import annotations

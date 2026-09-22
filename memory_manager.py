@@ -4,8 +4,6 @@ Single integration point that delegates to registered providers.
 Only ONE external (non-builtin) provider is allowed at a time to
 prevent tool schema bloat and conflicting memory backends.
 
-Adapted from Hermes-Agent's ``agent/memory_manager.py``.
-
 Usage in main.py:
     manager = MemoryManager()
     manager.add_provider(BuiltinMemoryProvider(memory_store))
@@ -35,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Context fencing helpers — adapted from Hermes
+# Context fencing helpers — parse/strip <memory-context> recall blocks
 # ---------------------------------------------------------------------------
 
 _FENCE_TAG_RE = re.compile(r'</?\s*memory-context\s*>', re.IGNORECASE)

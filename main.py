@@ -9,8 +9,6 @@ A reading companion / psychological agent with:
 - Slash commands for session control
 - ReAct tool-use loop
 - Async streaming output + cancel support
-
-Adapted from claw-code and Hermes-Agent engineering patterns.
 """
 
 from __future__ import annotations

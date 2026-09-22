@@ -1,8 +1,7 @@
 """Structured context compaction — NO LLM required.
 
-Adapted from claw-code:
-- crates/runtime/src/compact.rs — statistics-based summarization with XML blocks
-- crates/runtime/src/summary_compression.rs — budget-based summary trimming
+Statistics-based summarization with XML blocks; the summary text itself is
+additionally trimmed with a per-character/line budget.
 
 Key features:
 - Walks the boundary back to avoid splitting tool_use/tool_result pairs
@@ -134,9 +133,9 @@ def _adjust_boundary_for_tool_pairs(
 ) -> int:
     """Walk the keep-from boundary back to avoid splitting tool_use/tool_result pairs.
 
-    Adapted from claw-code compact.rs:130-157.
-    If the first preserved message is a tool_result, ensure its paired
-    assistant tool_use message is also preserved.
+    Truncation must never orphan a tool_result: if the first preserved
+    message is a tool_result, back the boundary up so its paired assistant
+    tool_use message is preserved too.
     """
     k = raw_keep_from
     while k > 0 and k > prefix_len:
@@ -262,11 +261,11 @@ def _format_compact_summary(summary: str) -> str:
     return text.strip()
 
 
-# ── Summary Compression (summary_compression.rs pattern) ─────────────────
+# ── Summary Compression ─────────────────────────────────────────────────
 
 @dataclass
 class SummaryCompressionBudget:
-    """Budget for compressing the summary text itself (claw-code pattern)."""
+    """Budget for compressing the summary text itself."""
     max_chars: int = 1200
     max_lines: int = 24
     max_line_chars: int = 160
@@ -275,7 +274,6 @@ class SummaryCompressionBudget:
 def compress_summary(summary: str, budget: SummaryCompressionBudget | None = None) -> str:
     """Compress a structured summary to fit within a character/line budget.
 
-    Adapted from claw-code crates/runtime/src/summary_compression.rs.
     Uses priority-based line selection:
     1. Scope/statistics lines (always keep)
     2. Section headers (keep if possible)

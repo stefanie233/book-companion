@@ -1,6 +1,5 @@
 """Conversation runtime — the core agent loop.
 
-Adapted from claw-code crates/runtime/src/conversation.rs ConversationRuntime<C, T>.
 Generic over ApiClient and ToolExecutor traits via Python Protocols.
 """
 
@@ -433,10 +432,7 @@ _ENV_TEMPLATE = (
 
 
 class ConversationRuntime:
-    """Coordinates the model loop, tool execution, permissions, and session.
-
-    Adapted from claw-code ConversationRuntime<C, T>.
-    """
+    """Coordinates the model loop, tool execution, permissions, and session."""
 
     def __init__(
         self,
@@ -973,7 +969,6 @@ class ConversationRuntime:
     def _run_health_probe(self) -> None:
         """Run a non-destructive tool probe to verify runtime is functional after compaction.
 
-        Pattern from claw-code conversation.rs run_session_health_probe (ROADMAP #38).
         If the tool executor is broken, the next turn will catch it with a clear error.
         """
         try:
@@ -983,7 +978,7 @@ class ConversationRuntime:
 
     # ── System prompt builder ───────────────────────────────────────────
 
-    # Class-level boundary marker (claw-code prompt.rs pattern)
+    # Class-level boundary marker between static and dynamic prompt layers
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__"
 
     def _build_system_prompt(self, user_input: str = "") -> str:

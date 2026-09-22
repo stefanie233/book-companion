@@ -10,9 +10,6 @@ Persona / USER.md authority split (2026-08-13):
   persona.md = AI 观察投影（描述性真实，L3 管理）
   USER.md    = 用户自我陈述（期望的对待方式，builtin 管，L3 不写）
 Conflict handling is deferred (plan 4.6 TBD).
-
-Adapted from TencentDB Agent Memory 2.0 (MemoryCore/src/core/persona/),
-book-centric for Book Companion.
 """
 
 from __future__ import annotations
@@ -30,11 +27,11 @@ from memory_pipeline.prompts import L3_PERSONA_SYSTEM_PROMPT, format_l3_prompt
 
 logger = logging.getLogger(__name__)
 
-# Max persona content length (chars) — TencentDB chat-mode default
+# Max persona content length (chars) — chat-mode default
 DEFAULT_PERSONA_MAX_CHARS = 2000
 # Only persona/instruction L1 memories above this priority feed L3 (life profile)
 DEFAULT_L3_PRIORITY_FLOOR = 60
-# P4: regenerate persona every N new L1 memories (TencentDB triggerEveryN default)
+# P4: regenerate persona every N new L1 memories (triggerEveryN default)
 DEFAULT_PERSONA_TRIGGER_EVERY_N = 50
 # Soft context budget: how many unconsumed persona memories / scenes to feed
 MAX_L3_PERSONA_MEMORIES = 30
@@ -49,7 +46,7 @@ def check_persona_trigger(
 ) -> tuple[bool, str]:
     """Decide whether to run L3 persona generation. Returns (should_run, reason).
 
-    TencentDB L3 trigger set (adapted to the book-centric pipeline):
+    L3 trigger set (adapted to the book-centric pipeline):
       P1  explicit    — agent set request_persona_update flag (persona tool)
       P2  cold start  — scenes / unconsumed persona memories exist but no
                         persona has ever been generated

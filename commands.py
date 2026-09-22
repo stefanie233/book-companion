@@ -1,4 +1,4 @@
-"""Slash command system — adapted from claw-code crates/commands/src/lib.rs.
+"""Slash command system.
 
 Declarative SlashCommandSpec table + dict-based dispatch.
 Detection: starts with '/' and first word has no additional '/' chars.
@@ -58,7 +58,7 @@ SLASH_COMMANDS: list[SlashCommandSpec] = [
 
 
 def is_slash_command(text: str) -> bool:
-    """Check if text looks like a slash command (Hermes pattern)."""
+    """Check if text looks like a slash command (a single '/cmd' token, not a path)."""
     stripped = text.strip()
     if not stripped.startswith("/"):
         return False

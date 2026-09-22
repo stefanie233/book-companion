@@ -7,8 +7,6 @@ Trigger paths:
   B. Idle timeout (default 120s)
   C. Shutdown / session end flush
   D. Pre-compress (before context compression)
-
-Adapted from TencentDB Agent Memory 2.0 (MemoryCore/src/utils/pipeline-manager.ts).
 """
 
 from __future__ import annotations

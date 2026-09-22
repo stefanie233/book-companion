@@ -4,7 +4,6 @@ Single LLM call (L2-2: 先单次调用, 场景块 >几十个时再升子 Agent).
 Reads unconsumed L1 memories from wingman DB, feeds them + existing scene
 blocks to the LLM, and applies create/update decisions to SceneStore.
 
-Adapted from TencentDB Agent Memory 2.0 (MemoryCore/src/core/scene/),
 book-centric for Book Companion (L2-1: 按书组织).
 """
 

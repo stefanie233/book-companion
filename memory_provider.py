@@ -1,7 +1,6 @@
 """Abstract base class for pluggable memory providers.
 
 Memory providers give the agent persistent recall across sessions.
-Adapted from Hermes-Agent's ``agent/memory_provider.py``.
 
 Architecture:
   - Built-in provider (MEMORY.md / USER.md) is always active

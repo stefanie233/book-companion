@@ -26,7 +26,7 @@ async def handle_context_log_list(request: web.Request) -> web.Response:
     if not recorder:
         return web.json_response({"error": "context recorder not enabled"}, status=503)
     sessions = recorder.list_sessions()
-    # Merge Hermes flight recorder sessions
+    # Merge sessions from the external recorder (when one is wired in)
     hermes_rec = request.app.get("hermes_recorder")
     if hermes_rec:
         for s in hermes_rec.list_sessions():
@@ -61,7 +61,7 @@ async def handle_context_log_round(request: web.Request) -> web.Response:
     round_data = recorder.get_round(round_id)
     if round_data and round_data.get("session_id") == session_id:
         return web.json_response(round_data)
-    # Fallback to Hermes recorder
+    # Fallback to the external recorder
     hermes_rec = request.app.get("hermes_recorder")
     if hermes_rec:
         round_data = hermes_rec.get_round(round_id)
@@ -100,13 +100,13 @@ def install_context_log_routes(app: web.Application, context_recorder) -> None:
     """Wire the flight recorder into an aiohttp app.
 
     1. Expose the recorder on the app (the SSE chat handler reads it).
-    2. Auto-detect the Hermes flight recorder DB (~/.hermes/context_log.db)
-       so the viewer can show Hermes CLI sessions alongside Book Companion ones.
+    2. Auto-detect an external session recorder DB (~/.hermes/context_log.db)
+       and show its sessions alongside Book Companion ones.
     3. Register the /api/context-log REST routes + serve the viewer page.
     """
     app["context_recorder"] = context_recorder
 
-    # Auto-detect Hermes flight recorder database (~/.hermes/context_log.db)
+    # Auto-detect the external recorder's database (~/.hermes/context_log.db)
     # 可用 BOOK_COMPANION_HERMES_DB 覆盖（换位置或指向不存在路径即禁用它）。
     env_db = os.environ.get("BOOK_COMPANION_HERMES_DB", "").strip()
     hermes_db = (Path(env_db).expanduser() if env_db

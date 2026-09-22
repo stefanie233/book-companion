@@ -1,4 +1,4 @@
-"""Permission system — adapted from claw-code crates/runtime/src/permissions.rs.
+"""Permission system.
 
 Simple mode-based authorization: a tool runs if the active mode is >= the
 tool's required mode.  No interactive prompting — this is a local CLI agent.

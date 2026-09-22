@@ -1,4 +1,4 @@
-"""Instruction file discovery -- adapted from claw-code prompt.rs discover_instruction_files().
+"""Instruction file discovery.
 
 Walks up from CWD to root, collecting .book-companion.md / CLAUDE.md files.
 Content-hash dedup prevents redundant injection. Char budgets enforced.
@@ -22,7 +22,7 @@ _INSTR_FILES_TPL = (
     else "# Project Instructions\n\n{file_blocks}"
 )
 
-# Budget limits (from claw-code prompt.rs)
+# Budget limits for injected instruction files
 MAX_TOTAL_CHARS = 12_000
 MAX_FILE_CHARS = 4_000
 

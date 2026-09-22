@@ -1,4 +1,4 @@
-"""Session data model — adapted from claw-code crates/runtime/src/session.rs."""
+"""Session data model."""
 
 from __future__ import annotations
 

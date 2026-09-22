@@ -13,7 +13,7 @@
 | 定位 | 基于 AI 的 CLI 阅读陪伴助手 |
 | 语言 | Python 3.12 |
 | 核心依赖 | asyncio + prompt_toolkit + aiohttp + OpenAI 兼容 API |
-| 设计来源 | claw-code（ReAct 循环 + 指令文件发现）+ Hermes-Agent（SOUL.md 人格 + MEMORY.md 记忆）|
+| 设计来源 | 原创为主；第三方参考与版权致谢见根目录 NOTICE |
 
 运行：`python main.py` 或项目根目录 `.bat`。
 

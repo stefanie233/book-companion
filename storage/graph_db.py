@@ -195,7 +195,7 @@ GRAPH_DDL = [
     f"CREATE INDEX IF NOT EXISTS idx_tagreg_project ON {TABLE_TAG_REGISTRY}(project_id, parent_type);",
 ]
 
-# FTS5 + triggers (v3 corrected: columns strictly aligned, per CodeGraph schema)
+# FTS5 + triggers (v3 corrected: columns strictly aligned with the nodes table)
 GRAPH_FTS_DDL = [
     f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
@@ -624,7 +624,7 @@ class GraphDB(BaseDatabase):
     ) -> dict:
         """Record feedback for an observation, adjusting trust_score.
 
-        Incremental trust model (adapted from Holographic memory):
+        Incremental trust model with temporal decay:
         - helpful=True  -> helpful_count += 1, trust += 0.05 (max 1.0)
         - helpful=False -> trust -= 0.05 (min 0.0)
         - retrieval_count += 1 on every feedback call

@@ -1,11 +1,11 @@
-"""File-based memory store — adapted from Hermes tools/memory_tool.py MemoryStore.
+"""File-based memory store.
 
 Maintains two files: MEMORY.md (agent knowledge) and USER.md (user profile).
 Entries are delimited by "§" and frozen at session start for stable system prompts.
 
 Key improvements over v1 (2026-06-02):
-  - replace: substring-matching entry replacement (Hermes parity)
-  - remove: substring-matching instead of index-based (Hermes parity)
+  - replace: substring-matching entry replacement
+  - remove: substring-matching instead of index-based
   - File locking: msvcrt (Windows) / fcntl (Unix) cross-platform
   - Atomic writes: tempfile.mkstemp + os.fsync + os.replace
   - Content scanning: injection/exfiltration pattern detection
@@ -172,7 +172,7 @@ class MemoryStore:
                 results.append(("user", entry, i))
         return results
 
-    # ── Mutation API (returns Dict like Hermes memory_tool) ─────────────────
+    # ── Mutation API (returns a structured result dict) ─────────────────
 
     def add(self, target: str, content: str) -> dict[str, Any]:
         """Append a new entry. Returns structured result dict.
@@ -279,8 +279,8 @@ class MemoryStore:
     def remove(self, target: str, old_text: str) -> dict[str, Any]:
         """Remove the entry containing old_text substring.
 
-        Accepts substring matching (Hermes-style). For index-based removal,
-        use the old_text as the exact entry content.
+        Accepts substring matching. For index-based removal, use the
+        old_text as the exact entry content.
         """
         old_text = old_text.strip()
         if not old_text:
@@ -386,7 +386,7 @@ class MemoryStore:
     def _success_response(
         self, target: str, message: str | None = None
     ) -> dict[str, Any]:
-        """Build a structured success response (Hermes-compatible format)."""
+        """Build a structured success response dict for the caller."""
         entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)

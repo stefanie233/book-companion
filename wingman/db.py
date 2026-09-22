@@ -665,7 +665,7 @@ class WingmanDatabase:
         )
         conn.commit()
 
-    # ── Persona checkpoint helpers (mirror TencentDB CheckpointManager) ─
+    # ── Persona checkpoint helpers (L3 trigger state persistence) ─
 
     def get_persona_checkpoint(self) -> dict[str, str]:
         """Read L3 trigger state."""

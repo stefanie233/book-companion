@@ -1,4 +1,4 @@
-"""Tool registry — adapted from claw-code crates/tools/src/lib.rs pattern.
+"""Tool registry.
 
 String-in/string-out tool contract. Each tool has a JSON Schema for LLM function calling.
 Built-in tools span 7 toolsets: file_reading, library_query, library_edit, knowledge, utility, file_ops, agent.
@@ -70,7 +70,7 @@ class ToolSpec:
 
 
 class ToolRegistry:
-    """Registry of available tools. String-in/string-out contract (claw-code pattern)."""
+    """Registry of available tools. String-in/string-out contract."""
 
     def __init__(self):
         self._tools: dict[str, ToolSpec] = {}
@@ -3087,7 +3087,6 @@ def create_builtin_registry(
     # ── BookGraph: context query (PRIMARY, DIRECT) ─────────────────────
     # Composes search + node + baked trace. One call gives the LLM a
     # focused subgraph so it doesn't need to chain graph_node/trace.
-    # Mirrors codegraph's context tool (always-loaded, bakes trace in).
 
     def _tool_graph_context(question: str) -> str:
         """Answer a natural-language question using the knowledge graph."""

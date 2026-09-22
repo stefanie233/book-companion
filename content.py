@@ -1,7 +1,8 @@
 """Content block types for agent messages.
 
-Adapted from claw-code crates/runtime/src/session.rs ContentBlock enum pattern.
-Strongly-typed blocks make compact/serialize/deserialize safe and explicit.
+Strongly-typed blocks make compact/serialize/deserialize safe and explicit:
+each part knows its own payload shape, so downstream conversion never has
+to guess at field meaning from a free-form dict.
 """
 
 from __future__ import annotations

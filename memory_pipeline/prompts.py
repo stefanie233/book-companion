@@ -1,6 +1,5 @@
 """L1 extraction and dedup prompts.
 
-Adapted from TencentDB Agent Memory 2.0 (MemoryCore/src/core/prompts/).
 Chinese-first, customized for Book Companion reading scenarios.
 """
 

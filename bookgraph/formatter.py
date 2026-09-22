@@ -2,8 +2,8 @@
 
 Pure functions: dict -> markdown. No LLM, no DB, no I/O.
 Output is compact markdown with chapter anchors, optimized for LLM
-consumption - mirrors codegraph's formatter philosophy: dense, located,
-schema-free (SQL column names never leak; Chinese labels used instead).
+consumption - dense, located, schema-free (SQL column names never leak;
+Chinese labels used instead).
 
 Stability contract: output must be byte-identical for identical input.
 Every iteration uses ``sorted`` over lists - never bare ``set`` or
@@ -38,7 +38,7 @@ _EVENT_TYPE_LABELS = {
 }
 
 # ── observation scoring (trust × temporal decay) ─────────────────────────────
-# Adapted from Holographic memory's FactRetriever: score = trust × 0.5^(age/half_life)
+# score = trust × 0.5^(age/half_life) — exponential half-life decay.
 # Half-life in days; 0 = disabled (trust only, no decay).
 _OBSERVATION_DECAY_HALF_LIFE_DAYS = 30
 
@@ -226,9 +226,9 @@ def format_context(context: dict, max_chapter: int | None = None) -> str:
     """Format graph_context result: entry points + relations + baked
     paths + quotes, all in one focused view.
 
-    Mirrors codegraph's context tool: one call gives the LLM enough to
-    answer without chaining node/trace. Paths are "baked" here so the
-    agent doesn't need to discover a standalone trace tool.
+    One call gives the LLM enough to answer without chaining
+    node/trace queries. Paths are "baked" here so the agent doesn't
+    need to discover a standalone trace tool.
     """
     question = context.get("question", "")
     entries = context.get("entries", [])

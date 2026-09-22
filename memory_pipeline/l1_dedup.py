@@ -2,8 +2,6 @@
 
 Phase 1: Candidate recall (no LLM, DB search by similarity)
 Phase 2: Batch LLM judgment (single call, store/skip/update/merge)
-
-Adapted from TencentDB Agent Memory 2.0 (MemoryCore/src/core/record/l1-dedup.ts).
 """
 
 from __future__ import annotations

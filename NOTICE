@@ -1,0 +1,60 @@
+Book Companion — Third-Party Notices
+====================================
+
+Book Companion 的部分代码在结构、模式或其直接实现上参考/派生自以下
+第三方项目。以下项目均为 MIT 许可；按 MIT 的要求，其版权声明在再
+分发时须随副本保留。各"版权行"均逐字抄自上游 LICENSE 文件原文，
+请勿改写（含空格与标点）。
+
+─────────────────────────────────────────────────────────────────────
+
+1. TencentDB Agent Memory
+   许可证:  MIT
+   上游:    https://github.com/TencentCloud/TencentDB-Agent-Memory
+   用途:    memory_pipeline/ 的分层记忆提取管线（L0–L3），即 L1 原子
+            记忆 / L2 场景 / L3 画像的设计模式
+   版权行:  Copyright (C) 2026 Tencent.  All rights reserved.
+
+─────────────────────────────────────────────────────────────────────
+
+2. Hermes-Agent
+   许可证:  MIT
+   上游:    https://github.com/NousResearch/hermes-agent
+   用途:    memory_store / memory_manager 的记忆读写与编排模式，
+            persona 的 SOUL.md 身份覆盖模式
+   版权行:  Copyright (c) 2025 Nous Research
+
+─────────────────────────────────────────────────────────────────────
+
+3. claw-code
+   许可证:  MIT
+   上游:    https://github.com/ultraworkers/claw-code
+   用途:    runtime/compact/session 的回合与压缩模式，context_files
+            的指令文件发现，tools/commands/permissions 的表驱动注册、
+            斜杠命令与模式权限设计
+   版权行:  Copyright (c) 2026 UltraWorkers and Claw Code contributors
+
+─────────────────────────────────────────────────────────────────────
+
+4. 内嵌前端库（reader/lib/，原样打包、未修改，均为 MIT）
+   - reader/lib/cytoscape.min.js
+     上游:    https://github.com/cytoscape/cytoscape.js
+     版权行:  Copyright (c) 2016-2024, The Cytoscape Consortium.
+              （抄自文件头原文）
+   - reader/lib/layout-base.js
+     上游:    https://github.com/iVis-at-Bilkent/layout-base
+     版权行:  Copyright (c) 2019 iVis@Bilkent
+   - reader/lib/cose-base.js
+     上游:    https://github.com/iVis-at-Bilkent/cose-base
+     版权行:  Copyright (c) 2019 - present, iVis@Bilkent.
+   - reader/lib/cytoscape-fcose.js
+     上游:    https://github.com/iVis-at-Bilkent/cytoscape.js-fcose
+     版权行:  Copyright (c) 2018 - present, iVis-at-Bilkent.
+
+   说明: 这些文件以独立的 <script> 挂载、未经修改或内联。本文件
+         已保留其版权声明，满足 MIT 的复写要求。
+
+─────────────────────────────────────────────────────────────────────
+
+维护约定: 未来新增 vendored 库或参考新的上游实现时，在对应小节
+补充"许可证 / 上游 / 用途 / 版权行（逐字）"四项即可。

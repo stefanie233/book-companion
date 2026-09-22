@@ -1,4 +1,4 @@
-"""Persona system — adapted from Hermes agent/prompt_builder.py SOUL.md pattern.
+"""Persona system.
 
 The agent identity can be overridden by placing a SOUL.md file in the project root.
 If SOUL.md exists, its content replaces the DEFAULT_IDENTITY in the system prompt.
