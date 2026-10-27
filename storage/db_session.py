@@ -16,6 +16,8 @@ from storage.models import (
     ALTER_SESSIONS_FORK_POINT_INDEX,
     ALTER_SESSIONS_KEYWORDS,
     ALTER_SESSIONS_REVIEW_COUNT,
+    ALTER_SESSIONS_ROLE_KIND,
+    ALTER_SESSIONS_ROLE_REF,
     ALTER_SESSIONS_TIME_REVIEWED,
     ALL_DDL,
     CREATE_ARCHIVABLE_INDEX,
@@ -80,6 +82,10 @@ _SESSION_MIGRATIONS: list[tuple[int, str, str | list[str]]] = [
         CREATE_LLM_USAGE_LOG,
         *CREATE_LLM_USAGE_INDEXES,
     ]),
+    (12, "Playable-role kind: character (graph) vs author (authors.db)", [
+        ALTER_SESSIONS_ROLE_KIND,
+        ALTER_SESSIONS_ROLE_REF,
+    ]),
 ]
 
 
@@ -106,12 +112,14 @@ class SessionDB(BaseDatabase):
         conn.execute(
             f"""INSERT INTO {TABLE_SESSIONS}
                 (id, project_id, parent_id, title, agent, model, mode,
-                 character_name,
+                 character_name, role_kind, role_ref, fork_point_index,
                  compaction_count, message_count, time_created, time_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
             (row.id, row.project_id, row.parent_id, row.title,
              row.agent, row.model, row.mode,
              row.character_name or "",
+             row.role_kind or "character", row.role_ref or "",
+             row.fork_point_index,
              row.compaction_count, row.message_count,
              row.time_created, row.time_updated),
         )
@@ -459,9 +467,13 @@ class SessionDB(BaseDatabase):
 
     def load_messages(self, session_id: str) -> list[dict]:
         conn = self.get_conn()
+        # Tie-break on rowid, not id: ids are random UUIDs, so sorting equal
+        # timestamps by id scrambles the order. Fork copies used to be
+        # stamped all at once (same millisecond), which made branch history
+        # load out of order.
         cur = conn.execute(
             f"SELECT * FROM {TABLE_MESSAGES} WHERE session_id=? "
-            "ORDER BY time_created ASC, id ASC;",
+            "ORDER BY time_created ASC, rowid ASC;",
             (session_id,),
         )
         messages = []
@@ -469,7 +481,7 @@ class SessionDB(BaseDatabase):
             msg = dict(mrow)
             pcur = conn.execute(
                 f"SELECT * FROM {TABLE_PARTS} WHERE message_id=? "
-                "ORDER BY time_created ASC, id ASC;",
+                "ORDER BY time_created ASC, rowid ASC;",
                 (mrow["id"],),
             )
             msg["parts"] = [dict(p) for p in pcur.fetchall()]

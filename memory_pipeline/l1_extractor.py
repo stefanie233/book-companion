@@ -3,12 +3,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from llm_json import loads_tolerant
 from memory_pipeline.prompts import L1_EXTRACTION_SYSTEM_PROMPT, format_extraction_prompt
 
 logger = logging.getLogger(__name__)
@@ -91,6 +90,7 @@ async def extract_l1(
             user_prompt,
             model=model,
             timeout=timeout,
+            scenario="memory.l1_extract",
         )
     except Exception as e:
         logger.warning("L1 extraction LLM call failed: %s", e)
@@ -104,28 +104,14 @@ async def extract_l1(
 
 
 def _parse_extraction_result(raw: str, previous_scene_name: str) -> ExtractionResult:
-    """Parse the LLM JSON response into ExtractionResult."""
-    cleaned = raw.strip()
+    """Parse the LLM JSON response into ExtractionResult.
 
-    # Strip markdown code block wrappers
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-
-    # Extract JSON array
-    array_match = re.search(r"\[[\s\S]*\]", cleaned)
-    if not array_match:
-        logger.warning("L1 extraction: no JSON array found in response")
-        return ExtractionResult(last_scene_name=previous_scene_name)
-
-    try:
-        parsed = json.loads(array_match.group())
-    except json.JSONDecodeError as e:
-        logger.warning("L1 extraction: JSON parse failed: %s", e)
-        return ExtractionResult(last_scene_name=previous_scene_name)
-
-    if not isinstance(parsed, list):
-        logger.warning("L1 extraction: response is not an array")
+    阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``。失败代价很重：调用方
+    把空结果当「没抽到记忆」，会清空 buffer 并推进 warmup —— 整批对话永久丢弃。
+    """
+    parsed = loads_tolerant(raw, expect=list)
+    if parsed is None:
+        logger.warning("L1 extraction: no parseable JSON array in response")
         return ExtractionResult(last_scene_name=previous_scene_name)
 
     scenes: list[dict] = []

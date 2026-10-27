@@ -20,3 +20,10 @@ class SessionInfo:
     agent: str | None = None
     character_name: str = ""
     fork_point_index: int | None = None
+    #: 可扮演者的种类 —— ``character``（图谱实体）| ``author``（作者层）。
+    #: 消费端**必须先看这一列**再解析名字：同一个人名在两个库里都可能有，
+    #: 而名字解析不会报错，只会悄悄给你另一个人。
+    role_kind: str = "character"
+    #: 稳定主键。``author`` 时是 ``author_id``；``character`` 时空着
+    #: （那边的键是 ``project_id`` + 正名）。
+    role_ref: str = ""

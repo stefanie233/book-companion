@@ -15,10 +15,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from flight_recorder.recorder import ContextRecorder
+from flight_recorder.recorder import ContextRecorder, session_tag
 from flight_recorder.server import install_context_log_routes
 
-__all__ = ["ContextRecorder", "create_recorder", "install_context_log_routes"]
+__all__ = ["ContextRecorder", "create_recorder", "install_context_log_routes",
+           "session_tag"]
 
 
 def create_recorder(project_dir: str | Path) -> ContextRecorder | None:

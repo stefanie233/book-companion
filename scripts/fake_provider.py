@@ -62,6 +62,8 @@ class MockState:
             "has_tools": bool(body.get("tools")),
             "fault": fault,
             "scenario_matched": matched,
+            # 客户端给的输出预算 —— 断言「撞上限后有没有抬预算」要用
+            "max_tokens": body.get("max_tokens"),
         })
         del self.requests[:-REQ_LOG_CAP]
 
@@ -145,7 +147,7 @@ def _match_rule(body: dict) -> dict | None:
 
 
 def _nonstream(body: dict, reply: str, tool_calls: list[dict],
-               reasoning: str) -> dict:
+               reasoning: str, finish: str | None = None) -> dict:
     msg: dict = {"role": "assistant", "content": reply}
     if reasoning:
         msg["reasoning_content"] = reasoning
@@ -155,7 +157,8 @@ def _nonstream(body: dict, reply: str, tool_calls: list[dict],
             "created": int(time.time()),
             "model": body.get("model", MODEL_NAME),
             "choices": [{"index": 0, "message": msg,
-                         "finish_reason": "tool_calls" if tool_calls else "stop"}],
+                         "finish_reason": finish
+                         or ("tool_calls" if tool_calls else "stop")}],
             "usage": _usage(body, reply)}
 
 
@@ -247,6 +250,9 @@ async def handle_chat(request: web.Request) -> web.StreamResponse:
         return web.Response(text="<<garbage not json>>")
     if mode == "truncated_json":
         return web.json_response(_nonstream(body, '{"nodes": ["地下室人"-', [], ""))
+    if mode == "max_tokens":
+        # 推理模型吃光预算的真实签名：HTTP 200 + 空 content + finish_reason=length
+        return web.json_response(_nonstream(body, "", [], "", finish="length"))
     if mode == "truncate":                   # partial body, connection dies
         resp = web.StreamResponse()
         await resp.prepare(request)
@@ -291,7 +297,7 @@ async def handle_fault_set(request: web.Request) -> web.Response:
         body = {}
     mode = str(body.get("mode", "")).strip()
     valid = {"http_500", "empty_stream", "garbage", "truncate",
-             "truncated_json", "delay"}
+             "truncated_json", "delay", "max_tokens"}
     if mode not in valid:
         return web.json_response(
             {"ok": False, "error": f"mode must be one of {sorted(valid)}"},

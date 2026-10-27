@@ -14,15 +14,32 @@ echo    书伴 Book Companion 启动中...
 echo ============================================
 echo.
 
+:: 0. 端口闸：8766 上已有实例就直接退出
+::    Windows 的 SO_REUSEADDR 允许两个进程同时监听同一端口，新实例既不
+::    报错也收不到流量，于是「重启了但其实没生效」。这里先拦住。
+echo [1/3] 检查端口 8766...
+set "OWNERPID="
+for /f "tokens=5" %%p in ('netstat -ano ^| findstr /r /c:"127.0.0.1:8766 .*LISTENING"') do set "OWNERPID=%%p"
+if not defined OWNERPID goto port_free
+echo.
+echo [错误] 端口 8766 已被进程 %OWNERPID% 占用
+echo        先结束它再启动：taskkill /PID %OWNERPID% /F
+echo        或关掉那个 Agent 窗口后重跑本脚本。
+echo.
+pause
+exit /b 1
+
+:port_free
+
 :: 1. 后台启动 agent（独立窗口，可交互）
 ::    优先用 .venv（setup.bat 建的），没建过则回退系统 python
 set "PY=.venv\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
-echo [1/2] 启动后端 Agent... (%PY%)
+echo [2/3] 启动后端 Agent... (%PY%)
 start "书伴 Agent" cmd /c "%PY% main.py"
 
 :: 2. 等待服务就绪（最多 60 秒；超时明确报错，不再无限死等）
-echo [2/2] 等待服务就绪...
+echo [3/3] 等待服务就绪...
 set /a tries=0
 :wait
 rem ping 代替 timeout 当 sleep：timeout 在输入被重定向时会直接报错退出

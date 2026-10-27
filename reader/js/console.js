@@ -91,7 +91,10 @@ function switchConsoleView(view) {
   document.querySelectorAll('#consoleSecNav .console-secnav-tab').forEach(t =>
     t.classList.toggle('active', t.dataset.view === view));
   document.getElementById('consoleViewDrivers').style.display = view === 'drivers' ? '' : 'none';
+  const bindView = document.getElementById('consoleViewBinding');
+  if (bindView) bindView.style.display = view === 'binding' ? '' : 'none';
   document.getElementById('consoleViewUsage').style.display = view === 'usage' ? '' : 'none';
+  if (view === 'binding' && window.BindingUI) window.BindingUI.load();
   if (view === 'usage' && window.UsageUI) window.UsageUI.load();
 }
 

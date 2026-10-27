@@ -251,6 +251,22 @@ function handleEvent(data) {
       }
       break;
 
+    case 'scopes_planned':
+      // 集类书才有这个事件：各篇自成一体，批次不跨篇（单域不发，见 scope.py）
+      addPhaseDot('叙事域', 'done', `${data.scope_count} 篇`);
+      addFeedEvent('done', '叙事域',
+        `识别为集类 · ${data.scope_count} 篇各自成域`,
+        (data.labels || []).join(' · '));
+      break;
+
+    case 'batch_unverified':
+      // 「沉默不是成功」：没验干净的批次要在进度条上看得见，不能混在一堆
+      // 「完成」里冒充收敛。
+      addFeedEvent('warn', '未验证',
+        `第 ${data.batch_index} 批未通过验证 · ${data.verify?.verdict || '?'}`,
+        `回炉 ${data.verify?.rounds || 0} 轮，残余 ${data.verify?.residual || 0} 条`);
+      break;
+
     case 'content_filtered':
       addFeedEvent('done', 'ContentFilter',
         `过滤 ${data.excluded_count} chunks`,
@@ -583,6 +599,7 @@ function iconToChar(icon) {
     case 'done': return '<i data-lucide="check"></i>';
     case 'active': return '⟳';
     case 'failed': return '<i data-lucide="x"></i>';
+    case 'warn': return '<i data-lucide="alert-triangle"></i>';
     case 'pending': return '○';
     default: return '·';
   }

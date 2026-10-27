@@ -10,125 +10,108 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from typing import Any, Callable
 
 import aiohttp
 
+from bookgraph.llm_call import (
+    MAX_OUTPUT_BUDGET, cached_tokens, is_throttle, is_truncated, output_budget,
+    reasoning_text, reasoning_tokens, retry_delay)
 from config import Config
+from llm_json import loads_tolerant
+from provider_store import config_for
 from storage.graph_db import GraphDB
+from sub_agent.types import load_prompt
 
 log = logging.getLogger("bookgraph")
 
-_BASE_EXPLORER_PROMPT = """你是一个书籍内容图谱提取器。你会收到一本书的正文片段（若干 chunk），
-你的任务是从中提取实体和关系，以及角色的经典台词和观察事件，直接产出 JSON 结果。
+# 提取器提示词在 ``prompts/subagent/book_extractor.md`` —— 这一层最需要反复改，
+# 而 Python 字符串里的转义（JSON 示例的花括号尤其）正是最难改的地方。口吻仿
+# ``book_classifier.md``：**教方法，不教答案**（旧提示词把「kind 可自由扩展」
+# 这类路径依赖写死在代码里，等于让提取器用更少的信息重做已做过的判断）。
+_EXTRACTOR_PROMPT_FALLBACK = """你是一个书籍正文提取器。你会收到一本书的正文片段
+（若干 chunk），从中提取**关系** —— 实体是关系的副产品。直接产出 JSON。
 
-提取规则：
-1. 只提取具名实体——有明确名称的人物、地点、事件、组织等。
-   人称代词（他/她/它）、泛指（有人/某个地方）不提取为独立实体。
-2. 严格遵守下方"本书世界观边界"——只提取世界观内的实体，现实元数据不提取。
-3. 实体的 kind 不限于预设列表。下方"建议 kind 分类"是默认词汇表，可自由扩展。
-4. 事件节点：描述"发生了什么"，不需要逐句提取。一个事件 = 推动剧情的一个动作或变化。
-5. 如果本批内发现两个不同名称可能指向同一实体，输出 merge_candidates
-   （confidence + reason），不要硬合并——系统会在全部提取完成后做全局消歧。
-6. 实体描述要简洁精准，1-2 句话点出该实体在故事中的身份/作用。
-7. ★ 边的 source/target 可以是：
-   a) 本批 new_nodes 中的 canonical_name
-   b) 上方"已有实体索引"中的 canonical_name
-   系统会自动解析为 node_id。优先连接到已有实体——图谱的完整性依赖于跨批次连线。
-8. chunk_id 必须填任务描述里给出的实际 chunk_id 字符串。
-9. 当前图谱已有 N 个实体节点（数量在任务描述里给出）。你产出的 new_nodes 会被系统去重——
-   如果某个名字已在图谱中存在，系统会自动复用而非新建，你只管提取。
+铁律（完整提示词文件缺失时的最小集）：
+1. 实体因做事而存在：写不出以它为端点的关系，就不要声明它。
+2. 每条断言（节点 / 边 / 观察）都要给**逐字原文** evidence，必须能在本批正文里找到。
+3. 关系要具体（mentors 优于 related_to）；是解读就标 event_type=perspective。
+4. chunk_id 必须是任务描述里给出的实际 chunk_id。
+5. 拿不准就报 merge_candidates，不要替读者决定。
 
-10. ★ 经典台词提取 ★：从正文中截取角色说的**原句**——有文学感、揭示性格、或推动情绪的关键台词。
-   每个 quote 必须包含：
-   - character_name: 说话的角色名（canonical_name）
-   - quote_text: 从原文逐字摘录的台词（10-80 字为宜，太短无信息，太长非台词）
-   - scene_context: 1 句简短场景描述（谁在什么情境下说的、对谁说）
-   - related_nodes: 与此台词相关的实体 canonical_name 列表（关联角色、地点、事件）
-   标准：每 5 个 chunk 产出 2-8 条 quotes。不要廉价对话，只要**能代表角色声音**的句子。
-   注意：角色内心独白也算 quote，quote_text 不加引号。
-
-11. ★ 观察事件（new_observations）★：对于 kind="character" 的实体，从正文中提取
-   **带原文锚点的观察**，而非结论性的性格鉴定。每个 observation 包含：
-   - node_name: 观察对象（canonical_name）
-   - field: personality / appearance / motivation / role_in_story / speaking_style
-   - value: 观察到的内容（如"暴躁但重情义""瘦高个戴金丝眼镜"）
-   - event_type: fact / perspective / opinion
-     · appearance（外貌）、role_in_story（叙事功能）多为 fact--客观可验证
-     · personality（性格）、motivation（动机）多为 perspective--你的解读
-     · opinion 仅当原文中某角色/叙述者明确表达过观点时使用
-   - subject: 视角主体。fact 填 null；perspective 填"LLM提取"；opinion 填观点来源
-   - evidence_chunk_id: 产生该观察的 chunk_id（原文锚点，必填）
-   - tags: 主题标签列表（如"信仰冲突""诀别"），可自创，见规则 13
-
-   ★ 核心原则：不下结论，只记观察。同一角色在不同章节可能有多个 personality 观察
-   （如 ch3"暴躁"、ch10"重情义"），全部追加输出，系统不覆盖。让消费端综合判断。
-   本段没观察到信息就不输出该 field，坚决不编造。
-
-12. ★ 边的类型标注（event_type）★：每条 new_edges 必须标注 event_type：
-   - fact: 客观关系。appears_in（出场于）/ mentions（提及）/ parent_of（亲属）/
-     location_of（位于）/ causes（导致）/ wrote（写了）。subject 填 null。
-   - perspective: 解读性关系。loves（爱）/ hates（恨）/ trusts（信任）/ fears（惧怕）/
-     betrays（背叛）/ mentors（教导）/ protects（保护）/ resists（对抗）/ deceives（欺骗）/
-     admires（仰慕）/ rivals（竞争）/ depends_on（依赖）。subject 填"LLM提取"。
-   - opinion: 原文中某角色/叙述者明确主张的关系。subject 填主张者。
-   也可自创 kind，但尽量具体而非笼统（"confidant" 比 "related_to" 好）。
-   ★ 关系是视角时必须标 perspective 并填 subject，不要让视角冒充事实。
-
-13. ★ 主题标签（tags）★：当某主题在正文中反复出现（如"信仰冲突""权力博弈""自我放逐"），
-   可在 new_observations 和 new_edges 的 tags 中标注。标签名自由，但系统会按 parent_type
-   归类到 fact/perspective/opinion（与所在事件的 event_type 一致）。标签用于后续主题聚合
-   与召回，不要滥用--只标真正贯穿情节的主题。
-
-14. ★ 已有实体索引使用规则 ★：
-   - 如果本批正文提到了索引中已有的实体 -> 在 new_edges 中连接它，不要创建重复的 new_node
-   - 如果发现某个名字是索引中某个实体的别称 -> 输出 new_alias（{alias, canonical_name}），而非 new_node
-   - 跨章节的事件节点应连接到索引中的相关角色，即使角色不在本批正文中
-   - 如果索引中某实体在本批出现了新的观察信息，仍可输出 new_observations（系统追加，不覆盖）
-   - 索引中已有实体的新观察，node_name 填该实体的 canonical_name 即可
-
-直接输出 JSON，无额外文本，格式严格如下：
-```json
+直接输出 JSON，无额外文本：
 {
-    "new_nodes": [
-        {"canonical_name": "...", "kind": "...", "description": "...",
-         "first_appearance_chunk_id": "..."}
-    ],
-    "new_observations": [
-        {"node_name": "...", "field": "personality", "value": "...",
-         "event_type": "perspective", "subject": "LLM提取",
-         "evidence_chunk_id": "...", "tags": ["信仰冲突"]}
-    ],
-    "new_edges": [
-        {"source": "...", "target": "...", "kind": "...", "chunk_id": "...",
-         "event_type": "fact", "subject": null, "tags": []}
-    ],
-    "new_aliases": [
-        {"alias": "...", "canonical_name": "..."}
-    ],
-    "merge_candidates": [
-        {"name_a": "...", "name_b": "...", "confidence": 0.7, "reason": "..."}
-    ],
-    "quotes": [
-        {"character_name": "...", "quote_text": "...", "scene_context": "...", "related_nodes": ["..."]}
-    ],
-    "summary": "本批 N 块完成。新建 X 实体，Y 条关系，Z 别名，Q 条台词，O 条观察。"
+  "new_nodes": [{"canonical_name","kind","why","evidence"}],
+  "new_edges": [{"source","target","kind","chunk_id","event_type","subject","evidence","tags"}],
+  "new_observations": [{"node_name","field","value","event_type","subject","evidence_chunk_id","evidence","tags"}],
+  "new_aliases": [{"alias","canonical_name"}],
+  "merge_candidates": [{"name_a","name_b","confidence","reason"}],
+  "quotes": [{"character_name","quote_text","chunk_id","scene_context","related_nodes"}],
+  "chunk_summaries": {"chunk_id": "这一块讲了什么（一句话，每块都要有）"},
+  "summary": "..."
 }
-```
 """
 
 
-def build_explorer_prompt(book_context: dict | None) -> str:
-    """Compose Explorer system prompt: base + book-specific context block."""
-    if not book_context:
-        return _BASE_EXPLORER_PROMPT
-    ctx_json = json.dumps(book_context, ensure_ascii=False, indent=2)
-    return _BASE_EXPLORER_PROMPT + (
-        "\n\n## 本书世界观边界（由前置 agent 产出，全书固定）\n\n"
-        f"{ctx_json}\n"
+def _load_extractor_prompt() -> str:
+    """读提示词文件；缺失时退回最小集，并且**出声**（沉默不是成功）。"""
+    text = load_prompt("book_extractor", _EXTRACTOR_PROMPT_FALLBACK)
+    if text == _EXTRACTOR_PROMPT_FALLBACK:
+        log.warning("prompts/subagent/book_extractor.md 缺失 —— 退到最小提示词，"
+                    "提取质量会明显下降")
+    return text
+
+
+
+def _render_text_forms(text_forms: list[dict] | None) -> str:
+    """把导入期判定的**文本形态**渲染成提取指令。
+
+    措辞是**指令**而不是参考：「按此归属，不要重新判断」。理由是提取器只看得到
+    块文本、看不到排版 —— 而这些形态是导入期逐段读过版式样张后判定的。让提取器
+    重新判断，等于让它用更少的信息重做一遍已经做过的判断。
+
+    这解决的是一个具体误判：窄门里书信（``p.calibre19``）与叙述正文
+    （``p.calibre14``）段均长都是 70 字上下，统计上分不开；不告诉提取器，
+    信里第一人称的口吻就会被归给叙述者。
+    """
+    rows = [f for f in (text_forms or [])
+            if isinstance(f, dict) and str(f.get("selector") or "").strip()]
+    if not rows:
+        return ""
+    lines = ["\n\n## 本书文本形态（导入期已逐段读过样张后判定，务必遵守）\n"]
+    for f in rows:
+        name = str(f.get("name") or "").strip() or "未命名形态"
+        ev = str(f.get("evidence") or "").strip()
+        lines.append(f"- `{f['selector']}` = **{name}**" + (f"（依据：{ev}）" if ev else ""))
+    lines.append(
+        "\n**这些形态已判定完毕，遇到时按此归属，不要重新判断。** 尤其注意："
+        "书信 / 日记 / 引文里的第一人称，口吻属于**写它的角色**，不属于叙述者 —— "
+        "不要把信里的话当成叙述者的自述。"
     )
+    lines.append(
+        "\n正文里每个段落前面可能出现 `«形态名»` 形式的**排版标注**（形如 "
+        "`«书信·日记引文» 亲爱的杰罗姆：`）。那是导入期逐段读过版式后贴上的"
+        "**位置标签**，不是原文的一部分 —— 引用原文时不要把它带进去。"
+        "没有标注的段落，是导入期未判定的普通段落。"
+    )
+    return "\n".join(lines)
+
+
+def build_explorer_prompt(book_context: dict | None,
+                          text_forms: list[dict] | None = None) -> str:
+    """Compose Explorer system prompt: base + book context + 文本形态指令。
+
+    *text_forms* 来自导入期落库的 ``book_text_forms``（见 ``db.list_text_forms``）。
+    这是「分类器 → 提取器」的回流：提取质量的提升不来自提取器变聪明，来自它的
+    环境被标注了。
+    """
+    prompt = _load_extractor_prompt()
+    if book_context:
+        ctx_json = json.dumps(book_context, ensure_ascii=False, indent=2)
+        prompt += ("\n\n## 本书世界观边界（由前置 agent 产出，全书固定）\n\n"
+                   f"{ctx_json}\n")
+    return prompt + _render_text_forms(text_forms)
 
 
 def build_node_index(index_data: list[dict]) -> str:
@@ -169,7 +152,13 @@ def build_two_tier_node_index(index_map: dict | None) -> str:
             alias_str = ""
             if n.get("aliases"):
                 alias_str = " (别称: " + ", ".join(n["aliases"]) + ")"
-            lines.append(f"  [{n['kind']}] {n['canonical_name']}{alias_str}")
+            desc = (n.get("description") or "").strip()
+            # 身份说明只给一行、最多 40 字 —— 索引是「认人」用的，不是传记。
+            if len(desc) > 40:
+                desc = desc[:40] + "…"
+            desc_str = f" —— {desc}" if desc else ""
+            lines.append(
+                f"  [{n['kind']}] {n['canonical_name']}{alias_str}{desc_str}")
     return "\n".join(lines)
 
 
@@ -178,16 +167,31 @@ def build_task_message(
     chunks: list[dict],
     total: int, done_count: int, node_count: int,
     existing_nodes_text: str = "",
+    scope_brief: str = "",
+    feedback: list[str] | None = None,
 ) -> str:
     """Build the user task message for one batch.
 
     Args:
         chunks: list of {chunk_id, chapter_index, chapter_title, chunk_index, content}
         existing_nodes_text: pre-formatted node index from build_node_index()
+        scope_brief: 叙事域简报（集类书才有，见 ``bookgraph/scope.py``）
+        feedback: 回炉轮的缺陷清单（机械体检 + 证伪趟的质疑）
     """
     lines = [
         f"来源：《{book_title}》（作者：{book_author}）",
         f"全书共 {total} 个文本块。",
+    ]
+    if scope_brief:
+        lines += ["", scope_brief]
+    if feedback:
+        lines += ["", "## 上一轮这批的问题（这一轮必须逐条处理）", ""]
+        lines += [f"  {i}. {f}" for i, f in enumerate(feedback, 1)]
+        lines += ["",
+                  "对每一条：要么在正文里找到依据、把断言改对，要么**撤回**它。"
+                  "撤回是允许的、也是被鼓励的 —— 少说、说准，比多说、说错强。"
+                  "不要重复上一轮已经被指出来的错误。"]
+    lines += [
         "",
         f"本批次共 {len(chunks)} 块：",
     ]
@@ -214,27 +218,12 @@ def build_task_message(
 
 
 def parse_explorer_json(content: str) -> dict | None:
-    """Tolerant parse of Explorer's final JSON output."""
-    if not content:
-        return None
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    start = content.find("{")
-    end = content.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(content[start:end + 1])
-        except json.JSONDecodeError:
-            pass
-    return None
+    """Tolerant parse of Explorer's final JSON output.
+
+    阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``（旧阶梯实测 106 次调用
+    失败 13 次，每次都整批节点/边/引文全丢）。
+    """
+    return loads_tolerant(content, expect=dict)
 
 
 async def run_explorer(
@@ -249,6 +238,8 @@ async def run_explorer(
     done_count: int,
     system_prompt: str,
     log_cb: Callable[[dict], None] | None = None,
+    scope_brief: str = "",
+    feedback: list[str] | None = None,
 ) -> tuple[dict | None, str | None]:
     """Run Explorer on one batch.
 
@@ -262,13 +253,22 @@ async def run_explorer(
     response, latency_ms, attempt, max_attempts, tokens_in, tokens_out,
     error_detail, parsed, node_index} — used for LLM call logging.
     """
+    cfg = config_for(cfg, "bookgraph.explorer")
     node_count = db.total_node_count(book_id)
 
     # Build node index: let the LLM see what's already in the graph.
     # Two-tier — full compact list (no aliases) + top-relevance detailed
     # subset (with aliases) — keeps the prompt small without hiding entities.
+    #
+    # **刻意不按叙事域过滤。** 曾经过滤过，代价是**复现实体被反复重命名**：
+    # 提取第 7 篇时看不见第 1 篇已建的「我」，于是给同一个人另起了「史铁生」
+    # —— 实测《我与地坛》的叙述者裂成三个节点。防串流靠的是「一批不跨篇」
+    # 加域简报，不是靠把环境藏起来；藏起来只是让提取器**看不见自己已经做过
+    # 什么**，那不是隔离，是失忆。
     chapter_indices = {ch["chapter_index"] for ch in chunks if "chapter_index" in ch}
-    index_map = db.get_node_index_two_tier(book_id, chapter_indices) if chapter_indices else None
+    index_map = db.get_node_index_two_tier(
+        book_id, chapter_indices
+    ) if chapter_indices else None
     existing_nodes_text = build_two_tier_node_index(index_map)
     node_index_counts = (
         {"compact": len(index_map.get("compact") or []),
@@ -278,7 +278,8 @@ async def run_explorer(
 
     user_msg = build_task_message(
         book_title, book_author, chunks, total, done_count, node_count,
-        existing_nodes_text=existing_nodes_text,
+        existing_nodes_text=existing_nodes_text, scope_brief=scope_brief,
+        feedback=feedback,
     )
     full_prompt = f"[system]\n{system_prompt}\n\n[user]\n{user_msg}"
     body: dict = {
@@ -289,11 +290,10 @@ async def run_explorer(
         ],
         "stream": False,
         "temperature": 0.0,
-        # Explicit output budget: without it the endpoint's default caps the
-        # answer (reasoning tokens eat the budget first), truncating the JSON
-        # mid-array -> parse_failed. 16000 is verified enough for a 5-6 chunk
-        # batch on the deepseek-v4-flash endpoint (finish_reason='stop').
-        "max_tokens": 16000,
+        # 输出预算按**总** token 算（推理 + 正文）。写死 16000 时实测 10 次调用
+        # 挂 7 次：推理就烧掉 15k，正文一个字符轮不到，端点回 HTTP 200 + 空
+        # content。见 ``bookgraph/llm_call``。下面每轮按需抬高。
+        "max_tokens": output_budget(cfg),
     }
     headers = {
         "Authorization": f"Bearer {cfg.api_key}",
@@ -303,6 +303,9 @@ async def run_explorer(
     def _emit_log(status: str, response: str, *, latency_ms: int | None,
                   attempt: int, tokens_in: int | None = None,
                   tokens_out: int | None = None,
+                  tokens_cached: int | None = None,
+                  reasoning_tokens: int | None = None,
+                  reasoning_content: str = "",
                   error_detail: str | None = None,
                   parsed: dict | None = None) -> None:
         if log_cb is None:
@@ -317,6 +320,9 @@ async def run_explorer(
                 "max_attempts": 3,
                 "tokens_in": tokens_in,
                 "tokens_out": tokens_out,
+                "tokens_cached": tokens_cached,
+                "reasoning_tokens": reasoning_tokens,
+                "reasoning_content": reasoning_content,
                 "error_detail": error_detail,
                 "parsed": parsed,
                 "node_index": node_index_counts,
@@ -325,9 +331,18 @@ async def run_explorer(
             log.warning("Explorer log_cb failed", exc_info=True)
 
     last_exc: Exception | None = None
-    for attempt in range(3):  # 1 + 2 retries
+    budget = output_budget(cfg)
+    seen_truncated = False
+    seen_parse_failed = False
+    throttled = 0
+    for attempt in range(8):
+        # 常态 3 次（1 次 + 2 次重试）够用。**限流**要多等（8 次）；**撞上限**
+        # 要给更多预算（5 次 —— 预算翻倍很快收敛，再多只是烧钱）。
+        limit = 8 if throttled else (5 if seen_truncated else 3)
+        if attempt >= limit:
+            break
         if attempt > 0:
-            await asyncio.sleep(2 ** attempt)
+            await asyncio.sleep(retry_delay(attempt, throttled))
         t0 = time.monotonic()
         try:
             async with session.post(
@@ -345,6 +360,29 @@ async def run_explorer(
                 content = data["choices"][0]["message"].get("content") or ""
                 latency_ms = int((time.monotonic() - t0) * 1000)
                 usage = data.get("usage") or {}
+                cached = cached_tokens(data)
+                think = reasoning_tokens(data)
+                think_text = reasoning_text(data)
+                if is_truncated(data):
+                    # 撞上限 ≠ 模型说胡话。空 content 多半是推理吃光了额度，
+                    # 所以**别当瞬时故障重试同样的预算** —— 加预算才有用。
+                    seen_truncated = True
+                    budget = min(budget * 2, MAX_OUTPUT_BUDGET)
+                    log.warning(
+                        "Explorer 撞上 %d token 上限（推理 %d，正文 %d 字）"
+                        "—— 预算抬到 %d 重试",
+                        body["max_tokens"], think, len(content), budget)
+                    _emit_log("truncated", content, latency_ms=latency_ms,
+                              attempt=attempt + 1,
+                              tokens_in=usage.get("prompt_tokens"),
+                              tokens_out=usage.get("completion_tokens"),
+                              tokens_cached=cached, reasoning_tokens=think,
+                              reasoning_content=think_text,
+                              error_detail=f"finish_reason=length, "
+                                           f"reasoning_tokens={think}")
+                    body["max_tokens"] = budget
+                    last_exc = RuntimeError("truncated at max_tokens")
+                    continue
                 parsed = parse_explorer_json(content)
                 if parsed is not None:
                     counts = _extraction_counts(parsed)
@@ -352,6 +390,8 @@ async def run_explorer(
                               attempt=attempt + 1,
                               tokens_in=usage.get("prompt_tokens"),
                               tokens_out=usage.get("completion_tokens"),
+                              tokens_cached=cached, reasoning_tokens=think,
+                              reasoning_content=think_text,
                               parsed=counts)
                     return parsed, None
                 log.warning("Explorer returned unparseable content: %s",
@@ -359,24 +399,38 @@ async def run_explorer(
                 _emit_log("parse_failed", content, latency_ms=latency_ms,
                           attempt=attempt + 1,
                           tokens_in=usage.get("prompt_tokens"),
-                          tokens_out=usage.get("completion_tokens"))
-                # Empty response = transient gateway fault (observed HTTP 200
-                # with content=""). Retry it like a timeout — the same prompt
-                # succeeds on replay. A non-empty malformed response is a real
-                # format error and fails immediately (no wasted retries).
-                if not content.strip():
-                    last_exc = RuntimeError("empty response")
-                    log.warning("Explorer empty response — retrying (transient)")
-                    continue
-                return None, "parse_failed"
+                          tokens_out=usage.get("completion_tokens"),
+                          tokens_cached=cached, reasoning_tokens=think,
+                          reasoning_content=think_text)
+                # 两种都重试。
+                # 空响应 = 网关瞬时故障（实测 HTTP 200 + content=""），同一条
+                # 提示词重放就正常。
+                # 非空畸形**也重试** —— 旧注释说「真格式错误，立即失败，不浪费
+                # 重试」，但算错了账：模型输出是随机的，重放常常就对了（实测这
+                # 一版模型 65 次里 2 次写出没收尾的字符串）；而**不重试的代价是
+                # 整批 5-7 块全丢**，重试只花一次调用。解析失败本身罕见
+                # （上一轮 157 次调用 0 次），所以重试不会变成常态浪费。
+                seen_parse_failed = True
+                last_exc = RuntimeError(
+                    "unparseable response" if content.strip() else "empty response")
+                log.warning("Explorer 响应无法解析（第 %d 次），重试", attempt + 1)
+                continue
         except (asyncio.TimeoutError, aiohttp.ClientError, RuntimeError) as exc:
             last_exc = exc
             latency_ms = int((time.monotonic() - t0) * 1000)
+            if is_throttle(exc):
+                throttled += 1
             log.warning("Explorer attempt %d failed: %s", attempt + 1, exc)
             continue
 
     log.error("Explorer all retries exhausted: %s", last_exc)
-    if isinstance(last_exc, asyncio.TimeoutError):
+    if seen_truncated:
+        # 预算问题不是网络问题 —— 分开报，否则「加预算」这条线索永远看不到。
+        error_type = "truncated"
+    elif seen_parse_failed:
+        # 同样要分开报：畸形响应是提示词/模型的问题，不是网络的问题。
+        error_type = "parse_failed"
+    elif isinstance(last_exc, asyncio.TimeoutError):
         error_type = "timeout"
     elif isinstance(last_exc, (RuntimeError, aiohttp.ClientError)):
         error_type = "api_error"
@@ -396,4 +450,7 @@ def _extraction_counts(parsed: dict) -> dict:
         "new_aliases": len(parsed.get("new_aliases") or []),
         "new_quotes": len(parsed.get("quotes") or []),
         "merge_candidates": len(parsed.get("merge_candidates") or []),
+        # 简述覆盖率进调用台账：模型漏写时能从 log 看出来，不用翻正文。
+        "chunk_summaries": len(
+            parsed.get("chunk_summaries") or parsed.get("summaries") or {}),
     }

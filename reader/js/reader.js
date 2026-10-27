@@ -92,6 +92,26 @@ export async function selectBook() {
   // otherwise make bookChanged always false (stale session leaks across books).
   const bookChanged = !S._lastLoadedBook || S._lastLoadedBook !== sel.value;
   S.currentBook = sel.value;
+  if (bookChanged) {
+    // 切书瞬间先清掉上一本的示数。positionMeta 只在新书定位/同步命中后
+    // 重写，首开无阅读进度的书不会命中 —— 旧的章节名会一直挂在
+    // 阅读器头上（如选《反杜林论》却显示上一本的「致柯莱伊小姐的一封信」）。
+    const metaEl = document.getElementById('positionMeta');
+    if (metaEl) metaEl.textContent = '';
+    const posEl = document.getElementById('chunkPos');
+    if (posEl) posEl.textContent = '0 / 0';
+    // 位置/选区是「上一本书」的坐标，绝不能跟着新书发出去
+    S.visibleChapters = [];
+    S.selectionSection = null;
+    S.selectionChapter = null;
+    S.selectionChunk = null;
+    S.selectionCfi = '';
+    S.selectionAnchorText = '';
+    S.lastSelection = '';
+    S.lastRange = null;
+    const selTag = document.getElementById('selectionTag');
+    if (selTag) selTag.classList.remove('visible');
+  }
   try {
     const resp = await fetch(S.API + '/api/books/' + S.currentBook + '/context');
     if (seq !== _selectSeq) return;      // 已有更新的切书请求，本次作废
@@ -125,12 +145,19 @@ export async function selectBook() {
         selectChapter();
       }
     }
-    // When switching books: clear chat, reset session, start fresh.
-    // Same-book restore (e.g. from view-state) keeps the session alive.
+    // 换了一本书 = 阅读页开新会话界面。旧会话仍留在历史里，只是不再
+    // 续写它（同一本书的 tab 切换仍会恢复今天的会话）。
+    // resetChatView 还会作废在途 loadSession / 流式回复，避免刚清空又被
+    // 上一本书的响应写回来。
     if (bookChanged) {
-      window.clearChatLog && window.clearChatLog();
-      S.chatHistory = [];
-      S.currentSessionId = '';
+      if (window.clearTabSession) window.clearTabSession('reader');
+      if (window.resetChatView) {
+        window.resetChatView();
+      } else {
+        window.clearChatLog && window.clearChatLog();
+        S.chatHistory = [];
+        S.currentSessionId = '';
+      }
       loadSessionList();
     }
     // Only a *successful* load updates _lastLoadedBook — a failed fetch

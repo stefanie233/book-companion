@@ -11,7 +11,13 @@
 export const S = {
 
   // ── API ───────────────────────────────────────────────────────
-  API: 'http://127.0.0.1:8766',
+  // 同源优先：页面由 API 服务器自己提供，换端口/换主机名都不必改代码。
+  // 写死 127.0.0.1:8766 时，从 8777 打开页面能加载、但所有 fetch 都
+  // "Failed to fetch"（前端看不出是发给谁的）。file:// 打开没有 origin，
+  // 才回退到默认端口。
+  API: (location.protocol === 'http:' || location.protocol === 'https:')
+    ? location.origin
+    : 'http://127.0.0.1:8766',
 
   // ── Reader state ──────────────────────────────────────────────
   currentBook: null,
@@ -32,14 +38,39 @@ export const S = {
   lastSelection: '',
   lastRange: null,
   selectionSource: 'book',
+  // Structural coordinates of the selection (book text only). Native EPUB
+  // selections carry the epub section (spine position); chunk-mode
+  // selections carry the DB chapter/chunk. The backend resolves either to
+  // (chapter, chunk) — the selection is "already seen" evidence, used to
+  // anchor context and raise the spoiler gate.
+  selectionSection: null,
+  selectionChapter: null,
+  selectionChunk: null,
+  selectionCfi: '',
+  // Selected text plus ~40 chars before / 120 after, from the same Range.
+  // A bare word ("杨修") can occur in several chunks; the anchor text
+  // disambiguates which chunk the reader actually selected.
+  selectionAnchorText: '',
+  // Chapters visible in the viewport, mapped by /api/sync. Sent with chat
+  // so the gate never sits below what the reader can already see.
+  visibleChapters: [],
 
   // ── Chat / mode ───────────────────────────────────────────────
   currentMode: 'immersive',
   currentCharacterName: '',
+  currentRoleKind: 'character',   // 'character'=图谱实体 | 'author'=作者层
+  currentRoleRef: '',             // author 时是 author_id（稳定主键）
   currentMaxChapter: null,        // null=global, int=spoiler-free
   currentSessionId: '',           // active chat session; empty = new session
+  // 主页 / 阅读页 / 写作页三条会话线各自独立（工作区存在 app.js 的
+  // bc_tab_sessions；currentSessionId 永远只是「当前页这条线」的指针）。
   chatHistory: [],                // [{role, content}] — sent to backend
   chatLastTimestamp: 0,           // ms — for time-separator logic
+  // Bumped whenever the visible conversation is replaced (loadSession /
+  // newSession). In-flight streams capture it so a late typewriter tick or
+  // error handler can never write a reply from the old branch into the new
+  // session's chatHistory (which the backend uses as context).
+  chatEpoch: 0,
 
   // ── Shelf ─────────────────────────────────────────────────────
   shelfSort: { key: 'time', dir: 'asc' },
@@ -47,8 +78,11 @@ export const S = {
 
   // ── Roleplay setup transient state ────────────────────────────
   rpSelectedBookId: null,
+  rpSelectedBookTitle: '',        // remembered for the 「返回角色列表」 re-entry
   rpSelectedCharName: null,
   rpSelectedCharChapter: null,    // first appearance chapter (for immersive default)
+  rpSelectedRoleKind: 'character',  // 'character' | 'author'
+  rpSelectedRoleRef: '',            // author_id when kind='author'
 
   // ── Search ────────────────────────────────────────────────────
   searchMode: 'proximity',        // 'proximity' | 'chapter'

@@ -16,6 +16,9 @@ class Config:
     model: str = "gpt-4o"
     refinement_model: str = ""  # Model for refinement pipeline (defaults to model if empty)
     search_api_key: str = ""
+    # 原生联网搜索的 Anthropic 兼容端点（如 https://api.deepseek.com/anthropic）。
+    # 留空 = 按 api_base 自动推导（host 是 *.deepseek.com 时）。
+    native_search_base: str = ""
     # Embedding (optional — if unset, keyword retrieval is used)
     embedding_api_key: str = ""
     embedding_model: str = ""
@@ -37,6 +40,9 @@ class Config:
     compact_preserve_recent: int = 4
     compact_max_tokens: int = 10_000
     auto_compact_threshold: int = 100_000
+    # 图谱链路单次调用的输出预算（总 token：推理 + 正文）。推理模型光思考就
+    # 要 15k+，给小了会「HTTP 200 但 content 为空」。0 = 用 bookgraph 默认值。
+    graph_max_tokens: int = 64_000
     # Context meter alert line (注意力衰减早于窗口上限; 前端圆环刻度)
     context_alert_ratio: float = 0.35
     # 0 = unlimited (archive Phase 2 consolidation keeps size in check)
@@ -83,6 +89,11 @@ class Config:
     @property
     def sessions_db_path(self) -> Path:
         return self.project_dir / "data" / "sessions.db"
+
+    @property
+    def writing_db_path(self) -> Path:
+        """WriteGraph 的写作状态库（作品正典图另存 graphs/graph_wk_*.db）。"""
+        return self.project_dir / "data" / "writing.db"
 
     @property
     def graphs_dir(self) -> Path:
@@ -151,6 +162,7 @@ def load_config(project_dir: Path | None = None) -> Config:
         model=env.get("BOOK_COMPANION_MODEL", settings.get("model", "gpt-4o")),
         refinement_model=env.get("REFINEMENT_MODEL", settings.get("refinement_model", "")),
         search_api_key=env.get("BOOK_COMPANION_SEARCH_API_KEY", ""),
+        native_search_base=env.get("BOOK_COMPANION_NATIVE_SEARCH_BASE", ""),
         # Embedding (optional — activates semantic search when set)
         embedding_api_key=env.get("EMBEDDING_API_KEY", ""),
         embedding_model=env.get("EMBEDDING_MODEL", ""),
@@ -162,6 +174,7 @@ def load_config(project_dir: Path | None = None) -> Config:
         compact_preserve_recent=settings.get("compact", {}).get("preserve_recent_messages", 4),
         compact_max_tokens=settings.get("compact", {}).get("max_estimated_tokens", 10_000),
         auto_compact_threshold=settings.get("compact", {}).get("auto_threshold", 100_000),
+        graph_max_tokens=settings.get("graph", {}).get("max_tokens", 64_000),
         memory_char_limit=settings.get("memory", {}).get("char_limit", 0),
         user_memory_char_limit=settings.get("memory", {}).get("user_char_limit", 0),
         scan_folder=env.get("BOOK_COMPANION_SCAN_FOLDER",

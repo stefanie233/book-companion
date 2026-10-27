@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from pathlib import Path
 from typing import Any
 
 import usage_log
+from llm_json import loads_tolerant
 
 logger = logging.getLogger(__name__)
 
@@ -79,33 +79,15 @@ def build_conversation_text(messages: list[dict]) -> str:
 
 
 def _parse_json_response(response: str) -> list[dict]:
-    """Parse LLM JSON response with fallback for common formatting issues."""
-    # Direct parse
-    try:
-        data = json.loads(response)
-        if isinstance(data, list):
-            return data
-    except json.JSONDecodeError:
-        pass
+    """Parse LLM JSON response with fallback for common formatting issues.
 
-    # Extract from markdown code block
-    m = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", response, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-
-    # Find any JSON array
-    m = re.search(r"\[.*\]", response, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
-
-    logger.warning("Phase 1: could not parse JSON from response: %s", response[:200])
-    return []
+    阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``。
+    """
+    data = loads_tolerant(response, expect=list)
+    if data is None:
+        logger.warning("Phase 1: could not parse JSON from response: %s", response[:200])
+        return []
+    return data
 
 
 # ── Phase 1: Session extraction ────────────────────────────────────────────
@@ -149,6 +131,7 @@ async def extract_phase1(
                 system_prompt=_EXTRACT_SYSTEM_PROMPT,
                 user_message=prompt,
                 model=model,
+                scenario="memory.archive",
             )
     except Exception as exc:
         logger.error("Phase 1 LLM call failed: %s", exc)
@@ -268,6 +251,7 @@ async def consolidate_phase2(
                 system_prompt="你是一个精确的文本整理助手。只输出要求的 JSON 格式，不要额外内容。",
                 user_message=prompt,
                 model=model,
+                scenario="memory.archive",
             )
     except Exception as exc:
         logger.error("Phase 2 LLM call failed: %s", exc)
@@ -313,35 +297,18 @@ async def consolidate_phase2(
 
 
 def _parse_phase2_response(response: str) -> dict | None:
-    """Parse Phase 2 JSON output: {"memory": [...], "user": [...]}."""
-    # Direct parse
-    try:
-        data = json.loads(response)
-        if isinstance(data, dict) and ("memory" in data or "user" in data):
-            return data
-    except json.JSONDecodeError:
-        pass
+    """Parse Phase 2 JSON output: {"memory": [...], "user": [...]}.
 
-    # Extract from markdown code block
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL)
-    if m:
-        try:
-            data = json.loads(m.group(1))
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
+    阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``。
 
-    # Find any JSON object
-    m = re.search(r"\{.*\}", response, re.DOTALL)
-    if m:
-        try:
-            data = json.loads(m.group(0))
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
-
+    键校验对**所有**解析路径一律生效（旧代码只有直解分支校验，两个 fallback
+    分支接受任意 dict）。这不只是整洁问题：调用方拿到结果后会
+    ``memory_store.memory_entries = list(parsed.get("memory", []))`` 直接覆盖
+    并落盘 —— 一个围栏包裹的 ``{"foo": 1}`` 会让旧代码**清空全部记忆**。
+    """
+    data = loads_tolerant(response, expect=dict)
+    if isinstance(data, dict) and ("memory" in data or "user" in data):
+        return data
     logger.warning("Phase 2: could not parse JSON from response: %s", response[:200])
     return None
 

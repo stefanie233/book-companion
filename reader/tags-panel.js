@@ -1,6 +1,7 @@
-/* 章节标注面板 — 覆盖层便利贴的前端入口。
+/* 标注面板 — 书籍信息编辑 + 覆盖层便利贴的前端入口。
  *
- * 书架卡 hover "章节标注"按钮 → 弹窗列出全部章节 + 当前类型（◉便利贴/○原表），
+ * 书架卡 hover "标注"按钮 → 弹窗顶部可改书名/作者（电子书源的书名常不干净，
+ * 导入时 LLM 清洗的兜底），下方列出全部章节 + 当前类型（◉便利贴/○原表），
  * 行内下拉 + 备注 + 保存/清除即时改 human override（book_chapter_overrides）。
  *
  * 与 graph-panel.js 同一家族：ensureModal + openXxxPanel 挂 window。
@@ -9,6 +10,7 @@
 
 import { S } from './js/state.js';
 import { escapeHtml } from './js/utils.js';
+import { loadShelf, refreshBooks } from './js/shelf.js';
 
 // ── 类型中文映射（与 api_server._type_label / CLI chapter_type_editor 同款）────
 const LABELS = {
@@ -39,8 +41,14 @@ function ensureModal() {
     <div class="tag-modal-backdrop" onclick="closeTagPanel()"></div>
     <div class="tag-modal-content">
       <div class="tag-modal-header">
-        <h2 id="tagModalTitle">章节标注</h2>
+        <h2 id="tagModalTitle">标注</h2>
         <button class="tag-modal-close" onclick="closeTagPanel()">×</button>
+      </div>
+      <div class="tag-book-info">
+        <span class="tbi-label">书籍信息</span>
+        <input class="tbi-input tbi-title" id="tbiTitle" placeholder="书名" maxlength="200">
+        <input class="tbi-input tbi-author" id="tbiAuthor" placeholder="作者" maxlength="100">
+        <button class="tag-save" id="tbiSave" onclick="saveBookInfo()">保存</button>
       </div>
       <div class="tag-modal-body" id="tagModalBody">
         <!-- dynamic content -->
@@ -62,10 +70,14 @@ function ensureModal() {
 
 // ── Open / close ─────────────────────────────────────────────────────
 
-function openTagPanel(bookId, bookTitle) {
+function openTagPanel(bookId, bookTitle, bookAuthor) {
   currentBookId = bookId;
   ensureModal();
-  document.getElementById('tagModalTitle').textContent = '章节标注 — ' + (bookTitle || bookId);
+  document.getElementById('tagModalTitle').textContent = '标注 — ' + (bookTitle || bookId);
+  // 书籍信息预填：值来自书架刚渲染的数据，和卡片上所见一致
+  document.getElementById('tbiTitle').value = bookTitle || '';
+  document.getElementById('tbiAuthor').value = bookAuthor || '';
+  document.getElementById('tbiSave').textContent = '保存';
   document.getElementById('tagModal').style.display = 'flex';
   loadChapters();
 }
@@ -74,6 +86,38 @@ function closeTagPanel() {
   const modal = document.getElementById('tagModal');
   if (modal) modal.style.display = 'none';
   currentBookId = '';
+}
+
+// ── 书籍信息（书名/作者）保存 ─────────────────────────────────────────
+// 电子书源的书名常不干净；导入时 LLM 清洗是一次性的，这里是人工兜底。
+
+async function saveBookInfo() {
+  const title = document.getElementById('tbiTitle').value.trim();
+  const author = document.getElementById('tbiAuthor').value.trim();
+  if (!title) { alert('书名不能为空'); return; }
+  const btn = document.getElementById('tbiSave');
+  btn.textContent = '保存中...';
+  try {
+    const resp = await fetch(
+      S.API + '/api/books/' + encodeURIComponent(currentBookId),
+      {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, author }),
+      },
+    );
+    const data = await resp.json();
+    if (data.error) { alert('保存失败：' + data.error); btn.textContent = '保存'; return; }
+    // 面板标题跟着新书名走；书架卡片 + 阅读器书单就地刷新
+    document.getElementById('tagModalTitle').textContent = '标注 — ' + data.book.title;
+    btn.textContent = '已保存';
+    setTimeout(() => { btn.textContent = '保存'; }, 1200);
+    loadShelf();
+    refreshBooks();
+  } catch (e) {
+    alert('保存失败：' + e.message);
+    btn.textContent = '保存';
+  }
 }
 
 // ── Load / render ────────────────────────────────────────────────────
@@ -197,3 +241,4 @@ async function tagClear(index) {
 // ── HTML onclick access ──────────────────────────────────────────────
 window.openTagPanel = openTagPanel;
 window.closeTagPanel = closeTagPanel;
+window.saveBookInfo = saveBookInfo;

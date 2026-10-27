@@ -9,9 +9,10 @@ the browser:
 1. **The code never streams** — the think-parser waits for the closing
    ``</think>`` and holds the whole reasoning block, so the reader stares at
    nothing for the entire reasoning phase and then gets one blob.
-2. **The process is stale** — ``api_server.py`` was rewritten on disk while an
-   older process kept serving the old module object.  Every endpoint still
-   answers, so the bug that was already fixed looks alive.
+2. **The process is stale** — the HTTP layer (``api_server.py`` + ``api/``)
+   was rewritten on disk while an older process kept serving the old module
+   objects.  Every endpoint still answers, so the bug that was already fixed
+   looks alive.
 
 This probe separates them.  It talks raw TCP (bypassing any HTTP-client
 buffering), timestamps each ``recv()``, counts the SSE frames that actually
@@ -20,7 +21,7 @@ on disk.
 
 Usage::
 
-    python scripts/sse_stream_probe.py                 # probe :8765
+    python scripts/sse_stream_probe.py                 # probe :8766
     python scripts/sse_stream_probe.py --port 8802
     python scripts/sse_stream_probe.py --message "解释熵"
 
@@ -30,17 +31,14 @@ Exit status: 0 = streaming healthy, 1 = not streaming, 2 = server unreachable.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import socket
 import sys
 import time
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-API_SERVER = PROJECT_ROOT / "api_server.py"
 
 # A live stream must deliver reasoning in many small frames.  One frame per
 # phase is the signature of whole-block buffering.
@@ -48,17 +46,19 @@ MIN_THINK_EVENTS = 5
 
 
 def _disk_fingerprint() -> dict:
-    """Fingerprint api_server.py exactly the way the server reports it."""
+    """Fingerprint the HTTP layer exactly the way the server reports it.
+
+    Delegates to ``api_server._code_fingerprint`` so the probe and the
+    server can never drift apart on scope (the routes live in ``api/``
+    as well as ``api_server.py``).
+    """
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
     try:
-        raw = API_SERVER.read_bytes()
-    except OSError as exc:
+        from api_server import _code_fingerprint
+        return _code_fingerprint()
+    except Exception as exc:  # pragma: no cover - diagnostics only
         return {"error": str(exc)}
-    return {
-        "api_server_sha256": hashlib.sha256(raw).hexdigest()[:16],
-        "api_server_mtime": datetime.fromtimestamp(
-            API_SERVER.stat().st_mtime).isoformat(timespec="seconds"),
-        "api_server_bytes": len(raw),
-    }
 
 
 def _health(host: str, port: int) -> dict:
@@ -154,7 +154,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--port", type=int, default=8766)
     ap.add_argument("--message", default="用一句话解释什么是熵")
     ap.add_argument("--mode", default="immersive")
     args = ap.parse_args()

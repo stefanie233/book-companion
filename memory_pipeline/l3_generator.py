@@ -250,6 +250,7 @@ async def generate_l3(
             user_prompt,
             model=model,
             timeout=timeout,
+            scenario="memory.l3",
         )
     except Exception as e:
         logger.warning("L3 generation LLM call failed: %s", e)

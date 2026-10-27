@@ -3,11 +3,21 @@
 Layer-0 test infra. Aggregates the checks that used to live only in session
 memory into a single entry point; run it after any non-trivial change.
 
-  python scripts/check_all.py [--only module-tests|registry|fake-provider|fixtures|frontend-js]
+  python scripts/check_all.py [--only module-tests|undefined-names|registry|fake-provider|fixtures|frontend-js]
 
 Checks:
   module-tests    scripts/test_model_profiles.py / test_provider_store.py /
-                  test_usage_log.py (assert scripts, tmpdir-isolated)
+                  test_usage_log.py / test_llm_json.py (assert scripts)
+  undefined-names whole-repo static scan: every name used but never bound in
+                  its module. Catches the two shapes nothing else sees — an
+                  undefined *annotation* name (frozen by
+                  `from __future__ import annotations`, so it only ever shows
+                  as an IDE squiggle) and an undefined name in a *function
+                  body* (a real NameError, but only on the branch that runs).
+                  No mypy/pyright config exists, and runtime suites can't
+                  reach it: `logger` sat undefined in runtime.py's graph-
+                  evolution path for months because only the success branch
+                  touched it, inside a try that swallowed the first throw.
   registry        create_builtin_registry() boots; core tools resolvable
   fake-provider   fake_provider.py boots on a free port; chat (plain + SSE),
                   embeddings, models, scenario rules and fault injection
@@ -22,6 +32,8 @@ Checks:
 
 from __future__ import annotations
 
+import ast
+import builtins
 import json
 import os
 import shutil
@@ -37,7 +49,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 MODULE_TESTS = ["test_model_profiles.py", "test_provider_store.py",
-                "test_usage_log.py"]
+                "test_usage_log.py", "test_llm_json.py",
+                "test_graph_invariants.py", "test_graph_recorder.py",
+                "test_graph_selection.py", "test_graph_scope.py",
+                "test_graph_orchestrator.py", "test_chunk_reuse.py",
+                "test_graph_llm_budget.py", "test_graph_e2e.py",
+                "test_author_graph.py", "test_author_enrich_e2e.py",
+                "test_author_sources.py", "test_author_voice.py",
+                "test_author_dossier.py",
+                "test_web_search_service.py",
+                "test_writegraph.py", "test_writegraph_vcs.py",
+                "test_writegraph_git_ops.py", "test_writing_voice.py",
+                "test_writing_git_tools.py", "test_chat_mode_context.py",
+                "test_chat_context.py"]
 
 
 @dataclass
@@ -72,6 +96,80 @@ def check_module_tests() -> CheckResult:
     detail = "\n".join(fails)
     return CheckResult("module-tests", "FAIL" if fails else "PASS",
                        detail, time.monotonic() - t0)
+
+
+# ── undefined-names ───────────────────────────────────────────────────────
+# 判据刻意宽松：名字只要在文件**任何地方**绑定过就算数（哪怕在别的函数、
+# 别的分支里）。宁可漏报也不误报 —— 这个检查只有恒绿才有价值，一旦出现
+# 假阳性就会被绕过。它抓的是「本模块根本没这个名字」这一类。
+
+# Python 在模块里自动提供的名字，不在 builtins 里但随时可用。
+_MODULE_GLOBALS = frozenset({
+    "__file__", "__name__", "__doc__", "__package__", "__spec__",
+    "__loader__", "__builtins__", "__annotations__", "__dict__",
+    "__path__", "__debug__", "__class__",
+})
+
+# 非项目代码 / 用户数据：扫它们只会制造噪音。
+_SKIP_DIRS = frozenset({
+    "__pycache__", ".git", ".venv", "venv", ".codegraph", ".claude",
+    "node_modules", "data",
+})
+
+
+def _module_bindings(tree: ast.AST) -> set[str]:
+    """模块里出现过的所有绑定名（宽松）。"""
+    names: set[str] = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            names |= {(a.asname or a.name).split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            names |= {a.asname or a.name for a in n.names}
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(n.name)
+        elif isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            names.add(n.id)
+        elif isinstance(n, ast.arg):
+            names.add(n.arg)
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            names.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            names |= set(n.names)
+        elif isinstance(n, ast.MatchAs) and n.name:
+            names.add(n.name)          # case x:
+        elif isinstance(n, ast.MatchStar) and n.name:
+            names.add(n.name)          # case [*rest]:
+        elif isinstance(n, (ast.TypeVar, ast.ParamSpec, ast.TypeVarTuple)):
+            names.add(n.name)          # PEP 695: def f[T]()
+    return names
+
+
+def check_undefined_names() -> CheckResult:
+    """Whole-repo: names that are loaded but never bound in their module."""
+    t0 = time.monotonic()
+    hits: list[str] = []
+    scanned = 0
+    for path in sorted(ROOT.rglob("*.py")):
+        if _SKIP_DIRS & set(path.parts):
+            continue
+        rel = path.relative_to(ROOT)
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError) as exc:
+            hits.append(f"{rel}: unparseable — {exc}")
+            continue
+        scanned += 1
+        have = _module_bindings(tree) | set(dir(builtins)) | _MODULE_GLOBALS
+        seen: dict[str, int] = {}
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                if n.id not in have:
+                    seen.setdefault(n.id, n.lineno)
+        for name, line in sorted(seen.items(), key=lambda kv: kv[1]):
+            hits.append(f"{rel}:{line}: {name}")
+    return CheckResult("undefined-names", "FAIL" if hits else "PASS",
+                       "\n".join(hits) or f"{scanned} files clean",
+                       time.monotonic() - t0)
 
 
 def check_registry() -> CheckResult:
@@ -252,6 +350,7 @@ def check_fixtures() -> CheckResult:
 
 CHECKS = {
     "module-tests": check_module_tests,
+    "undefined-names": check_undefined_names,
     "registry": check_registry,
     "fake-provider": check_fake_provider,
     "fixtures": check_fixtures,

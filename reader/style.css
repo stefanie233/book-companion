@@ -445,8 +445,10 @@ i[data-lucide] {
   justify-content: space-between;
   gap: var(--space-md);
   padding: var(--space-xs) 0 var(--space-sm);
-  backdrop-filter: blur(7px);
-  -webkit-backdrop-filter: blur(7px);
+  /* No backdrop-filter here. A live blur on a sticky element re-samples
+     the shelf behind it on every scroll frame — the single biggest cause
+     of the home-page scroll dropping frames. The 0.88-alpha tint gradient
+     on .shelf-sticky-head already carries legibility. */
 }
 .shelf-sticky-head.compact #continueSection { margin-bottom: 0; }
 .shelf-sticky-head.compact #continueSection > .shelf-section-title {
@@ -476,14 +478,15 @@ i[data-lucide] {
   margin-bottom: 0;
   flex-wrap: nowrap;
 }
-#shelfStickyHeader > .shelf-section-title {
+#shelfStickyHeader .shelf-header-lead { min-width: 0; }
+#shelfStickyHeader .shelf-header-lead > .shelf-section-title {
   max-height: 40px;
   overflow: hidden;
   transition: max-height 320ms var(--ease-out),
               opacity 320ms var(--ease-out),
               margin-bottom 320ms var(--ease-out);
 }
-.shelf-sticky-head.compact #shelfStickyHeader > .shelf-section-title {
+.shelf-sticky-head.compact #shelfStickyHeader .shelf-header-lead > .shelf-section-title {
   max-height: 0;
   opacity: 0;
   margin-bottom: 0;
@@ -576,11 +579,34 @@ i[data-lucide] {
   position: relative;
   z-index: 1;
   --book-w: clamp(92px, 9.5vw, 130px);
+  /* 行改 flex 纵排：flex 子项的 margin 互不折叠，
+     下面 headroom 的正负 margin 才能逐行精确相抵。 */
+  display: flex;
+  flex-direction: column;
 }
 
 .shelf-row {
   position: relative;
+  /* hover 上浮的头部余量。content-visibility:auto 按规范强制 paint
+     containment —— 行把所有后代裁在自己的 padding box 里，书上浮超出
+     行顶的部分被整段裁掉（封面顶端裁平露出墙色，2026-09-25 截图实测
+     上浮 26px 全没）。padding 把裁剪边界抬高 P，等量负 margin 把行盒
+     顶边抬回原位上方 P 处：盒顶上移 P、盒高加 P ⇒ 盒底不动，行距
+     margin-bottom 原样不动 ⇒ 内容与下一行全部原位，只有裁剪框变高。
+     （若再给 margin-bottom 补 P，盒顶会被顶回原处、内容整体下坠 P ——
+     第一版就这么错的。）36px = 上浮 14px + 底部原点 scale(1.05) 抬升
+     （最高书约 10px）+ 阴影余量。 */
+  --lift-headroom: 36px;
+  padding-top: var(--lift-headroom);
+  margin-top: calc(-1 * var(--lift-headroom));
   margin-bottom: clamp(36px, 5vh, 54px);
+}
+/* content-visibility:auto only pays off on long shelves. For a normal
+   library (a handful of rows) it makes the browser lay out/paint each row
+   as it scrolls into view — a hitch per row, every pass. `is-long` is set
+   by renderShelfRows above a row threshold; below it, all rows render once
+   and scrolling is pure compositing. */
+.shelf-grid.is-long .shelf-row {
   /* skip layout/paint of off-screen rows entirely; intrinsic size
      keeps the scrollbar stable before a row is first rendered */
   content-visibility: auto;
@@ -833,6 +859,16 @@ i[data-lucide] {
   to   { transform: rotate(1.6deg); }
 }
 
+/* Scroll-time budget: pause the decorative infinite animations while the
+   shelf is actively scrolling (class toggled by initStickyCompact). They
+   resume right after. Continuous transform/opacity animations are cheap
+   individually, but dozens of them still compete with the scroll
+   compositor on integrated GPUs. */
+.is-scrolling-home .book-ribbon,
+.is-scrolling-home .scene-dust span {
+  animation-play-state: paused;
+}
+
 /* Hover scrim with title / author */
 .scene-book-scrim {
   position: absolute;
@@ -841,7 +877,9 @@ i[data-lucide] {
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
-  padding: 10px 12px;
+  /* 底部留出 34px 动作条的高度 + 一点间隙：书名/作者永远在条的上方，
+     不被玻璃条压住。条本身有深色底，不需要依靠 scrim 压暗。 */
+  padding: 10px 12px 46px;
   background: var(--scrim);
   opacity: 0;
   transition: opacity 0.3s var(--ease-out);
@@ -925,6 +963,15 @@ i[data-lucide] {
   margin-bottom: 0;
 }
 
+/* 标题 + 导入入口同一组：书名在左，导入紧随其后（书架自己的动作）。 */
+.shelf-header-lead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
 .shelf-header-actions {
   display: flex;
   align-items: center;
@@ -955,16 +1002,17 @@ i[data-lucide] {
   transform: rotate(20deg);
 }
 
-.shelf-sort-bar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-sm);
+/* ── Sort: one trigger button + collapsed dropdown panel ────────────
+   Five modes no longer fit as a flat pill row. Trigger keeps the old
+   pill look so the toolbar still reads the same; the panel holds the
+   five options. The notes panel reuses .sort-btn with its own theme
+   later in this file — these selectors stay out of its way. */
+.shelf-sort-wrap {
+  position: relative;
   flex-shrink: 0;
 }
 
-/* E-commerce style filter pills — scoped to the shelf bar; the notes
-   panel reuses .sort-btn with its own theme later in this file. */
-#shelfSortBar .sort-btn {
+.sort-trigger {
   appearance: none;
   border: 1px solid var(--scene-chip-border);
   background: var(--scene-chip-bg);
@@ -975,57 +1023,272 @@ i[data-lucide] {
   cursor: pointer;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 6px;
   box-shadow: 0 1px 4px rgba(60, 50, 30, 0.08);
   transition: background var(--duration-fast), border-color var(--duration-fast), color var(--duration-fast);
 }
-#shelfSortBar .sort-btn:hover {
+.sort-trigger:hover {
   background: var(--scene-chip-hover);
   color: var(--scene-ink);
 }
-#shelfSortBar .sort-btn.active {
+.shelf-sort-wrap.open .sort-trigger {
   background: var(--scene-pill-active-bg);
   border-color: var(--scene-pill-active-bg);
   color: var(--scene-pill-active-ink);
 }
-#shelfSortBar .sort-btn .sort-dir {
-  font-size: 0.65rem;
-  opacity: 0.7;
+
+/* Panel stays in the DOM when collapsed (no display:none) — that is what
+   makes the slide-out/collapse transition possible. visibility is delayed
+   on close, otherwise the panel vanishes before the fade finishes. */
+.sort-panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 168px;
+  padding: var(--space-xs);
+  /* 用 --card-bg 而不是 --scene-chip-bg：后者在夜景主题下是
+     rgba(255,255,255,0.08)（为深色墙面上的一枚淡胶囊设计的），
+     拿来做浮在书封上方的面板底会让文字彻底读不清。--card-bg 两套主题都是实心。 */
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-drop);
+  z-index: 40;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transform: translateY(-8px) scaleY(0.92);
+  transform-origin: top right;
+  transition: opacity var(--duration-fast) var(--ease-out),
+              transform var(--duration-base) var(--ease-out),
+              visibility 0s linear var(--duration-base);
 }
-#shelfSortBar .sort-btn.active .sort-dir {
+.shelf-sort-wrap.open .sort-panel {
   opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  transform: none;
+  transition: opacity var(--duration-fast) var(--ease-out),
+              transform var(--duration-base) var(--ease-out),
+              visibility 0s;
 }
 
-/* Delete button on shelf book hover */
-.shelf-delete-btn {
-  position: absolute;
-  bottom: 8px;
-  right: 8px;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: #c0392b;
-  border: 2px solid #e74c3c;
-  color: #fff;
-  font-size: 16px;
+/* Rows cascade in on open. --so-delay is referenced only by opacity and
+   transform, so hover feedback on the background stays instant even on
+   the last row (a blanket transition-delay would have lagged it 100ms). */
+.sort-option {
+  --so-delay: 0ms;
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 7px 10px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-caption);
+  color: var(--scene-ink-2);
   cursor: pointer;
+  opacity: 0;
+  transform: translateY(-4px);
+  transition: opacity .16s var(--ease-out) var(--so-delay),
+              transform .18s var(--ease-out) var(--so-delay),
+              background var(--duration-fast);
+}
+.shelf-sort-wrap.open .sort-option { opacity: 1; transform: none; }
+.shelf-sort-wrap.open .sort-option:nth-child(1) { --so-delay: 20ms; }
+.shelf-sort-wrap.open .sort-option:nth-child(2) { --so-delay: 40ms; }
+.shelf-sort-wrap.open .sort-option:nth-child(3) { --so-delay: 60ms; }
+.shelf-sort-wrap.open .sort-option:nth-child(4) { --so-delay: 80ms; }
+.shelf-sort-wrap.open .sort-option:nth-child(5) { --so-delay: 100ms; }
+.sort-option:hover { background: var(--scene-chip-hover); color: var(--scene-ink); }
+.sort-option.active {
+  background: var(--scene-pill-active-bg);
+  color: var(--scene-pill-active-ink);
+}
+.sort-option .so-label { flex: 1; }
+.sort-option .so-dir {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.65rem;
+  opacity: 0.75;
+}
+
+/* 「自定义」行右侧的整理入口。整行本身是切排序的，所以这里必须
+   stopPropagation（写在 HTML 的 onclick 里），否则点它会把排序也切了。 */
+.sort-option .so-edit {
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 2px;
+  margin-left: 2px;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  /* 这是进入整理模式的唯一入口（选中「自定义」不会再自动进入），
+     所以静止态要看得见，不能做成 hover 才浮现的弱提示。 */
+  opacity: 0.8;
+  cursor: grab;
+  display: inline-flex;
+  align-items: center;
+}
+.sort-option .so-edit:hover { opacity: 1; background: rgba(127, 127, 127, 0.18); }
+
+/* ── 整理模式：拖动书本排自定义顺序 ────────────────────────────────
+   进入后整个书架退化成一块排序面板，三件事必须同时关掉：
+     · 入场动画与 hover 抬升 —— 拖动时封面会自己弹起来，且每次重渲染重播
+     · 离屏行的 content-visibility —— 否则跨行拖动时离屏卡片 rect 归零，
+       插入位会算错（症状很隐蔽：拖到后面几行才开始错）
+     · 卡片角标 —— 防止拖到一半误触删除 */
+.shelf-reorder-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+}
+/* 作者样式里的 display:flex 会盖掉 UA 的 [hidden]{display:none}，必须显式写 */
+.shelf-reorder-bar[hidden] { display: none; }
+.srb-hint {
+  font-size: var(--fs-caption);
+  color: var(--scene-ink-2);
+  opacity: 0.8;
+}
+.srb-done {
+  appearance: none;
+  border: 1px solid var(--scene-pill-active-bg);
+  background: var(--scene-pill-active-bg);
+  color: var(--scene-pill-active-ink);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: var(--fs-caption);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 拖动时别让指针划过的文字被选起来 */
+body.shelf-reordering { user-select: none; }
+
+/* 入场动画的抑制单独用一个类，且**退出整理模式时不摘掉**。
+   理由：CSS 动画在 animation-name 变化时会重启 —— 从 .reordering 上摘掉
+   animation:none，等于让 animation 从 none 变回 shelve-in，整个书架的
+   卡片会当场重播一遍入场（21 本、延迟最长 900ms），看着像故障。
+   这个类由 renderShelfRows 按 _reorderMode 决定去留，所以下一次真正
+   的新渲染（切排序、重载）会把它摘掉，入场动画自然恢复。 */
+.shelf-grid.no-enter-anim .scene-book { animation: none; }
+
+.shelf-grid.reordering .shelf-row { content-visibility: visible; }
+.shelf-grid.reordering .scene-book { cursor: grab; }
+.shelf-grid.reordering .scene-book:hover { z-index: 1; }
+.shelf-grid.reordering .scene-book:hover .scene-book-lift {
+  transform: rotate(var(--tilt));
+}
+/* 倾斜的内联 --tx/--ty 已由 JS 闸门挡住；这里把姿态钉在静止值兜底。
+   注意不能写 transform:none —— 那会让书变平，和正常状态不是一个样子
+   （同 style.css 里 prefers-reduced-motion 那段注释的理由）。 */
+.shelf-grid.reordering .scene-book-inner { --tx: 0; --ty: -0.21; }
+/* 整理模式下手柄在卡片上，动作条会抢指针，也不该可点。 */
+.shelf-grid.reordering .book-actions { display: none; }
+
+/* 被拖起来的那张卡。transform 落在 .scene-book 上 —— 它是命中层，
+   但整理模式下悬停语义已经关掉，不会触发那套「命中层几何不能变」的抖动。 */
+.shelf-grid.reordering .scene-book.dragging { z-index: 50; cursor: grabbing; }
+.shelf-grid.reordering .scene-book.dragging .scene-book-lift {
+  transform: rotate(var(--tilt));
+}
+.shelf-grid.reordering .scene-book.dragging .scene-book-inner {
+  box-shadow: 0 18px 44px -8px rgba(0, 0, 0, 0.45);
+}
+
+/* 插入位指示条：JS 只写 transform，滑动交给这里的 transition */
+.shelf-drop-slot {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 30;
+  transition: transform .18s var(--ease-out);
+}
+
+/* ── 书架卡片的动作条 ─────────────────────────────────────────────
+   三个动作（图谱 / 标注与书籍信息 / 删除）曾经是三个 32px 的高饱和圆点，
+   分居封面左上、右上、右下，hover 时各自再放大 1.35 倍。它们一浮出来就
+   压掉封面一大块 —— 而书架的设计语言是「实物」（木板、微倾、书脊高光、
+   随指针躲闪），三个 Web 徽章恰好把它破掉。
+
+   现在收成一条贴底的动作排：通栏、无底色、无边框、图标 17px。它直接坐在
+   .scene-book-scrim 自己的底部渐变上——那层渐变本来就随 hover 一起出现，
+   于是没有任何「工具栏」被贴上去，只是封面下缘暗下来、浮出三个图标。
+   只在卡片 hover 或键盘焦点落进来时滑出（:focus-within 一并处理 ——
+   opacity:0 不移出 Tab 顺序，之前键盘用户会 Tab 进三个看不见的按钮）。
+   删除默认与另外两个同色，只有它自己被 hover 才转红：危险色应该出现在
+   「已经瞄准了它」的时刻，而不是每本书都亮着。
+
+   刻意不用 backdrop-filter：它会给每张卡建一层 backdrop root，26 本书
+   一起挂在滚动合成器上，正是文件顶部那条滚动预算在防的事；而底部渐变
+   已经提供了足够对比，不需要再模糊。 */
+.book-actions {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 7;
+  height: 36px;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 6;
+  gap: 6px;
+  padding: 0 4px;
+  /* 无边框、无底色，只在自己这 36px 里补一段透明→暗的柔光。
+     和 scrim 叠起来刚好把图标托住，又不会出现一条「工具栏」的硬边。 */
+  background: linear-gradient(180deg, rgba(18, 15, 12, 0) 0%,
+                              rgba(18, 15, 12, 0.66) 100%);
+  opacity: 0;
+  transform: translateY(100%);
+  pointer-events: none;
+  transition: opacity 0.2s var(--ease-out), transform 0.28s var(--ease-out);
+}
+.scene-book:hover .book-actions,
+.scene-book:focus-within .book-actions {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.book-act {
+  width: 30px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   padding: 0;
   margin: 0;
-  line-height: 1;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
-  transition: transform 0.12s var(--ease-out), background 0.12s, border-color 0.12s, opacity 0.2s var(--ease-out);
-  opacity: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: rgba(248, 243, 233, 0.9);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
 }
-.scene-book:hover .shelf-delete-btn { opacity: 1; }
-.shelf-delete-btn:hover {
-  background: #e74c3c;
-  border-color: #ff6b6b;
-  transform: scale(1.35);
-  opacity: 1;
+.book-act svg { width: 18px; height: 18px; }
+.book-act:hover { color: #fff; background: rgba(246, 240, 228, 0.18); }
+.book-act.book-act-danger { color: rgba(248, 243, 233, 0.62); }
+.book-act.book-act-danger:hover { color: #ff8272; background: rgba(231, 76, 60, 0.24); }
+.book-act:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(22, 18, 14, 0.9), 0 0 0 3px rgba(246, 240, 228, 0.85);
+}
+
+/* 触屏没有 hover：动作排常驻。封面底部没有渐变兜底（scrim 不出现），
+   所以这里自己补一层很淡的底，否则浅色封面上图标会糊掉。
+   第二档会换成 ⋯ + 长按菜单。 */
+@media (hover: none) {
+  .book-actions {
+    opacity: 1;
+    transform: translateY(0);
+    pointer-events: auto;
+    background: linear-gradient(180deg, rgba(18, 15, 12, 0) 0%,
+                                rgba(18, 15, 12, 0.72) 100%);
+  }
 }
 
 .shelf-empty {
@@ -1074,6 +1337,13 @@ i[data-lucide] {
   flex-direction: column;
   overflow: hidden;
   position: relative;
+  /* Collapse/expand animates the panel's own box; the splitter animates to
+     0 width in step so the freed space goes to the reading pane smoothly.
+     The reader iframe is resized only after the transition (JS timer). */
+  transition: width 280ms var(--ease-out),
+              min-width 280ms var(--ease-out),
+              max-width 280ms var(--ease-out),
+              padding 280ms var(--ease-out);
 }
 #chatPanel.hidden {
   display: none;
@@ -1249,8 +1519,18 @@ h2 {
   background: var(--border);
   cursor: col-resize;
   flex-shrink: 0;
-  transition: background var(--duration-fast) var(--ease-out);
+  overflow: hidden;
   position: relative;
+  transition: width 280ms var(--ease-out),
+              opacity 180ms var(--ease-out),
+              background var(--duration-fast) var(--ease-out);
+}
+/* Collapsed with the chat panel: give the reading pane the 6px back too,
+   instead of yanking it with display:none (which makes the layout jump). */
+.splitter.collapsed {
+  width: 0;
+  opacity: 0;
+  pointer-events: none;
 }
 .splitter:hover,
 .splitter.active { background: var(--accent); }
@@ -1398,6 +1678,13 @@ button.danger:hover { background: var(--danger); color: #fff; }
    layout; epub.js provides its own internal scrolling. */
 .book-page-native[hidden] { display: none !important; }
 .book-page-native { overflow: hidden; }
+/* 关掉 epub 滚动树上的 scroll anchoring：fork 的 counter 是 prepend 补偿的
+   唯一所有者（v2 视口守卫后几何正确）。anchoring 默认开启，会在 view reframe
+   的强制布局点先把 scrollTop 抬一个 section 高度，counter 再补一次 = +2H
+   弹回（2026-09-24 flingProbe 实锤：每次跳变 dTop≈2×d，快速上滚章节边界
+   稳定复现"空降回"）。宿主与全部后代都关——epub.js 的滚动容器由 stage 动态
+   创建、类名不可预知，后代通配最稳。同款先例见 #page-home。 */
+.book-page-native, .book-page-native * { overflow-anchor: none; }
 
 .book-page-inner {
   padding: var(--space-xl) var(--space-2xl);
@@ -1478,13 +1765,28 @@ button.danger:hover { background: var(--danger); color: #fff; }
   stroke-linejoin: round;
 }
 .chat-toggle-btn:hover { color: var(--text-strong); background: var(--bg-surface); }
-/* Hide all other content when collapsed */
+/* Fade the content out as the panel narrows. `visibility` flips after the
+   fade so the clipped transcript is not painted during the width
+   transition, and comes back immediately when expanding. */
+#chatPanel .chat-header h2,
+#chatPanel .chat-body {
+  transition: opacity 140ms var(--ease-out),
+              visibility 0s linear 0s;
+}
 #chatPanel.collapsed .chat-header h2,
 #chatPanel.collapsed .chat-body {
-  display: none;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 140ms var(--ease-out),
+              visibility 0s linear 140ms;
 }
 .right.collapsed .chat-header {
   margin-bottom: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  #chatPanel, .splitter,
+  #chatPanel .chat-header h2, #chatPanel .chat-body { transition: none; }
 }
 
 .chat-body {
@@ -1492,6 +1794,9 @@ button.danger:hover { background: var(--danger); color: #fff; }
   display: flex;
   flex-direction: column;
   overflow: hidden;    /* clip so flex children respect height constraints */
+  position: relative;  /* mode-prelude 浮层锚点 */
+  /* 面板可拖窄：预选药丸与输入区按容器宽度自适应（见 @container 320px） */
+  container-type: inline-size;
   font-size: var(--t-chat-font-size, var(--fs-secondary));
   color: var(--t-chat-font-color, var(--text-primary));
 }
@@ -1540,6 +1845,12 @@ button.danger:hover { background: var(--danger); color: #fff; }
 .chat-log .msg.agent {
   margin-right: auto;
 }
+
+/* 还没收到任何内容的 agent 行**整行不画**。
+   JS 一直在 setBubbleHTML 里挂 `is-pending`，但这条规则从来没有过 ——
+   于是「等模型」的那段时间里，界面上下都挂着一个白色空壳，
+   后端一旦不响应，它就一直挂在那儿，看起来像坏掉了。 */
+.chat-log .msg.is-pending { display: none; }
 
 @keyframes msgIn {
   from { opacity: 0; transform: translateY(6px); }
@@ -1761,6 +2072,27 @@ button.danger:hover { background: var(--danger); color: #fff; }
   white-space: nowrap;
 }
 .send-btn:hover { background: var(--bg-raised); color: var(--text-primary); }
+/* 生成中：同一个按钮变成「停止」，不额外占位。 */
+.send-btn.stop {
+  color: #ff4444;
+  border-color: rgba(255, 68, 68, 0.6);
+}
+.send-btn.stop:hover {
+  background: rgba(255, 68, 68, 0.12);
+  color: #ff4444;
+}
+
+/* Agent 回复被用户打断：正文照常显示，尾部留一枚轻标记。 */
+.interrupt-note {
+  align-self: flex-start;
+  margin: 2px 0 8px 8px;
+  padding: 1px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+  user-select: none;
+}
 
 .mic-btn.recording {
   border-color: #ff4444;
@@ -1983,9 +2315,141 @@ button.danger:hover { background: var(--danger); color: #fff; }
   gap: 6px;
   /* 交互栏嵌在限宽（45%）的聊天面板里，药丸行 nowrap 时最右侧的「会话」
      会被裁到屏幕外。允许换行——宽度够时仍是单行，不够时折成两行而不是
-     丢按钮。三个浮层（mode-picker/ctx-pop 为 fixed，session-panel 为
-     bottom:100% 锚定）都不受换行影响。 */
+     丢按钮。浮层（ctx-pop 为 fixed，session-panel 为 bottom:100% 锚定）
+     都不受换行影响。 */
   flex-wrap: wrap;
+}
+
+/* ── Reading mode prelude (empty session only) ──────────────────
+   仅在阅读页的空白会话里浮在聊天框中央：先挑一种读法，发出第一条
+   消息后整块消失——该会话的模式就此冻结。轨迹用凹陷纸面，选中项是
+   一枚浮起的白药丸，和书架上的纸卡同一套语言。 */
+.mode-prelude {
+  display: none;
+  position: absolute;
+  left: 50%;
+  top: 40%;
+  transform: translate(-50%, -50%);
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  z-index: 2;
+  pointer-events: none;   /* 只有药丸可点，别挡住日志区的滚动与选择 */
+  animation: modePreludeIn 220ms var(--ease-out);
+}
+.mode-prelude.visible { display: flex; }
+.mode-prelude .mode-seg {
+  pointer-events: auto;
+  box-shadow: 0 2px 12px rgba(60, 48, 30, 0.08);
+}
+.mode-prelude-hint {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  letter-spacing: 0.02em;
+  user-select: none;
+}
+html[data-theme="night"] .mode-prelude .mode-seg {
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+}
+
+@keyframes modePreludeIn {
+  from { opacity: 0; transform: translate(-50%, calc(-50% + 6px)); }
+  to   { opacity: 1; transform: translate(-50%, -50%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mode-prelude { animation: none; }
+}
+
+.mode-seg {
+  position: relative;      /* 滑动药丸的锚点 */
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+/* 选中块独立成一层：切档时整块滑过去，文字颜色各自过渡。
+   位移与果冻形变由 mode.js 用 WAAPI 驱动（可中断、带挤压/回弹）。 */
+.mode-seg-thumb {
+  position: absolute;
+  top: 3px;
+  left: 0;
+  height: calc(100% - 6px);
+  width: var(--seg-thumb-w, 0px);
+  transform: translateX(var(--seg-thumb-x, 0px));
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 1px 2px rgba(60, 48, 30, 0.14);
+  pointer-events: none;
+  z-index: 0;
+  will-change: transform;
+}
+html[data-theme="night"] .mode-seg-thumb {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+.mode-seg-opt {
+  appearance: none;
+  position: relative;      /* 文字压在滑动药丸之上 */
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: var(--fs-caption);
+  line-height: 1.5;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--duration-fast) var(--ease-out);
+}
+.mode-seg-opt i[data-lucide],
+.mode-seg-opt svg.lucide { width: 1.05em; height: 1.05em; }
+/* 悬停只提亮文字：全局 button:hover 会给按钮铺 --bg-raised，在药丸上正好
+   把白色选中块盖成聊天框同色 —— 这里显式顶掉背景与边框。 */
+.mode-seg-opt:hover {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-primary);
+}
+.mode-seg-opt.active:hover { color: var(--text-strong); }
+.mode-seg-opt.active { color: var(--text-strong); }
+.mode-seg-opt.active i[data-lucide],
+.mode-seg-opt.active svg.lucide { color: var(--accent); }
+.mode-seg-opt:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  box-shadow: none;   /* 顶掉全局 button:focus-visible 的双层阴影，只留一圈描边 */
+}
+/* JS 还没量好第一枚药丸之前的兜底（正常首帧内就会被替换掉） */
+.mode-seg:not(.thumb-ready) .mode-seg-opt.active {
+  background: var(--bg-surface);
+  border-color: var(--border);
+  box-shadow: 0 1px 2px rgba(60, 48, 30, 0.14);
+}
+html[data-theme="night"] .mode-seg {
+  background: var(--bg-sunken);   /* 夜里凹槽要比选中项更深，白药丸才浮得起来 */
+}
+
+/* 聊天面板可拖窄：窄到放不下三个标签时只留图标（名字退到 title 提示）。
+   用容器查询而不是视口断点——面板宽度由 splitter 决定，和窗口宽度无关。 */
+@container (max-width: 320px) {
+  .mode-seg-opt span { display: none; }
+  .mode-seg-opt { padding: 5px 10px; }
+  .mode-seg-opt i[data-lucide],
+  .mode-seg-opt svg.lucide { width: 1.15em; height: 1.15em; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mode-seg-opt { transition: none; }
 }
 
 /* Book import button — home page chat */
@@ -2097,6 +2561,47 @@ button.danger:hover { background: var(--danger); color: #fff; }
   padding: 5px 16px;
 }
 
+/* Path entry form — replaces window.prompt, which has no placeholder support
+   and gives no way back to an editable field after a failed scan. */
+.scan-path-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-sm);
+}
+.scan-path-hint {
+  font-size: var(--fs-caption);
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+.scan-path-error {
+  color: #ff6b6b;
+  word-break: break-all;
+}
+.scan-path-row {
+  display: flex;
+  gap: var(--space-sm);
+}
+.scan-path-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  font-family: inherit;
+  font-size: var(--fs-secondary);
+  color: var(--text-primary);
+  background: var(--bg-base);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+.scan-path-input:focus { border-color: var(--accent); }
+.scan-path-input::placeholder { color: var(--text-muted); opacity: 0.75; }
+.scan-path-row button {
+  flex-shrink: 0;
+  font-size: var(--fs-caption);
+  padding: 5px 14px;
+}
+
 .mode-toggle {
   appearance: none;
   display: inline-flex;
@@ -2117,49 +2622,6 @@ button.danger:hover { background: var(--danger); color: #fff; }
 .mode-toggle .mode-icon { font-size: var(--fs-secondary); }
 .mode-toggle .mode-caret { font-size: 0.625rem; opacity: 0.7; }
 
-.mode-picker {
-  display: none;
-  position: fixed;
-  background: var(--bg-sunken);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  box-shadow: 0 -4px 12px rgba(0,0,0,0.3);
-  min-width: 240px;
-  z-index: 100;
-  overflow: hidden;
-}
-.mode-picker.visible { display: block; }
-
-.mode-option {
-  padding: 8px 12px;
-  cursor: pointer;
-  border-bottom: 1px solid var(--border);
-  transition: background var(--duration-fast) var(--ease-out);
-}
-.mode-option:last-child { border-bottom: none; }
-.mode-option:hover { background: var(--bg-surface); }
-.mode-option.active { background: var(--accent-soft); }
-.mode-option.active .mo-name { color: var(--accent); }
-
-.mode-option .mo-name {
-  display: block;
-  font-size: var(--fs-secondary);
-  color: var(--text-primary);
-  font-weight: 500;
-}
-.mode-option .mo-desc {
-  display: block;
-  font-size: var(--fs-caption);
-  color: var(--text-muted);
-  margin-top: 2px;
-}
-
-.mode-option.mode-option-roleplay {
-  border-top: 1px solid var(--border);
-  margin-top: 4px;
-  padding-top: 10px;
-}
-
 /* ── Session panel (chat history) ─────────────────────────── */
 .session-toggle {
   margin-left: auto;
@@ -2178,6 +2640,7 @@ button.danger:hover { background: var(--danger); color: #fff; }
   min-width: 300px;
   max-width: 360px;
   max-height: 400px;
+  /* 空会话的模式预选浮在聊天框中央；历史面板展开时压在它上面 */
   z-index: 100;
   overflow: hidden;
   display: flex;
@@ -2460,31 +2923,53 @@ button.danger:hover { background: var(--danger); color: #fff; }
 .session-item:hover .si-archive { opacity: 0.7; }
 .session-item .si-archive:hover { opacity: 1; color: var(--hl-gold); }
 
-/* ── Branch switcher (chat bubble footer) ────────────────── */
+/* ── Branch switcher (DeepSeek-style ‹ 1/N › at fork points) ── */
+.branch-switcher-row {
+  flex-basis: 100%;
+  display: flex;
+  margin-top: 2px;
+}
+.msg.user .branch-switcher-row { justify-content: flex-end; }
+.msg.agent .branch-switcher-row { justify-content: flex-start; }
+
 .branch-switcher {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  margin-top: 4px;
-  padding: 1px 6px;
-  background: var(--bg-surface);
+  gap: 1px;
+  padding: 1px 3px;
   border-radius: 10px;
   font-size: 0.7rem;
+  line-height: 1;
   color: var(--text-muted);
+  background: transparent;
+  transition: background var(--duration-fast) var(--ease-out);
 }
+.branch-switcher:hover { background: var(--bg-surface); }
 .branch-switcher .bs-btn {
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   background: none;
   border: none;
   color: var(--text-muted);
   cursor: pointer;
-  padding: 0 4px;
-  font-size: 0.7rem;
-  line-height: 1;
-  border-radius: 3px;
+  padding: 0;
+  border-radius: 4px;
   transition: color var(--duration-fast) var(--ease-out), background var(--duration-fast) var(--ease-out);
 }
-.branch-switcher .bs-btn:hover { color: var(--accent); background: var(--border); }
-.branch-switcher .bs-label { padding: 0 2px; user-select: none; }
+.branch-switcher .bs-btn svg { width: 13px; height: 13px; }
+.branch-switcher .bs-btn:hover:not(:disabled) {
+  color: var(--accent);
+  background: var(--border);
+}
+.branch-switcher .bs-btn:disabled { opacity: 0.25; cursor: default; }
+.branch-switcher .bs-label {
+  padding: 0 3px;
+  user-select: none;
+  font-variant-numeric: tabular-nums;
+}
 
 /* ── Inline editor (重新输入) ────────────────────────────── */
 .inline-editor-msg {
@@ -2729,11 +3214,468 @@ button.danger:hover { background: var(--danger); color: #fff; }
 }
 .rp-btn-primary:hover { opacity: 0.85; }
 
+/* ── Author timeline — 一根轴，上下两半 ─────────────────────────────── */
+
+/* 作者视图是图谱页里的**第二层画布**，不是弹窗：占的是 #graphPageLayout
+   原来那块地方，顶上是同一条工具条。所以这里没有任何浮层样式 ——
+   没有遮罩、没有圆角外框、没有阴影。 */
+.atl-view {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-base);
+  overflow: hidden;
+}
+.atl-view[hidden] { display: none; }
+
+.atl-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-lg);
+  padding: 14px 24px 10px;
+  flex: 0 0 auto;
+}
+.atl-back {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  font-size: var(--fs-secondary);
+  cursor: pointer;
+  transition: var(--transition-interact);
+  flex-shrink: 0;
+}
+.atl-back:hover { color: var(--text-primary); background: var(--bg-raised); }
+.atl-eyebrow {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 10.5px; letter-spacing: .22em; text-transform: uppercase;
+  color: var(--text-muted);
+}
+.atl-eyebrow svg { width: 12px; height: 12px; }
+.atl-title-row { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+#atlTitle {
+  font-size: 30px; font-weight: 600; letter-spacing: .015em;
+  color: var(--text-strong); line-height: 1.25;
+}
+.atl-sub {
+  font-size: 15px; letter-spacing: .03em;
+  color: var(--text-muted); font-variant-numeric: tabular-nums;
+}
+.atl-body {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  overflow-y: auto;
+}
+/* 选人页 / 空态 / 报错：不是舞台，走普通内边距 */
+.atl-body > .rp-hint, .atl-body > .rp-char-list, .atl-body > .rp-empty,
+.atl-body > .rp-loading, .atl-body > .rp-error { margin: 18px 24px; }
+
+/* ── 概览条 ─────────────────────────────────────────────────────── */
+.atl-summary {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 12px 24px 10px;
+  flex: 0 0 auto;
+}
+.atl-chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 13px; border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);   /* 用 token 而不是写死白色：夜色下白底浅字读不出 */
+  font-size: 14px; color: var(--text-secondary);
+}
+.atl-chip.is-warn {
+  color: var(--accent);
+  border-color: rgba(180, 90, 45, .42);
+  background: rgba(180, 90, 45, .06);
+}
+.atl-swatch { width: 9px; height: 9px; border-radius: 50%; }
+.atl-swatch.work { background: #b46a2e; }
+.atl-swatch.life { background: #4f7f8a; }
+.atl-hint {
+  margin-left: auto;
+  font-size: 12.5px; color: var(--text-muted); opacity: .72;
+  letter-spacing: .02em;
+}
+
+/* ── 舞台：可拖动、可缩放的画布 ─────────────────────────────────── */
+/* 舞台就是图谱画布本身：满宽、无边框、同一片点阵 + 四周暗角。
+   它不再是「对话框里的一块面板」—— 上一版那圈 1px 边框与圆角正是
+   「这是一个弹窗」的视觉证据。 */
+.atl-stage {
+  position: relative;
+  flex: 1; min-height: 0;
+  background-color: var(--bg-base);
+  background-image: radial-gradient(circle, rgba(255, 255, 255, .05) 1px,
+                                    transparent 1.2px);
+  background-size: 26px 26px;
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+/* 上下各留一道渐隐：画布比舞台高，卡片在边缘本就会被裁。
+   硬切一刀像 bug，渐渐化进背景才读得出「上面还有」。 */
+.atl-stage::after {
+  content: '';
+  position: absolute; inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(180deg, var(--bg-base) 0, transparent 22px,
+                    transparent calc(100% - 22px), var(--bg-base) 100%),
+    radial-gradient(ellipse at center, transparent 55%,
+                    rgba(0, 0, 0, .26) 100%);
+  z-index: 2;
+}
+.atl-stage.atl-grabbing { cursor: grabbing; }
+.atl-canvas {
+  position: absolute; left: 0; top: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+/* 年代底纹：竖线 + 交替浅带 + 顶部年代标签 —— 给水平方向一个节拍 */
+.atl-band {
+  position: absolute; top: 0; bottom: 0;
+  background: rgba(180, 90, 45, .028);
+  pointer-events: none;
+}
+.atl-grid {
+  position: absolute; top: 0; width: 1px;
+  background: linear-gradient(180deg, transparent, var(--border) 10%,
+              var(--border) 90%, transparent);
+  opacity: .4; pointer-events: none;
+}
+/* 年代标签挂在轴上方（top 由 JS 按轴位算），给水平方向一个「纪年」的锚 */
+.atl-decade {
+  position: absolute; transform: translateX(-50%);
+  padding: 0 8px;
+  font-size: 13px; letter-spacing: .24em;
+  color: var(--text-muted); opacity: .8;
+  background: var(--bg-base);
+  border-radius: 4px;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+
+/* 唯一的那根轴 —— 上半作品、下半生平。
+   4px 厚、带一道 SVG 刻纹（仿旧谱牒的界栏），两端各收一颗菱形端饰。 */
+.atl-axis {
+  position: absolute; left: 0; right: 0; height: 5px;
+  transform: translateY(-2.5px);
+  border-radius: 2.5px;
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='66' height='5' viewBox='0 0 66 5'%3E%3Cpath d='M0 1.4h66' stroke='%23f7f3ec' stroke-opacity='.5' stroke-width='1'/%3E%3Cg stroke='%233b3122' stroke-opacity='.28' stroke-width='.9'%3E%3Cpath d='M9 1v3M25 1.8v1.4M42 1v3M58 1.8v1.4M17 1.4v2.2M50 1.4v2.2'/%3E%3C/g%3E%3Cpath d='M0 4.2h66' stroke='%235f5340' stroke-opacity='.3' stroke-width='.7'/%3E%3C/svg%3E"),
+    repeating-linear-gradient(118deg, rgba(70, 58, 40, .10) 0 1px,
+                              transparent 1px 4px),
+    linear-gradient(90deg, rgba(138, 122, 95, 0) 0, #9d8d70 90px,
+                    #8a7a5f 50%, #9d8d70 calc(100% - 90px),
+                    rgba(138, 122, 95, 0) 100%);
+  background-repeat: repeat-x, repeat, no-repeat;
+  background-size: 66px 5px, 4px 4px, 100% 100%;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, .55),
+              0 -1px 0 rgba(44, 36, 22, .07),
+              0 2px 8px rgba(180, 90, 45, .07);
+  pointer-events: none;
+}
+.atl-axis::before, .atl-axis::after {
+  content: "";
+  position: absolute; top: 50%; width: 7px; height: 7px;
+  margin-top: -3.5px;
+  transform: rotate(45deg);
+  background: #8a7a5f; opacity: .5;
+  border-radius: 1px;
+}
+.atl-axis::before { left: -5px; }
+.atl-axis::after { right: -5px; }
+.atl-tick {
+  position: absolute; width: 1px; height: 7px;
+  transform: translateY(-7px);
+  background: var(--border); opacity: .8;
+}
+.atl-tick.is-major {
+  height: 13px; transform: translateY(-13px);
+  background: var(--text-muted); opacity: .5;
+}
+.atl-year {
+  position: absolute; transform: translateX(-50%);
+  font-size: 14px; letter-spacing: .06em;
+  color: var(--text-muted); opacity: .85;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+
+/* 节点原点 = **轴上的那个点**。卡片靠 inline 的 bottom/top 往外挪，
+   所以圆点永远钉在轴上 —— 它标的是年份，不是层级。 */
+.atl-node { position: absolute; width: 0; height: 0; }
+/* 抬起来的那张卡不该被相邻层压住 */
+.atl-node:hover { z-index: 5; }
+.atl-up   { --atl-color: #b46a2e; --atl-tint: 180, 106, 46; }
+.atl-down { --atl-color: #4f7f8a; --atl-tint: 79, 127, 138; }
+.atl-dot {
+  position: absolute; left: -7px; top: -7px;
+  width: 14px; height: 14px; border-radius: 50%;
+  background:
+    radial-gradient(circle at 35% 30%, rgba(255, 255, 255, .55), transparent 55%),
+    var(--atl-color);
+  box-shadow: 0 0 0 3px var(--bg-base), 0 1px 4px rgba(44, 36, 22, .28);
+  transition: transform .18s var(--ease-out), box-shadow .18s var(--ease-out);
+}
+.atl-node:hover .atl-dot {
+  transform: scale(1.35);
+  box-shadow: 0 0 0 3px var(--bg-base),
+              0 0 0 10px rgba(var(--atl-tint), .15),
+              0 2px 7px rgba(44, 36, 22, .24);
+}
+
+/* 轴上的点 → 卡片的竖线 */
+.atl-stem {
+  position: absolute; left: -.5px; width: 1px;
+  pointer-events: none;
+}
+.atl-up .atl-stem {
+  bottom: 0;
+  background: linear-gradient(0deg, rgba(var(--atl-tint), .55),
+              rgba(var(--atl-tint), .1));
+}
+.atl-down .atl-stem {
+  top: 0;
+  background: linear-gradient(180deg, rgba(var(--atl-tint), .55),
+              rgba(var(--atl-tint), .1));
+}
+
+/* 条目卡片：三行封顶，全文在 title 里 */
+.atl-card {
+  position: absolute; left: -170px; width: 340px;
+  padding: 14px 20px 15px;
+  background: rgba(255, 255, 255, .86);
+  border: 1px solid rgba(213, 206, 192, .9);
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(44, 36, 22, .06);
+  transition: transform .18s var(--ease-out),
+              box-shadow .18s var(--ease-out),
+              background .18s var(--ease-out),
+              opacity .18s var(--ease-out);
+}
+/* 轨道色只用一个点说 —— 左边框那种「色条」是廉价感的来源 */
+.atl-card::before {
+  content: "";
+  position: absolute; left: 20px; top: 26px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--atl-color);
+}
+.atl-card-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  padding-left: 20px;
+  font-size: 20px; line-height: 1.5;
+  letter-spacing: .01em;
+  color: var(--text-secondary);
+}
+.atl-up:hover .atl-card {
+  transform: translateY(-3px);
+  background: #fff;
+  box-shadow: 0 8px 22px rgba(44, 36, 22, .14);
+}
+.atl-down:hover .atl-card {
+  transform: translateY(3px);
+  background: #fff;
+  box-shadow: 0 8px 22px rgba(44, 36, 22, .14);
+}
+.atl-has-link .atl-card { cursor: pointer; }
+.atl-has-link .atl-card:hover { border-color: var(--atl-color); }
+/* 悬停那一条展开全文：两行的封顶是为了让静止态排得下，
+   不是要把内容藏掉。抬起来之后由它盖住邻居即可。 */
+.atl-node:hover .atl-card-text { -webkit-line-clamp: unset; }
+/* 悬停某一条时，其余卡片退到背景里 —— 密的时候这一下最要紧 */
+.atl-canvas.atl-focusing .atl-node:not(:hover) .atl-card,
+.atl-canvas.atl-focusing .atl-node:not(:hover) .atl-ccard { opacity: .42; }
+
+/* ── 聚合胶囊：一簇挤得太近的条目 ───────────────────────────────── */
+.atl-cluster { cursor: pointer; }
+.atl-cbadge {
+  position: absolute; left: -18px; top: -18px;
+  width: 36px; height: 36px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background:
+    radial-gradient(circle at 34% 28%, rgba(255, 255, 255, .35), transparent 55%),
+    var(--atl-color);
+  color: #fff;
+  font-size: 15px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 0 0 3px var(--bg-base), 0 2px 10px rgba(44, 36, 22, .3);
+  transition: transform .18s var(--ease-out), box-shadow .18s var(--ease-out);
+}
+.atl-cluster:hover .atl-cbadge {
+  transform: scale(1.14);
+  box-shadow: 0 0 0 3px var(--bg-base),
+              0 0 0 11px rgba(var(--atl-tint), .16),
+              0 3px 12px rgba(44, 36, 22, .24);
+}
+.atl-ccard {
+  position: absolute; left: -105px; width: 210px;
+  padding: 11px 14px;
+  text-align: center;
+  background: rgba(255, 255, 255, .9);
+  border: 1px solid rgba(213, 206, 192, .9);
+  border-radius: 12px;
+  box-shadow: 0 1px 3px rgba(44, 36, 22, .06);
+  transition: box-shadow .18s var(--ease-out),
+              background .18s var(--ease-out),
+              opacity .18s var(--ease-out);
+}
+.atl-cluster:hover .atl-ccard {
+  background: #fff;
+  box-shadow: 0 8px 22px rgba(44, 36, 22, .14);
+}
+.atl-crange {
+  display: block;
+  font-size: 18px; color: var(--text-primary);
+  font-variant-numeric: tabular-nums; letter-spacing: .02em;
+}
+.atl-croom {
+  display: block; margin-top: 2px;
+  font-size: 13px; color: var(--text-muted); letter-spacing: .1em;
+}
+
+/* 空的那一半：如实说「没有」 */
+.atl-half-empty {
+  position: absolute; left: 50%; transform: translate(-50%, -50%);
+  display: flex; align-items: center; gap: 16px;
+  font-size: 15px; letter-spacing: .06em;
+  color: var(--text-muted); opacity: .6; white-space: nowrap;
+  pointer-events: none;
+}
+.atl-half-rule { width: 72px; height: 1px; background: var(--border); }
+
+/* ── 缩放条 ─────────────────────────────────────────────────────── */
+.atl-tools {
+  position: absolute; right: 14px; bottom: 12px;
+  z-index: 4;                 /* 压过暗角与渐隐（z-2），否则右下角发灰 */
+  display: flex; align-items: center; gap: 2px;
+  padding: 3px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 4px 14px rgba(44, 36, 22, .12);
+  backdrop-filter: blur(8px);
+  cursor: default;
+}
+.atl-tools button {
+  height: 32px; min-width: 32px;
+  border: none; background: none; border-radius: 999px;
+  color: var(--text-secondary); cursor: pointer;
+  font-size: 17px; line-height: 1;
+}
+.atl-tools button:hover { background: var(--bg-raised); color: var(--text-primary); }
+.atl-zoom-val {
+  padding: 0 8px !important;
+  font-size: 12.5px !important;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+}
+
+/* ── 全貌缩略条：画布比舞台宽时告诉你在哪 ─────────────────────────
+   放在**舞台外面**：浮在画布上会压住卡片，而它又是常驻的。 */
+.atl-mini {
+  flex: 0 0 auto;
+  margin: 8px 22px 0;
+  height: 24px;
+  pointer-events: none;
+}
+.atl-mini[hidden] { display: none; }
+.atl-mini-track {
+  position: relative; width: 100%; height: 100%;
+  border-radius: 7px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  box-shadow: inset 0 1px 2px rgba(44, 36, 22, .05);
+  pointer-events: auto; cursor: pointer;
+  overflow: hidden;
+}
+.atl-mini-axis {
+  position: absolute; left: 6px; right: 6px; top: 50%; height: 1px;
+  background: var(--border);
+}
+.atl-mmark {
+  position: absolute; top: 50%; width: 2px; height: 9px;
+  margin-top: -4.5px; border-radius: 1px; opacity: .5;
+}
+.atl-mmark.is-work { background: #b46a2e; }
+.atl-mmark.is-life { background: #4f7f8a; }
+.atl-mini-win {
+  position: absolute; top: 0; bottom: 0;
+  border: 1.5px solid var(--accent);
+  background: rgba(180, 90, 45, .10);
+  border-radius: 6px;
+  pointer-events: none;
+}
+
+/* ── 时间未知 ───────────────────────────────────────────────────── */
+.atl-undated {
+  padding: 10px 24px 14px;
+  border-top: 1px solid rgba(213, 206, 192, .55);
+  flex: 0 0 auto;
+}
+.atl-undated-toggle {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 4px 0;
+  background: none; border: none; cursor: pointer;
+  font-size: 15px; color: var(--text-muted);
+}
+.atl-undated-toggle:hover { color: var(--text-secondary); }
+.atl-caret { font-size: 11px; opacity: .8; }
+.atl-undated-note { font-size: 13px; opacity: .65; }
+.atl-undated-list {
+  margin-top: 8px;
+  max-height: 132px; overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 6px 20px;
+}
+.atl-undated-list[hidden] { display: none; }
+.atl-undated-item {
+  position: relative;
+  padding-left: 36px;
+  font-size: 11.5px; line-height: 1.55;
+  color: var(--text-secondary);
+}
+.atl-undated-room {
+  position: absolute; left: 0; top: 0;
+  padding: 0 4px;
+  border: 1px solid var(--border); border-radius: 4px;
+  font-size: 9.5px; color: var(--text-muted);
+}
+
 .rp-section-title {
   font-size: var(--fs-body);
   font-weight: 500;
   color: var(--text-primary);
   margin-bottom: var(--space-sm);
+}
+
+/* 作者 / 书中角色 两栏的分栏标题 */
+.rp-sub-title {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  letter-spacing: 0.08em;
+  margin: var(--space-md) 0 var(--space-xs);
+}
+.rp-role-tag {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  margin-left: 4px;
+  font-weight: 400;
+}
+.rp-hint {
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  line-height: 1.6;
+  padding: var(--space-sm) 0;
 }
 
 /* Book list */
@@ -3611,70 +4553,10 @@ mark.search-hl {
 
 /* ── BookGraph panel ───────────────────────────────────────────────────── */
 
-.book-graph-btn {
-  position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--accent-hover);
-  color: #fff;
-  font-size: 16px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 6;
-  padding: 0;
-  margin: 0;
-  line-height: 1;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
-  transition: transform 0.12s var(--ease-out), background 0.12s, border-color 0.12s, opacity 0.2s var(--ease-out);
-  opacity: 0;
-}
-.scene-book:hover .book-graph-btn { opacity: 1; }
-.book-graph-btn:hover {
-  background: var(--accent-hover);
-  border-color: #66d8ff;
-  transform: scale(1.35);
-  opacity: 1;
-}
+/* （书架卡片上的图谱 / 标注 / 删除入口已收进 .book-actions 动作条，
+   规则见上方「书架卡片的动作条」一节。） */
 
-/* 章节标注按钮 — 书架卡 hover 浮现（同图谱/删除按钮家族，左上角） */
-.book-tag-btn {
-  position: absolute;
-  top: 8px;
-  left: 8px;
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
-  background: var(--accent);
-  border: 2px solid var(--accent-hover);
-  color: #fff;
-  font-size: 16px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 6;
-  padding: 0;
-  margin: 0;
-  line-height: 1;
-  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
-  transition: transform 0.12s var(--ease-out), background 0.12s, border-color 0.12s, opacity 0.2s var(--ease-out);
-  opacity: 0;
-}
-.scene-book:hover .book-tag-btn { opacity: 1; }
-.book-tag-btn:hover {
-  background: var(--accent-hover);
-  border-color: #66d8ff;
-  transform: scale(1.35);
-  opacity: 1;
-}
-
-/* 章节标注弹窗 — 行内编辑横排，比 graph 弹窗更宽 */
+/* 标注弹窗 — 书籍信息编辑 + 章节便利贴，行内编辑横排，比 graph 弹窗更宽 */
 .tag-modal {
   display: none;
   position: fixed;
@@ -3726,6 +4608,31 @@ mark.search-hl {
   overflow-y: auto;
   flex: 1;
 }
+
+/* 书籍信息行 — 弹窗顶部，改书名/作者。独立于 .tag-modal-body：
+   章节列表每次重载都会 innerHTML 整体重写，放 body 里会被冲掉。 */
+.tag-book-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--border, rgba(0,0,0,0.08));
+  background: var(--bg-hover, rgba(0,0,0,0.02));
+  flex: none;
+}
+.tbi-label { flex: none; font-size: 13px; font-weight: 600; color: var(--text-primary, #1a1a1a); }
+.tbi-input {
+  padding: 4px 8px;
+  border: 1px solid var(--border, rgba(0,0,0,0.15));
+  border-radius: 6px;
+  background: var(--bg-base, #fff);
+  color: var(--text-primary, #1a1a1a);
+  font-size: 13px;
+  font-family: inherit;
+}
+.tbi-input:focus { outline: none; border-color: var(--accent); }
+.tbi-title { flex: 1; min-width: 0; }
+.tbi-author { flex: none; width: 160px; }
 .tag-loading, .tag-empty, .tag-error {
   text-align: center;
   padding: 40px 0;
@@ -4276,6 +5183,26 @@ mark.search-hl {
   color: var(--text-secondary);
   line-height: 1.8;
 }
+/* 「跳转原文」——节点首次出场的段落（chapter/chunk 由 first_appearance 现算）。
+   描边式而非实心：详情面板里它是**动作**不是主 CTA，实心会和节点色块抢眼。 */
+.graph-detail-body .detail-jump-btn {
+  display: inline-flex; align-items: center; gap: 5px;
+  margin-top: var(--space-sm);
+  padding: 5px 12px;
+  border: 1px solid var(--border, #2a2520);
+  border-radius: var(--radius-sm, 4px);
+  background: var(--bg-raised, #2a2520);
+  color: var(--text-secondary);
+  font-size: var(--fs-caption, 12px);
+  cursor: pointer;
+  transition: color var(--duration-fast, 150ms) var(--ease-out, ease),
+              border-color var(--duration-fast, 150ms) var(--ease-out, ease);
+}
+.graph-detail-body .detail-jump-btn:hover {
+  color: var(--accent, #00afff);
+  border-color: var(--accent, #00afff);
+}
+.graph-detail-body .detail-jump-btn svg { width: 13px; height: 13px; }
 .graph-detail-body .alias-tag {
   display: inline-block;
   background: var(--bg-surface);
@@ -4300,6 +5227,23 @@ mark.search-hl {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin: 0 0 var(--space-sm) 0;
+}
+/* 读者笔记 —— agent 自己的笔记本（docs/reader-notes-design.md）。
+   页边的样子：左边一道细线，引文小字，笔记正文正常字。 */
+.graph-detail-body .reader-note {
+  margin: 0 0 var(--space-md) 0;
+  padding-left: var(--space-sm);
+  border-left: 2px solid var(--border, #2a2520);
+}
+.graph-detail-body .reader-note-quote {
+  font-size: var(--fs-caption, 12px);
+  color: var(--text-muted, #6b6458);
+  margin-bottom: 4px;
+}
+.graph-detail-body .reader-note-text {
+  color: var(--text-primary, #c8c0b8);
+  line-height: 1.6;
+  white-space: pre-wrap;
 }
 /* Edge detail (merged) */
 .detail-edge-endpoints {
@@ -4360,6 +5304,25 @@ mark.search-hl {
 .graph-toolbar select:hover,
 .graph-toolbar button:hover { background: var(--bg-raised, #2a2520); }
 .graph-toolbar select { min-width: 180px; }
+/* 「作者简介」点了但还没选书：不弹 alert（会阻塞渲染进程），只闪一下选择框 */
+.graph-toolbar select.atl-nudge {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+/* 胶囊按钮：它**切到另一层视图**（作者简介），不是一次性的命令。
+   圆角把它和状态类按钮区分开 —— 有意的视觉差异，不是随手换个形状。 */
+.graph-toolbar .graph-pill-btn {
+  border-radius: 999px;
+  padding: 6px 16px;
+}
+/* 作者视图开着时，这颗按钮是「你正在这里」的状态，不是待点击的动作 */
+.graph-toolbar .graph-pill-btn.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+/* 布局切换是图谱独有的控制，作者视图里没有意义 */
+#page-graph.atl-mode #graphLayoutToggle { display: none; }
 
 /* ── Secondary nav (placeholder tabs) ─────────────────────── */
 .graph-secondary-nav {

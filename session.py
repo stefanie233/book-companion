@@ -122,6 +122,9 @@ def _block_to_dict(block: ContentBlock) -> dict:
         d["is_error"] = block.is_error
     elif block.type in ("voice_input", "voice_output"):
         d["text"] = block.text or ""  # voice metadata stored as JSON in text field
+    elif block.type == "interrupt":
+        # 中断注记：只存给下一次请求的上下文，不渲染成正文
+        d["text"] = block.text or ""
     return d
 
 

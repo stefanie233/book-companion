@@ -13,8 +13,21 @@ Lifecycle: persistent.  All rounds are kept until manually deleted via
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
+
+
+#: Session ids end up in a URL path and inside ``onclick="selectSession('…')"``.
+#: Generated labels (book/author names) must not smuggle in quotes, slashes or
+#: whitespace — a single ``'`` in a title would silently break the viewer.
+_TAG_BAD = re.compile(r"[\s/\\:*?\"<>|'`]+")
+
+
+def session_tag(text: str, limit: int = 40) -> str:
+    """Make a human-readable, viewer-safe session label (CJK kept as-is)."""
+    tag = _TAG_BAD.sub("_", str(text or "").strip()).strip("_")
+    return tag[:limit] or "unknown"
 
 
 _DDL = """
@@ -35,18 +48,27 @@ CREATE TABLE IF NOT EXISTS context_snapshots (
     tool_calls_json   TEXT,
     -- Tool execution results
     tool_results_json TEXT,
-    char_count        INTEGER DEFAULT 0
+    char_count        INTEGER DEFAULT 0,
+    -- Call metadata (added v2): which model answered, and how long it took
+    model             TEXT,
+    latency_ms        INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_ctx_session ON context_snapshots(session_id, turn_index);
 """
+
+#: Columns added after the first version.  ``migrate=False`` recorders (the
+#: Hermes DB, which we only read) must never ALTER someone else's file.
+_META_COLS = (("model", "TEXT"), ("latency_ms", "INTEGER"))
 
 
 class ContextRecorder:
     """Flight recorder: full request/response per ReAct round, persistent."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, migrate: bool = True) -> None:
         self._path = db_path
         self._conn: sqlite3.Connection | None = None
+        self._migrate = migrate
+        self._meta_cols = False
         self._ensure_schema()
 
     # ── internal ──────────────────────────────────────────────────────
@@ -62,6 +84,17 @@ class ContextRecorder:
     def _ensure_schema(self) -> None:
         conn = self._get_conn()
         conn.executescript(_DDL)
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(context_snapshots)")}
+        missing = [c for c in _META_COLS if c[0] not in cols]
+        if missing and self._migrate:
+            for name, decl in missing:
+                conn.execute(
+                    f"ALTER TABLE context_snapshots ADD COLUMN {name} {decl}")
+            cols = {r[1] for r in
+                    conn.execute("PRAGMA table_info(context_snapshots)")}
+        # Read-only recorders may point at an older schema — the SELECTs and
+        # the INSERT adapt to whatever columns actually exist.
+        self._meta_cols = all(name in cols for name, _ in _META_COLS)
         conn.commit()
 
     # ── public API ────────────────────────────────────────────────────
@@ -80,12 +113,17 @@ class ContextRecorder:
         response_text: str = "",
         tool_calls: list[dict] | None = None,
         tool_results: list[dict] | None = None,
+        model: str = "",
+        latency_ms: int | None = None,
     ) -> None:
         """Persist one complete ReAct round (input + output + tool results).
 
         ``tool_calls`` is the raw list from the LLM (``[{"id", "name", "arguments"}]``).
         ``tool_results`` is ``[{"name", "arguments", "result"}]`` after execution.
         Either may be empty/None when the round has no tool usage.
+
+        ``model`` / ``latency_ms`` answer "哪个模型、跑了多久" — without them a
+        prompt iteration has no baseline to compare against.
         """
         try:
             messages_json = json.dumps(messages, ensure_ascii=False)
@@ -94,22 +132,85 @@ class ContextRecorder:
             char_count = len(system_prompt) + sum(
                 len(m.get("content") or "") for m in messages
             )
+            cols = ["session_id", "turn_index", "react_round", "mode", "book_id",
+                    "system_prompt", "messages_json", "tools_count",
+                    "response_text", "tool_calls_json", "tool_results_json",
+                    "char_count"]
+            vals: list = [
+                session_id, turn_index, react_round, mode, book_id,
+                system_prompt, messages_json, tools_count,
+                response_text or "", tc_json, tr_json, char_count,
+            ]
+            if self._meta_cols:
+                cols += ["model", "latency_ms"]
+                vals += [model or "", latency_ms]
             conn = self._get_conn()
             conn.execute(
-                "INSERT INTO context_snapshots "
-                "(session_id, turn_index, react_round, mode, book_id, "
-                " system_prompt, messages_json, tools_count, "
-                " response_text, tool_calls_json, tool_results_json, char_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    session_id, turn_index, react_round, mode, book_id,
-                    system_prompt, messages_json, tools_count,
-                    response_text or "", tc_json, tr_json, char_count,
-                ),
+                f"INSERT INTO context_snapshots ({', '.join(cols)}) "
+                f"VALUES ({', '.join(['?'] * len(cols))})",
+                vals,
             )
             conn.commit()
         except Exception:
             pass  # recorder must never break the conversation
+
+    def record_llm_event(
+        self,
+        event: dict,
+        *,
+        session_id: str,
+        mode: str,
+        book_id: str = "",
+        turn_index: int = 0,
+        react_round: int = 0,
+    ) -> None:
+        """Record one **non-ReAct** LLM call from a ``log_cb`` style event.
+
+        Call sites that don't go through Runtime (authorgraph, writing, ...)
+        would otherwise be invisible here.  The event dict carries
+        ``{status, system, prompt, response, reasoning_content, finish_reason,
+        error_detail}`` — the same shape the graph prompt modules pass to
+        ``log_cb``.
+
+        Reasoning is wrapped in ``<think>…</think>`` inside ``response_text``:
+        that is the runtime's own convention (raw stream), and the viewer
+        already renders such blocks as a collapsible thought section — so no
+        schema change is needed and old rows keep working.
+
+        Failure status is prefixed as a marker line so ``parse_failed`` /
+        ``length`` truncation can be told apart from "the model had nothing
+        to say" when reading the log later.
+        """
+        try:
+            response = str(event.get("response") or "")
+            reasoning = str(event.get("reasoning_content") or "")
+            if reasoning:
+                response = f"<think>\n{reasoning}\n</think>\n{response}"
+            status = str(event.get("status") or "")
+            if status and status != "ok":
+                finish = str(event.get("finish_reason") or "")
+                mark = f"[[status={status}" + (
+                    f" finish_reason={finish}" if finish else "") + "]]"
+                detail = str(event.get("error_detail") or "")
+                if detail:
+                    mark += f" {detail}"
+                response = f"{mark}\n{response}" if response else mark
+            self.record_round(
+                session_id=session_id,
+                turn_index=turn_index,
+                react_round=react_round,
+                system_prompt=str(event.get("system") or ""),
+                messages=[{"role": "user",
+                           "content": str(event.get("prompt") or "")}],
+                tools_count=0,
+                mode=mode,
+                book_id=book_id,
+                response_text=response,
+                model=str(event.get("model") or ""),
+                latency_ms=event.get("latency_ms"),
+            )
+        except Exception:
+            pass  # recorder must never break the caller
 
     def list_sessions(self) -> list[dict]:
         """List sessions that have recorded rounds, with aggregate stats."""
@@ -130,12 +231,13 @@ class ContextRecorder:
     def list_rounds(self, session_id: str) -> list[dict]:
         """List rounds for a session (metadata only, no large fields)."""
         conn = self._get_conn()
+        meta = ", model, latency_ms" if self._meta_cols else ""
         rows = conn.execute(
             "SELECT id, turn_index, react_round, mode, book_id, "
             "  created_at, tools_count, char_count, "
             "  length(response_text) as response_len, "
             "  length(tool_calls_json) as tool_calls_len, "
-            "  length(tool_results_json) as tool_results_len "
+            f"  length(tool_results_json) as tool_results_len{meta} "
             "FROM context_snapshots WHERE session_id = ? "
             "ORDER BY id ASC",
             (session_id,),

@@ -1,8 +1,9 @@
 # Secrets
 .env
 
-# Design docs (kept local, not versioned)
-docs/
+# Design docs (kept local, not versioned) — 锚定仓库根，别写成 docs/
+# （无前导斜杠会匹配任意层级的 docs/，曾经把 .claude/docs/ 一起吞掉）
+/docs/
 
 # Data (gitignored — user data)
 data/config/
@@ -22,6 +23,9 @@ data/sessions.db
 data/sessions.db-*
 data/context_log.db
 data/context_log.db-*
+data/writing.db
+data/writing.db-*
+data/writing/
 data/graphs/
 data/fixtures/
 data/logs/
@@ -80,3 +84,9 @@ book-companion-share-*.tar.gz
 
 # Plan-mode design docs (work in progress)
 .claude/plans/
+data/graph.db
+data/graph.db-*
+data/authors.db
+data/authors.db-shm
+data/authors.db-wal
+data/backups/

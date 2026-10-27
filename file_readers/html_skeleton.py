@@ -213,6 +213,26 @@ def split_html_by_heading(
         return [("", html_content, "")]
 
 
+_H_TAG_NAME_RE = re.compile(r"^\s*<\s*(h[1-6])\b", re.IGNORECASE)
+
+
+def heading_tag_of(matched_tag: str) -> str:
+    """Extract the heading tag name from a splitter's ``matched_tag``.
+
+    The splitters return the **whole matched element** as their third tuple
+    item (``m.group(0)``), e.g. ``<h3 class="calibre5">第一章</h3>``.  The
+    tag name is the useful part for structural analysis — 人类简史's real
+    sections are ``h3`` while its figure/map captions are ``h5``/``h6``, and
+    that difference is the only thing separating them once the splitter has
+    thrown the markup away.
+
+    Returns ``""`` for non-heading matches (``font_size`` / ``css_class``
+    splitters usually match ``<p>`` or ``<font>``).
+    """
+    m = _H_TAG_NAME_RE.match(matched_tag or "")
+    return m.group(1).lower() if m else ""
+
+
 def _split_by_h_tags(html: str) -> list[tuple[str, str, str]]:
     """Split HTML at <h1>-<h6> boundaries."""
     pattern = re.compile(

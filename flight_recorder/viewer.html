@@ -299,7 +299,7 @@
 
 <script>
 // Use absolute URL when opened via file://, relative when served by api_server
-const API = (location.protocol === 'http:' || location.protocol === 'https:') ? '' : 'http://127.0.0.1:8765';
+const API = (location.protocol === 'http:' || location.protocol === 'https:') ? '' : 'http://127.0.0.1:8766';
 let selectedSession = null;
 let selectedRound = null;
 let polling = true;
@@ -385,6 +385,8 @@ async function loadRounds() {
             <span>${fmtChars(r.char_count)}</span>
             ${r.response_len ? `<span>resp ${fmtChars(r.response_len)}</span>` : ''}
             ${r.tools_count ? `<span>${r.tools_count} tools</span>` : ''}
+            ${r.model ? `<span>${esc(r.model)}</span>` : ''}
+            ${r.latency_ms ? `<span>${r.latency_ms}ms</span>` : ''}
           </div>
         </div>
       `;
@@ -400,7 +402,10 @@ async function loadDetail() {
   try {
     const r = await fetchJSON(`${API}/api/context-log/${selectedSession}/${selectedRound}`);
     document.getElementById('detailHeader').textContent =
-      `T${r.turn_index} R${r.react_round} · ${r.mode || ''} · ${fmtTime(r.created_at)}`;
+      `T${r.turn_index} R${r.react_round} · ${r.mode || ''}`
+      + (r.model ? ` · ${r.model}` : '')
+      + (r.latency_ms ? ` · ${r.latency_ms}ms` : '')
+      + ` · ${fmtTime(r.created_at)}`;
 
     const body = document.getElementById('detailBody');
     let html = '<div class="detail-body">';
@@ -632,6 +637,10 @@ async function selectGraphCall(runId, callId) {
       `<div style="padding:8px 12px;font-size:12px;color:var(--text-secondary)">${esc(meta)}</div>` +
       section('g-prompt', 'Prompt', `<pre class="json">${esc(c.prompt || '')}</pre>`) +
       section('g-response', 'Response', `<pre class="json">${esc(c.response || '')}</pre>`) +
+      (c.reasoning_content
+        ? section('g-reasoning', `思考过程（${fmtChars(c.reasoning_content.length)}）`,
+                  `<pre class="json">${esc(c.reasoning_content)}</pre>`)
+        : '') +
       (c.error_detail ? section('g-error', '错误', `<pre class="json">${esc(c.error_detail)}</pre>`) : '');
     body.querySelectorAll('.section-title').forEach(t => {
       t.onclick = () => t.parentElement.classList.toggle('collapsed');

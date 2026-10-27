@@ -15,9 +15,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from pathlib import Path
 
+from llm_json import loads_tolerant
 from storage.db_base import _now_ms
 import usage_log
 
@@ -70,36 +70,11 @@ def build_enrich_user_message(
 # ── Output parsing (three-tier fallback) ───────────────────────────────────
 
 def _parse_enrich_json(raw: str) -> dict | None:
-    """Parse the LLM's JSON output, trying progressively looser extraction."""
-    s = raw.strip()
-    if not s:
-        return None
-    # 1. As-is
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
-    # 2. Strip markdown code fence
-    stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.IGNORECASE)
-    try:
-        obj = json.loads(stripped)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
-    # 3. First { … last } substring
-    start = s.find("{")
-    end = s.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            obj = json.loads(s[start:end + 1])
-            if isinstance(obj, dict):
-                return obj
-        except json.JSONDecodeError:
-            pass
-    return None
+    """Parse the LLM's JSON output, trying progressively looser extraction.
+
+    阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``。
+    """
+    return loads_tolerant(raw, expect=dict)
 
 
 # ── metadata_json merge (three-state) ──────────────────────────────────────
@@ -156,7 +131,8 @@ async def enrich_book_metadata(api_client, db, book_id: str) -> bool:
             if attempt > 0:
                 await asyncio.sleep(attempt)
             with usage_log.source_scope("enrich", ref_id=book_id):
-                raw = await api_client.complete(ENRICH_PROMPT, user_message)
+                raw = await api_client.complete(
+                    ENRICH_PROMPT, user_message, scenario="enrich.metadata")
             if raw:
                 break
         if not raw:

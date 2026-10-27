@@ -1,0 +1,47 @@
+{
+  "id": "c04_city_memory",
+  "split": "dev",
+  "kind": "cold_start",
+  "brief": "思想随笔。考的是：概念与个人经验的咬合、非学术腔、反问收束。",
+  "work": {
+    "title": "城市与记忆",
+    "genre": "思想随笔",
+    "premise": "从「地图不是领土」谈起，写一次在陌生城市迷路的经历。",
+    "narrative_pov": "第一人称",
+    "target_chars": 1800,
+    "style_profile": {
+      "hard_rules": ["不引用学术文献与名人名言", "概念必须落回个人经验"]
+    }
+  },
+  "chapter": {"index": 1, "title": "城市与记忆"},
+  "contract": {
+    "purpose": "从地图与领土的差别谈起，讲一次在陌生城市迷路的经历，最后用一个反问收束。",
+    "must_hit_now": [
+      "提出地图与领土不是一回事",
+      "讲一段自己在陌生城市迷路的亲身经历",
+      "结尾用一个反问收束"
+    ],
+    "must_preserve": ["全文不使用学术术语解释概念"],
+    "forbidden_cross": [
+      "不引用任何文献或名人",
+      "不使用「综上所述」",
+      "不出现「作为一名……」"
+    ],
+    "ending_state": "以一个问题结束，不给出答案",
+    "story_time": "",
+    "target_chars": 1800
+  },
+  "prior": [],
+  "facts": [],
+  "promises": [],
+  "references": {
+    "query": ["地图", "领土", "记忆", "城市", "陌生", "迷路", "概念", "经验"],
+    "authors": [{"author_id": "au-cd3ea071d9564a87", "scene_type": "argument"}],
+    "books": [{"stable_book_id": "sb-6b426bd3591c4ab0", "book_id": "d922920080398b1a", "label": "人类简史"}]
+  },
+  "check": {
+    "must_hit_keywords": [["地图"], ["迷路"], ["？"]],
+    "forbidden_keywords": ["综上所述", "作为一名", "参考文献"],
+    "leak_names": ["尤瓦尔", "赫拉利", "智人"]
+  }
+}

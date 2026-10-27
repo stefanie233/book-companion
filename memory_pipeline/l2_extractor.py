@@ -9,12 +9,11 @@ book-centric for Book Companion (L2-1: 按书组织).
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from llm_json import loads_tolerant
 from memory_pipeline.prompts import L2_SCENE_SYSTEM_PROMPT, format_l2_prompt
 from memory_pipeline.scene_store import DEFAULT_SECTIONS, SceneBlock, SceneStore
 
@@ -91,6 +90,7 @@ async def extract_l2(
             user_prompt,
             model=model,
             timeout=timeout,
+            scenario="memory.l2",
         )
     except Exception as e:
         logger.warning("L2 extraction LLM call failed: %s", e)
@@ -135,28 +135,13 @@ def _parse_l2_result(raw: str) -> list[dict[str, Any]]:
     """Parse the LLM JSON response into scene ops.
 
     Each op: {book, action, summary, sections, consumed_ids}
+
+    阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``。失败返回空 —— 不丢数据
+    （记忆保持 unconsumed，下次自然重试），代价是场景块不更新 + 重复 LLM 花费。
     """
-    cleaned = raw.strip()
-
-    # Strip markdown code block wrappers
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-
-    # Extract JSON array
-    array_match = re.search(r"\[[\s\S]*\]", cleaned)
-    if not array_match:
-        logger.warning("L2 extraction: no JSON array found in response")
-        return []
-
-    try:
-        parsed = json.loads(array_match.group())
-    except json.JSONDecodeError as e:
-        logger.warning("L2 extraction: JSON parse failed: %s", e)
-        return []
-
-    if not isinstance(parsed, list):
-        logger.warning("L2 extraction: response is not an array")
+    parsed = loads_tolerant(raw, expect=list)
+    if parsed is None:
+        logger.warning("L2 extraction: no parseable JSON array in response")
         return []
 
     ops: list[dict[str, Any]] = []

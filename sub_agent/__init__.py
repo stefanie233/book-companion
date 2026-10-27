@@ -12,14 +12,21 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from config import Config
 from session import Session
 from tools import ToolExposure, ToolRegistry
 import usage_log
 
-from .types import SUBAGENT_SYSTEM_PROMPT, SUBAGENT_TOOLSETS, CONTEXT_CREATING_TOOLS
+from .types import (
+    CONTEXT_CREATING_TOOLS,
+    SUBAGENT_DEFAULT_MAX_ITERATIONS,
+    SUBAGENT_MAX_ITERATIONS,
+    SUBAGENT_PROMOTE_DEFERRED,
+    SUBAGENT_SYSTEM_PROMPT,
+    SUBAGENT_TOOLSETS,
+)
 
 
 # ── Output model ─────────────────────────────────────────────────────────
@@ -80,11 +87,52 @@ class SubAgentRunner:
         api_client,  # ApiClient protocol
         tool_registry: ToolRegistry,
         config: Config,
+        context_recorder: object | None = None,
+        scenario: str = "sub_agent",
     ):
         self._api_client = api_client
         self._full_registry = tool_registry
         self._config = config
+        # Model-binding route: chat-spawned agents inherit ``sub_agent``;
+        # import analysis passes ``import.analysis`` so its whole chain
+        # uses the import model.
+        self._scenario = scenario
+        # Optional flight recorder — when injected, every ReAct round of the
+        # sub-agent lands in data/context_log.db and shows up in the
+        # /flight-recorder/viewer.html session list.
+        self._context_recorder = context_recorder
         self.last_output: SubAgentOutput | None = None
+
+    def _build_sub_registry(self, resolved_type: str,
+                            reading_ctx: dict | None = None) -> ToolRegistry:
+        """子代理的工具表。**单独一个方法是为了能被测到** ——
+        两处调用点各抄一遍的话，「上下文到底有没有传进去」就只能靠跑真链路验。
+
+        过滤出来的是**全新** registry，``reading_ctx`` 默认是空的 —— 子代理里
+        任何读上下文的工具（``author_lookup`` / ``graph_node``）都会以为
+        「没打开书」，一路返回空。
+
+        **只在显式传了才拷**：``book_classifier`` 跑的是**正在导入的那本书**，
+        而主会话的 ``reading_ctx`` 指的是**用户当前翻开的书**，两者不是一本 ——
+        无差别继承会让导入分析去操作错的书。
+        """
+        toolsets = SUBAGENT_TOOLSETS.get(resolved_type,
+                                         SUBAGENT_TOOLSETS["reader"])
+        reg = self._full_registry.get_registry_for_toolsets(
+            toolsets=toolsets,
+            exclude_tools=CONTEXT_CREATING_TOOLS,
+            exclude_exposure=[ToolExposure.DIRECT_MODEL_ONLY, ToolExposure.HIDDEN],
+        )
+        # 主 agent 隐藏、子代理白名单内可见。**必须换一个 ToolSpec**：
+        # get_registry_for_toolsets 登记的是同一个对象，就地改 exposure
+        # 会把主 agent 的工具表一起改掉。
+        for name, spec in list(reg._tools.items()):
+            if (spec.exposure == ToolExposure.DEFERRED
+                    and spec.toolset in SUBAGENT_PROMOTE_DEFERRED):
+                reg.register(replace(spec, exposure=ToolExposure.DIRECT))
+        if reading_ctx:
+            reg.reading_ctx.update(reading_ctx)
+        return reg
 
     async def run(
         self,
@@ -93,8 +141,13 @@ class SubAgentRunner:
         description: str,
         prompt: str,
         model: str | None = None,
+        reading_ctx: dict | None = None,
     ) -> SubAgentOutput:
-        """Execute a sub-agent and return its structured output."""
+        """Execute a sub-agent and return its structured output.
+
+        ``reading_ctx`` 显式传入时才拷进子代理的 registry（见下面的注释）——
+        读上下文的工具靠它拿到「当前是哪本书、剧透门开到哪」。
+        """
         from runtime import ConversationRuntime
 
         agent_id = f"agent-{int(time.time() * 1_000_000)}"
@@ -102,19 +155,19 @@ class SubAgentRunner:
 
         # Resolve agent type with fallback
         resolved_type = agent_type if agent_type in SUBAGENT_TOOLSETS else "reader"
+        max_iter = SUBAGENT_MAX_ITERATIONS.get(
+            resolved_type, SUBAGENT_DEFAULT_MAX_ITERATIONS)
 
         # Build filtered tool registry — unified pipeline, same as main agent
-        toolsets = SUBAGENT_TOOLSETS.get(resolved_type, SUBAGENT_TOOLSETS["reader"])
-        filtered_registry = self._full_registry.get_registry_for_toolsets(
-            toolsets=toolsets,
-            exclude_tools=CONTEXT_CREATING_TOOLS,
-            exclude_exposure=[ToolExposure.DIRECT_MODEL_ONLY, ToolExposure.HIDDEN],
-        )
+        filtered_registry = self._build_sub_registry(resolved_type, reading_ctx)
 
         # Minimal system prompt — no CLAUDE.md, no persona, no memory
+        #
+        # 用 replace 而非 format：提示词里的 JSON 示例带花括号，format 会把它们
+        # 当占位符吃掉，逼得模板满屏写 {{ }} —— 那种转义正是提示词最难改的地方。
         system_prompt = SUBAGENT_SYSTEM_PROMPT.get(
             resolved_type, SUBAGENT_SYSTEM_PROMPT["reader"]
-        ).format(description=description)
+        ).replace("{description}", description)
 
         # Build sub-runtime: same ConversationRuntime, tighter constraints
         sub_runtime = ConversationRuntime(
@@ -126,12 +179,16 @@ class SubAgentRunner:
             skill_manager=None,
             hook_pipeline=None,
             system_prompt=system_prompt,
-        ).with_max_iterations(8)
+            scenario=self._scenario,
+        ).with_max_iterations(max_iter)
+        sub_runtime.context_recorder = self._context_recorder
 
-        # Run the sub-agent's ReAct loop (usage attributed to sub_agent)
+        # Usage attribution follows the route group: chat-spawned agents
+        # are "sub_agent", import analysis is "import".
+        source = (self._scenario or "sub_agent").split(".")[0]
         result_parts: list[str] = []
         try:
-            with usage_log.source_scope("sub_agent"):
+            with usage_log.source_scope(source):
                 async for chunk in sub_runtime.run_turn(prompt):
                     result_parts.append(chunk)
         except Exception as exc:
@@ -175,6 +232,7 @@ class SubAgentRunner:
         description: str,
         prompt: str,
         model: str | None = None,
+        reading_ctx: dict | None = None,
     ):
         """Execute a sub-agent and stream its output chunks in real-time.
 
@@ -187,17 +245,15 @@ class SubAgentRunner:
         created_at = _iso_now()
 
         resolved_type = agent_type if agent_type in SUBAGENT_TOOLSETS else "reader"
+        max_iter = SUBAGENT_MAX_ITERATIONS.get(
+            resolved_type, SUBAGENT_DEFAULT_MAX_ITERATIONS)
 
-        toolsets = SUBAGENT_TOOLSETS.get(resolved_type, SUBAGENT_TOOLSETS["reader"])
-        filtered_registry = self._full_registry.get_registry_for_toolsets(
-            toolsets=toolsets,
-            exclude_tools=CONTEXT_CREATING_TOOLS,
-            exclude_exposure=[ToolExposure.DIRECT_MODEL_ONLY, ToolExposure.HIDDEN],
-        )
+        filtered_registry = self._build_sub_registry(resolved_type, reading_ctx)
 
+        # 同上：replace 而非 format，保住提示词里的花括号。
         system_prompt = SUBAGENT_SYSTEM_PROMPT.get(
             resolved_type, SUBAGENT_SYSTEM_PROMPT["reader"]
-        ).format(description=description)
+        ).replace("{description}", description)
 
         sub_runtime = ConversationRuntime(
             session=Session(),
@@ -208,12 +264,15 @@ class SubAgentRunner:
             memory_store=_EmptyMemoryStore(),
             skill_manager=None,
             hook_pipeline=None,
-        ).with_max_iterations(8)
+            scenario=self._scenario,
+        ).with_max_iterations(max_iter)
+        sub_runtime.context_recorder = self._context_recorder
 
+        source = (self._scenario or "sub_agent").split(".")[0]
         raw_parts: list[str] = []
         first_chunk = True
         try:
-            with usage_log.source_scope("sub_agent"):
+            with usage_log.source_scope(source):
                 async for chunk in sub_runtime.run_turn(prompt):
                     # Only prepend [Sub] to the first chunk; pass the rest raw.
                     # Newlines within a chunk get [Sub] markers so each logical
@@ -312,6 +371,7 @@ async def execute_agent(
     api_client=None,
     tool_registry: ToolRegistry | None = None,
     config: Config | None = None,
+    reading_ctx: dict | None = None,
 ) -> str:
     """Async entry point for the ``Agent`` tool.
 
@@ -328,6 +388,7 @@ async def execute_agent(
         description=description,
         prompt=prompt,
         model=model,
+        reading_ctx=reading_ctx,
     )
     return json.dumps(asdict(output), ensure_ascii=False)
 
@@ -341,6 +402,7 @@ async def execute_agent_stream(
     api_client=None,
     tool_registry: ToolRegistry | None = None,
     config: Config | None = None,
+    reading_ctx: dict | None = None,
 ):
     """Streaming entry point for the ``Agent`` tool.
 
@@ -360,6 +422,7 @@ async def execute_agent_stream(
         description=description,
         prompt=prompt,
         model=model,
+        reading_ctx=reading_ctx,
     ):
         yield chunk
 

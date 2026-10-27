@@ -1,0 +1,69 @@
+{
+  "id": "c06_long_night_ch3",
+  "split": "train",
+  "kind": "continuation",
+  "brief": "续写。考的是：信息给法、嫌疑的度、承诺不提前揭。",
+  "work": {
+    "title": "长夜",
+    "genre": "校园悬疑",
+    "premise": "1990 年代小城，高三学生陈屿撞见班主任深夜搬走一只纸箱。",
+    "narrative_pov": "第三人称限知（陈屿）",
+    "target_chars": 1800,
+    "style_profile": {"hard_rules": ["视角只在陈屿身上", "不写全知旁白"]}
+  },
+  "chapter": {"index": 3, "title": "办公室"},
+  "focus": ["陈屿", "赵德明"],
+  "contract": {
+    "purpose": "陈屿去办公室问改分的事；赵德明承认有人打过招呼，但不说名字；陈屿开始怀疑林小满。",
+    "must_hit_now": [
+      "陈屿进办公室找赵德明",
+      "赵德明承认有人打过招呼",
+      "陈屿开始怀疑林小满"
+    ],
+    "must_preserve": ["赵德明始终不说出打招呼的人", "陈屿没有证据，只是怀疑"],
+    "forbidden_cross": [
+      "不揭示林小满是否告密",
+      "不揭示纸箱里是什么",
+      "不让赵德明说出打招呼的人"
+    ],
+    "ending_state": "陈屿把试卷夹进课本，没有还给老师",
+    "story_time": "次日中午",
+    "target_chars": 1800
+  },
+  "prior": [
+    {"index": 1, "title": "箱子", "content_file": "seeds/c06_ch1.md",
+     "summary": "陈屿撞见赵德明深夜搬走一只黄胶带封口的纸箱，赵德明回头确认他看见了。"},
+    {"index": 2, "title": "分数", "content_file": "seeds/c06_ch2.md",
+     "summary": "林小满劝陈屿别管；陈屿发现数学卷被改高两分；放学看见林小满的自行车在修车摊。"}
+  ],
+  "facts": [
+    {"subject_ref": "陈屿", "field": "state", "value": "高三学生；父亲下岗，母亲在纺织厂", "from": 1},
+    {"subject_ref": "陈屿", "field": "knowledge", "value": "看见赵德明深夜搬纸箱；自己的数学卷被改高两分", "from": 2},
+    {"subject_ref": "陈屿", "field": "knowledge_of_box", "value": null, "unknown_reason": "unclaimed", "from": 2},
+    {"subject_ref": "陈屿", "field": "goal", "value": "弄清改分是谁的意思", "from": 2},
+    {"subject_ref": "林小满", "field": "state", "value": "陈屿的同桌；父亲在教育局工作", "from": 1},
+    {"subject_ref": "林小满", "field": "knowledge", "value": "知道陈屿看见了纸箱", "from": 2},
+    {"subject_ref": "赵德明", "field": "state", "value": "班主任兼数学老师", "from": 1}
+  ],
+  "promises": [
+    {"id": "P1", "title": "纸箱里是什么", "kind": "foreshadow", "weight": 9,
+     "status": "planted", "planned_plant_chapter": 1, "planted_chapter": 1,
+     "earliest_reveal_chapter": 5, "planned_payoff_chapter": 8},
+    {"id": "P2", "title": "谁让赵德明改分", "kind": "foreshadow", "weight": 8,
+     "status": "planted", "planned_plant_chapter": 2, "planted_chapter": 2,
+     "earliest_reveal_chapter": 3, "planned_payoff_chapter": 3},
+    {"id": "P3", "title": "林小满是否告密", "kind": "hook", "weight": 7,
+     "status": "planted", "planned_plant_chapter": 2, "planted_chapter": 2,
+     "earliest_reveal_chapter": 4, "planned_payoff_chapter": 6}
+  ],
+  "references": {
+    "query": ["办公室", "老师", "分数", "怀疑", "同学", "沉默", "校园", "秘密"],
+    "authors": [],
+    "books": [{"stable_book_id": "sb-60763bc1e552451d", "book_id": "0dd1db9a41e5fb04", "label": "面纱"}]
+  },
+  "check": {
+    "must_hit_keywords": [["办公室"], ["打招呼"], ["林小满"]],
+    "forbidden_keywords": ["箱子里是", "箱子里装"],
+    "leak_names": ["凯蒂", "沃尔特", "香港", "湄潭府"]
+  }
+}

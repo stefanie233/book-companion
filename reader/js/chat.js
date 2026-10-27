@@ -224,6 +224,39 @@ export function createThinkRow(thinkText, durationSec, live) {
   return row;
 }
 
+/** Stamp the rendered row index on a live message.
+ *
+ * loadSession re-numbers every row at the end, but messages appended while
+ * chatting never went through it — so their fork action read
+ * `dataset.msgIndex == undefined`, which JSON-serialises to null and turns
+ * "重新输入" into "copy the whole session". Keep the index current at the
+ * single point where rows are appended.
+ */
+function stampMsgIndex(el) {
+  if (!el) return;
+  el.dataset.msgIndex = String(
+    document.querySelectorAll('#chatLog > .msg').length - 1);
+}
+
+/** Adopt the persisted user-message id returned with the chat response.
+ *
+ * Forking needs the DB id (`up_to_message_id`). A live bubble has no id
+ * until the page is reloaded; with this, "重新回复" works in the same
+ * session it was sent in.
+ */
+function stampUserMessageId(resp, userDiv, state) {
+  const uid = resp.headers.get('X-User-Message-Id');
+  if (!uid || state._epoch !== S.chatEpoch) return;
+  if (userDiv) {
+    userDiv.dataset.msgId = uid;
+    return;
+  }
+  // Voice input: the row is a voice bubble, not the text Div we created.
+  const rows = document.querySelectorAll('#chatLog > .msg.user');
+  const last = rows[rows.length - 1];
+  if (last) last.dataset.msgId = uid;
+}
+
 function createBubble(role, html, avatarEl) {
   const div = document.createElement('div');
   div.className = 'msg ' + role;
@@ -252,7 +285,9 @@ function createBubble(role, html, avatarEl) {
       forkEdit(div);
     };
   } else {
-    btn.innerHTML = '<i data-lucide="pencil"></i>';
+    // "重新回复" is a reload action, not an edit — use the circular arrow
+    // so it reads differently from the pencil on the user's own turn.
+    btn.innerHTML = '<i data-lucide="rotate-cw"></i>';
     btn.title = '重新回复:让书伴重新回复,从处分叉新分支';
     btn.onclick = function (e) {
       e.stopPropagation();
@@ -305,6 +340,23 @@ function createBubble(role, html, avatarEl) {
  * indexing in sessions.js — used by fork and the branch switcher — is
  * unaffected.
  */
+/** 非 2xx = 服务端在发出第一条 SSE 之前就崩了（未捕获异常返回 JSON）。
+ *  不检查就会顺着「读 body、找不到 data: 行」一路走到流的尽头 ——
+ *  界面上一句话都没有，看起来像请求根本没发出去。 */
+async function reportHttpError(resp, agentDiv, state) {
+  let msg = '请求失败：HTTP ' + resp.status;
+  try {
+    const err = await resp.json();
+    if (err && err.error) msg = err.error;
+  } catch (_) { /* 不是 JSON，就报状态码 */ }
+  if (msg.length > 1200) msg = msg.slice(0, 1200) + '…';
+  // The request may have outlived its view (branch/session switch while the
+  // JSON body was being read). Never write it into the new chatHistory.
+  if (state && state._epoch !== S.chatEpoch) return;
+  setBubbleHTML(agentDiv, renderMarkdown(msg));
+  S.chatHistory.push({ role: 'agent', content: msg });
+}
+
 function setBubbleHTML(agentDiv, html) {
   const bubble = agentDiv.querySelector('.bubble');
   if (!bubble) return;
@@ -347,6 +399,7 @@ export function addChat(role, text, extraClass, timeMs) {
 
   if (extraClass) div.classList.add(extraClass);
   log.appendChild(div);
+  stampMsgIndex(div);
   log.scrollTop = log.scrollHeight;
   return div;
 }
@@ -490,6 +543,13 @@ function startTypewriter(bubble, state) {
 
   async function tick(now) {
     if (!state._twActive) return;
+    // The visible conversation was replaced under us (branch switch / new
+    // session). Stop silently — writing the old branch's text (or its voice
+    // bubbles) into the new transcript is exactly the mismatch to avoid.
+    if (state._epoch !== S.chatEpoch) {
+      state._twActive = false;
+      return;
+    }
 
     if (now - state._twLastFrame < speedMs) {
       _twRafId = requestAnimationFrame(tick);
@@ -497,12 +557,20 @@ function startTypewriter(bubble, state) {
     }
     state._twLastFrame = now;
 
+    const backlog = state._fullText.length - state._twIndex;
+    // 模型输出是突发的：落后超过 80 字就按比例追赶（约半秒内追平），
+    // 正常节奏仍是逐字。否则渲染会永远欠着模型一大段尾巴，停止时
+    // 一重绘就像「先前被限速的内容突然全倒出来」。
+    const step = backlog > 80
+      ? Math.min(backlog, Math.ceil(backlog / 30))
+      : 1;
     const ch = state._fullText[state._twIndex];
     if (S.currentMode === 'roleplay' && ch && /[。！？…—]/.test(ch)) {
       state._twLastFrame += PUNCT_PAUSE;
     }
 
-    state._twIndex++;
+    state._twIndex = Math.min(
+      state._fullText.length, state._twIndex + step);
     bubble.innerHTML = renderMarkdown(state._fullText.slice(0, state._twIndex))
       + '<span class="typewriter-cursor">|</span>';
     autoScrollToBottom(document.getElementById('chatLog'));
@@ -514,8 +582,7 @@ function startTypewriter(bubble, state) {
       const cursor = bubble.querySelector('.typewriter-cursor');
       if (cursor) cursor.remove();
       state._twActive = false;
-      S.chatHistory.push({ role: 'agent', content: state._fullText });
-      if (S.chatHistory.length > 30) S.chatHistory = S.chatHistory.slice(-20);
+      pushAgentHistory(state);
 
       // ── Render TTS voice bubbles from tts_speak tool ──────────
       if (state._voiceUrls && state._voiceUrls.length > 0) {
@@ -553,6 +620,10 @@ function stopTypewriter(state) {
 // ── SSE v2 event handler ───────────────────────────────────────────
 
 function handleSSEEvent(event, state, agentDiv) {
+  // Late frames from a stream whose view was replaced: drop them entirely
+  // (including `done`'s usage update, which would corrupt the new session's
+  // context ring).
+  if (state._epoch !== S.chatEpoch) return;
   switch (event.type) {
     case 'think_start':
       state._thinkStartTime = Date.now();
@@ -592,7 +663,11 @@ function handleSSEEvent(event, state, agentDiv) {
 
     case 'text':
       state._fullText += event.content;
-      if (!state._twActive) startTypewriter(agentDiv.querySelector('.bubble'), state);
+      // 已经按了停止：不再重启打字机（屏幕立刻停住）；在途的尾巴仍会
+      // 收进 _fullText，最终定格时与服务端落盘的内容一致。
+      if (!state._stopping && !state._twActive) {
+        startTypewriter(agentDiv.querySelector('.bubble'), state);
+      }
       break;
 
     case 'tool_start':
@@ -611,23 +686,51 @@ function handleSSEEvent(event, state, agentDiv) {
       }
       break;
 
+    case 'interrupted':
+      // 服务端已停住这一轮：冻结打字机、把已收到的正文定格，尾部标记
+      // 「已中断」。后面的 done 仍会到达，markInterrupted 是幂等的。
+      state._streamDone = true;
+      markInterrupted(agentDiv, state);
+      break;
+
     case 'error':
       stopTypewriter(state);
       finalizeThinkRow(state);
       setBubbleHTML(agentDiv,
         renderMarkdown(state._fullText || event.message || '发生错误'));
       S.chatHistory.push({ role: 'agent', content: state._fullText || event.message });
+      state._historyPushed = true;
       break;
 
     case 'done':
       state._streamDone = true;
+      // 兜底：interrupted 帧没读到（连接被我们 aborted，或取消到得太晚
+      // 服务端已正常收尾）时，本地的停止意图也要把界面收成「已中断」。
+      if (event.interrupted || state._stopping) {
+        markInterrupted(agentDiv, state);
+      }
       // Guard against a stream that ends mid-reasoning (no think_end frame):
       // otherwise the row would stay labelled "思考中…" forever.
       finalizeThinkRow(state);
       if (event.usage) updateUsage(event.usage);
-      if (event.session_id && !S.currentSessionId) {
-        S.currentSessionId = event.session_id;
-        window.saveViewState && window.saveViewState();
+      // Same rule as the header: adopt whichever session the server used
+      // (it may have replaced a cross-page/mode id), unless the view moved
+      // on — in that case keep the id on the line that sent it.
+      if (event.session_id) {
+        if (!state || state._epoch === S.chatEpoch) {
+          if (window.adoptSession) {
+            window.adoptSession(event.session_id, {
+              tab: state && state._sendTab,
+              bookId: state && state._sendBook,
+            });
+          } else {
+            S.currentSessionId = event.session_id;
+          }
+          window.saveViewState && window.saveViewState();
+        } else if (window.recordTabSession && state && state._sendTab) {
+          window.recordTabSession(state._sendTab, event.session_id,
+            { bookId: state._sendBook });
+        }
       }
       break;
   }
@@ -643,6 +746,118 @@ function finalizeThinkRow(state) {
   state._thinkBuf = '';
 }
 
+// ── User-initiated stop ───────────────────────────────────────────
+// 一条流 = 一个 turn_id。停止按钮先通知服务端（可精确停到当前回合，
+// 工具和后续 ReAct 轮次都不再跑），2.5s 内没等到终态再断连接兜底。
+
+function newTurnId() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+  } catch (_) { /* insecure context */ }
+  return 'turn-' + Date.now().toString(36) + '-' +
+    Math.random().toString(36).slice(2);
+}
+
+/** 重载会话时也用它：中断注记不是正文，只画一枚轻标记。 */
+export function createInterruptNote() {
+  const div = document.createElement('div');
+  div.className = 'interrupt-note';
+  div.textContent = '已中断';
+  return div;
+}
+
+function setSendButtonBusy(busy) {
+  const btn = document.getElementById('sendBtn');
+  if (!btn) return;
+  btn.classList.toggle('stop', !!busy);
+  btn.textContent = busy ? '停止' : '发送';
+  btn.title = busy ? '停止生成' : '';
+}
+
+/** 每条 agent 回复只进一次 chatHistory（打字机、中断、中止三条路径共用）。 */
+function pushAgentHistory(state) {
+  if (!state || state._historyPushed || state._epoch !== S.chatEpoch) return;
+  state._historyPushed = true;
+  if (!state._fullText) return;
+  S.chatHistory.push({ role: 'agent', content: state._fullText });
+  if (S.chatHistory.length > 30) S.chatHistory = S.chatHistory.slice(-20);
+}
+
+/** 停止时只认「按下那一刻已经渲染出来的前缀」。
+ *
+ * ``_fullText`` 里通常还压着服务端已经吐完、打字机没来得及画的尾巴；
+ * 中断时把整段重绘会让人以为被限速的内容突然全倒了出来。
+ */
+function renderedPrefix(state) {
+  if (!state) return '';
+  if (state._stopping && state._stopIndex >= 0) {
+    return state._fullText.slice(0, state._stopIndex);
+  }
+  return state._fullText;
+}
+
+function markInterrupted(agentDiv, state) {
+  if (!state || state._epoch !== S.chatEpoch) return;
+  stopTypewriter(state);
+  finalizeThinkRow(state);
+  const shown = renderedPrefix(state);
+  if (shown) {
+    state._twIndex = shown.length;
+    setBubbleHTML(agentDiv, renderMarkdown(shown));
+  } else {
+    // 按下时一个字都还没画出来：保持空占位隐藏，绝不回填积压正文。
+    state._twIndex = 0;
+    setBubbleHTML(agentDiv, '');
+  }
+  pushAgentHistory(state);
+  if (state._interruptedShown) return;
+  state._interruptedShown = true;
+  if (agentDiv && agentDiv.parentNode) {
+    agentDiv.parentNode.insertBefore(createInterruptNote(), agentDiv.nextSibling);
+  }
+}
+
+/** 停止当前流：先冻结界面，再让服务端停；最终落盘由服务端负责。 */
+export function stopAgent() {
+  const active = S._activeStream;
+  if (!active || active.state._stopping) return;
+  active.state._stopping = true;
+  // 定格点 = 按下这一刻已经画出来的字数；之后收到的在途文本只进
+  // _fullText（服务端落盘用），不再上屏。
+  if (active.state._stopIndex < 0) {
+    // v1 回退路径没有打字机，文本是一到就整段渲染的 —— 全量算已渲染。
+    active.state._stopIndex = active.state._v1Fallback
+      ? active.state._fullText.length
+      : (active.state._twIndex || 0);
+  }
+
+  // 立刻冻结并补标记：服务端可能正卡在一个同步工具里，不能等它回话。
+  // 后续到达的在途文本只进 _fullText（服务端落盘用），不再上屏。
+  markInterrupted(active.agentDiv, active.state);
+
+  if (active.turnId) {
+    fetch(S.API + '/api/chat/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ turn_id: active.turnId }),
+      keepalive: true,
+    }).catch(function () {
+      // 旧服务端没有这个接口 → 下面 2.5s 的 abort 仍然能停住。
+    });
+  }
+
+  active.fallbackTimer = setTimeout(function () {
+    try { active.abortCtrl.abort(); } catch (_) { /* already closed */ }
+  }, 2500);
+}
+
+export function sendOrStop() {
+  if (S._activeStream) stopAgent();
+  else sendMessage();
+}
+
 // ── Send message (SSE streaming) ──────────────────────────────────
 
 export async function sendMessage(overrideText) {
@@ -650,6 +865,8 @@ export async function sendMessage(overrideText) {
   const isOverride = overrideText != null;
   const text = isOverride ? String(overrideText).trim() : input.value.trim();
   if (!text) return;
+  // 一轮只允许一条流：流式期间按钮已经变成「停止」。
+  if (S._activeStream) return;
 
   let fullText = text;
   // Quote-injection only for manual input from the chat box; fork/regenerate
@@ -673,9 +890,21 @@ export async function sendMessage(overrideText) {
   const userDiv = createBubble('user', '', null);
   userDiv.querySelector('.bubble').textContent = text;
   log.appendChild(userDiv);
+  stampMsgIndex(userDiv);
   log.scrollTop = log.scrollHeight;
   S.chatHistory.push({ role: 'user', content: text });
+  // 会话已经开始：撤掉模式预选，把这次会话的阅读模式固定下来。
+  if (window.updateModePrelude) window.updateModePrelude();
   if (!isOverride) input.value = '';
+
+  // 写作页：带上当前作品/章，回合结束后刷新工作台（工具可能建了书/章/正文）。
+  const writingCtx = (window._currentTab === 'write' && window.WritingUI
+    && typeof window.WritingUI.context === 'function')
+    ? window.WritingUI.context() : null;
+  // 手改优先：先落盘再做 agent 的事，否则回来刷新会把未保存的改动吞掉。
+  if (writingCtx && typeof window.WritingUI.flush === 'function') {
+    try { await window.WritingUI.flush(); } catch (_) { /* 保存失败不拦对话 */ }
+  }
 
   // Agent bubble placeholder — created now so the typewriter has a target as
   // soon as text arrives, but collapsed while empty so the reasoning phase
@@ -686,7 +915,15 @@ export async function sendMessage(overrideText) {
   const agentDiv = createBubble('agent', '', avatarEl);
   setBubbleHTML(agentDiv, '');
   log.appendChild(agentDiv);
+  stampMsgIndex(agentDiv);
   log.scrollTop = log.scrollHeight;
+
+  // A fork loads its child before this turn is re-sent, so the row the
+  // branch switcher anchors to only exists now. Re-render it (no-op when
+  // the switcher is already there / the session has no branches).
+  if (S.currentSessionId && window.renderBranchSwitchers) {
+    window.renderBranchSwitchers(S.currentSessionId);
+  }
 
   // Per-message streaming state (stored as properties on a plain object)
   const state = {
@@ -699,10 +936,35 @@ export async function sendMessage(overrideText) {
     _twLastFrame: 0,
     _streamDone: false,
     _v1Fallback: false,
+    // Which conversation this stream belongs to. See S.chatEpoch.
+    _epoch: S.chatEpoch,
+    // Stop freeze point: characters already painted when the user hit
+    // stop. -1 = not stopped; never backfill the buffered tail.
+    _stopIndex: -1,
   };
 
   const abortCtrl = new AbortController();
   S._chatAbort = abortCtrl;
+  const turnId = newTurnId();
+  S._activeStream = {
+    turnId: turnId,
+    abortCtrl: abortCtrl,
+    state: state,
+    agentDiv: agentDiv,
+    fallbackTimer: null,
+  };
+  setSendButtonBusy(true);
+
+  // 三个界面各用各的提示词与上下文：主页只带 home 语境，阅读页才带书、
+  // 进度、选区。写作页的现场走 writing_work_id / writing_chapter_index。
+  const onReader = window._currentTab === 'reader';
+  const isRoleplay = S.currentMode === 'roleplay';
+  const page = writingCtx ? 'writing' : (onReader ? 'reader' : 'home');
+  // 回复落在哪条会话线：中途切页也不能把新会话记到别的线上。
+  const sendTab = window.getActiveChatTab ? window.getActiveChatTab() : 'home';
+  const sendBook = S.currentBook || '';
+  state._sendTab = sendTab;
+  state._sendBook = sendBook;
 
   try {
     const resp = await fetch(S.API + '/api/chat', {
@@ -719,18 +981,46 @@ export async function sendMessage(overrideText) {
           }
           return fullText;
         })(),
-        mode: S.currentMode,
-        stream: 'v2',
-        character_name: S.currentCharacterName || undefined,
-        max_chapter: S.currentMaxChapter,
-        book_id: S.currentMode === 'roleplay'
-          ? (S.rpSelectedBookId || S.currentBook || '')
-          : (S.currentBook || ''),
-        ...(S.currentMode !== 'roleplay' && S.currentBook && window._currentTab === 'reader' ? {
-          position: { chapter: S.currentChapter, chunk: S.currentChunk }
+        // 写作页的对话走写作模式：同一套 ReAct 循环，换一套提示词与工具。
+        mode: writingCtx ? 'writing' : S.currentMode,
+        page: page,
+        ...(writingCtx ? {
+          writing_work_id: writingCtx.workId || '',
+          writing_chapter_index: writingCtx.index || 0,
         } : {}),
-        selection: S.currentMode !== 'roleplay' ? S.lastSelection : '',
-        selection_source: S.currentMode !== 'roleplay' ? S.selectionSource : '',
+        stream: 'v2',
+        // /api/chat/cancel 用同一个 id 精确停住这一轮
+        turn_id: turnId,
+        character_name: S.currentCharacterName || undefined,
+        role_kind: S.currentRoleKind || 'character',
+        role_ref: S.currentRoleRef || undefined,
+        // 剧透门只在扮演模式有意义；主页/写作页不发。
+        max_chapter: (isRoleplay && !writingCtx) ? S.currentMaxChapter : undefined,
+        // 阅读进度只喂 reader-notes 召回通道（与 max_chapter 的剧透门无关）
+        reading_chapter: (!writingCtx && onReader) ? S.currentChapter : undefined,
+        book_id: writingCtx ? '' : (isRoleplay
+          ? (S.rpSelectedBookId || S.currentBook || '')
+          : (onReader ? (S.currentBook || '') : '')),
+        ...(!writingCtx && !isRoleplay && onReader && S.currentBook ? {
+          position: { chapter: S.currentChapter, chunk: S.currentChunk },
+          // Chapters visible in the viewport (from /api/sync). The gate must
+          // never sit below what is already on screen.
+          visible_chapters: (S.visibleChapters && S.visibleChapters.length)
+            ? S.visibleChapters : undefined,
+        } : {}),
+        selection: (!writingCtx && !isRoleplay && onReader) ? S.lastSelection : '',
+        selection_source: (!writingCtx && !isRoleplay && onReader) ? S.selectionSource : '',
+        // Structural coordinates of the selection (see state.js). The
+        // backend uses them to anchor <selection-context> and to raise the
+        // spoiler gate — a selected passage is text the reader has seen.
+        ...(!writingCtx && !isRoleplay && onReader && S.selectionSource === 'book'
+          && S.lastSelection ? {
+          selection_section: S.selectionSection,
+          selection_chapter: S.selectionChapter,
+          selection_chunk: S.selectionChunk,
+          selection_cfi: S.selectionCfi || '',
+          selection_anchor_text: S.selectionAnchorText || '',
+        } : {}),
         history: (function () {
           const h = S.chatHistory;
           if (h.length && h[h.length - 1].role === 'user') {
@@ -742,10 +1032,25 @@ export async function sendMessage(overrideText) {
       })
     });
 
+    if (!resp.ok) { await reportHttpError(resp, agentDiv, state); return; }
+
+    // Fork needs the persisted message id even before a page reload.
+    stampUserMessageId(resp, typeof userDiv === 'undefined' ? null : userDiv, state);
+
     const sid = resp.headers.get('X-Session-Id');
-    if (sid && !S.currentSessionId) {
-      S.currentSessionId = sid;
-      window.saveViewState && window.saveViewState();
+    // Adopt the session the server actually persisted to. It differs from
+    // the local id when the server had to create a new one (no id, or a
+    // page/mode mismatch — session lines never mix). The epoch check keeps
+    // a branch/tab switch made mid-stream from being overwritten; in that
+    // case the id still belongs to the line that sent it.
+    if (sid) {
+      if (state._epoch === S.chatEpoch) {
+        if (window.adoptSession) window.adoptSession(sid, { tab: sendTab, bookId: sendBook });
+        else S.currentSessionId = sid;
+        window.saveViewState && window.saveViewState();
+      } else if (window.recordTabSession) {
+        window.recordTabSession(sendTab, sid, { bookId: sendBook });
+      }
     }
 
     const reader = resp.body.getReader();
@@ -799,23 +1104,39 @@ export async function sendMessage(overrideText) {
         stopTypewriter(state);
         // Flush remaining text immediately
         state._twIndex = state._fullText.length;
-        setBubbleHTML(agentDiv, renderMarkdown(state._fullText));
-        S.chatHistory.push({ role: 'agent', content: state._fullText });
+        if (state._epoch === S.chatEpoch) {
+          setBubbleHTML(agentDiv, renderMarkdown(state._fullText));
+          pushAgentHistory(state);
+        }
       }
     }
   } catch (e) {
     if (e.name === 'AbortError') {
-      // 会话切换取消：停止打字机并收尾思考行，避免它停留在"思考中…"，
-      // 同时让仍为空的占位行保持隐藏（不留空气泡）。
+      // 两种中止共用一条路径：用户按停止（_stopping，补中断标记）与
+      // 会话/分支切换（静默收尾）。后者不改当前视图。
       stopTypewriter(state);
       finalizeThinkRow(state);
-      setBubbleHTML(agentDiv, renderMarkdown(state._fullText));
+      if (state._stopping) {
+        markInterrupted(agentDiv, state);
+      } else {
+        setBubbleHTML(agentDiv, renderMarkdown(state._fullText));
+      }
       return;
     }
     stopTypewriter(state);
     setBubbleHTML(agentDiv, renderMarkdown('请求失败: ' + e.message));
   } finally {
+    if (S._activeStream && S._activeStream.abortCtrl === abortCtrl) {
+      clearTimeout(S._activeStream.fallbackTimer);
+      S._activeStream = null;
+      setSendButtonBusy(false);
+    }
     if (S._chatAbort === abortCtrl) S._chatAbort = null;
+    // 工具可能建了作品/章节、写了正文——回合结束后把工作台对齐到磁盘。
+    if (writingCtx && window.WritingUI
+        && typeof window.WritingUI.refresh === 'function') {
+      window.WritingUI.refresh();
+    }
   }
 }
 
@@ -871,12 +1192,26 @@ document.addEventListener('mouseup', function (e) {
       S.selectionSource = 'book';
       S.lastSelection = text;
       S.lastRange = sel.rangeCount > 0 ? sel.getRangeAt(0).cloneRange() : null;
+      if (S.renderMode !== 'native') {
+        // Chunk view: the visible chunk is the selected chunk. Native
+        // selections are stamped by annotations.js with the epub section.
+        S.selectionSection = null;
+        S.selectionCfi = '';
+        S.selectionChapter = S.currentChapter;
+        S.selectionChunk = S.currentChunk;
+        S.selectionAnchorText = text;
+      }
       if (typeof window.popupInteracting === 'undefined' || !window.popupInteracting) {
         if (typeof window.showAnnotationPopup === 'function') window.showAnnotationPopup(sel, text);
       }
     } else if (chatEl.contains(sel.anchorNode)) {
       S.selectionSource = 'chat';
       S.lastSelection = text;
+      S.selectionSection = null;
+      S.selectionCfi = '';
+      S.selectionChapter = null;
+      S.selectionChunk = null;
+      S.selectionAnchorText = '';
       showSelectionRef(text, '聊天');
     }
   }, 10);
@@ -898,6 +1233,11 @@ export function clearSelectionRef() {
   document.getElementById('selectionTag').classList.remove('visible');
   S.lastSelection = '';
   S.lastRange = null;
+  S.selectionSection = null;
+  S.selectionChapter = null;
+  S.selectionChunk = null;
+  S.selectionCfi = '';
+  S.selectionAnchorText = '';
 }
 
 // ── Voice: recording (ASR) ─────────────────────────────────────────
@@ -1176,6 +1516,7 @@ export function createVoiceBubble(role, audioUrl, durationSec, transcript, timeM
   });
 
   log.appendChild(div);
+  stampMsgIndex(div);
   log.scrollTop = log.scrollHeight;
   audio.load();
   return div;
@@ -1274,6 +1615,8 @@ function _showVoiceContextMenu(x, y, state) {
 // ── Voice message: send (ASR + LLM) ──────────────────────────────
 
 async function sendVoiceMessage(wavBlob, durationSec) {
+  // 同 sendMessage：一轮只允许一条流，流式期间不再叠一条语音回合。
+  if (S._activeStream) return;
   const log = document.getElementById('chatLog');
 
   // 1. Upload recording → persistent URL
@@ -1309,6 +1652,8 @@ async function sendVoiceMessage(wavBlob, durationSec) {
 
   // Store history
   S.chatHistory.push({ role: 'user', content: voiceText });
+  // 语音同样算会话开始：撤掉模式预选，锁定这次会话的阅读模式。
+  if (window.updateModePrelude) window.updateModePrelude();
 
   // 3. Build message with emotion context
   let message = voiceText;
@@ -1334,6 +1679,7 @@ async function sendVoiceMessage(wavBlob, durationSec) {
   const agentDiv = createBubble('agent', '', avatarEl);
   setBubbleHTML(agentDiv, '');
   log.appendChild(agentDiv);
+  stampMsgIndex(agentDiv);
   log.scrollTop = log.scrollHeight;
 
   // 6. Send to LLM (reuse sendMessage logic)
@@ -1347,10 +1693,34 @@ async function sendVoiceMessage(wavBlob, durationSec) {
     _twLastFrame: 0,
     _streamDone: false,
     _v1Fallback: false,
+    // Which conversation this stream belongs to. See S.chatEpoch.
+    _epoch: S.chatEpoch,
+    // Stop freeze point: characters already painted when the user hit
+    // stop. -1 = not stopped; never backfill the buffered tail.
+    _stopIndex: -1,
   };
 
   const abortCtrl = new AbortController();
   S._chatAbort = abortCtrl;
+  const turnId = newTurnId();
+  S._activeStream = {
+    turnId: turnId,
+    abortCtrl: abortCtrl,
+    state: state,
+    agentDiv: agentDiv,
+    fallbackTimer: null,
+  };
+  setSendButtonBusy(true);
+
+  const isWriting = window._currentTab === 'write' && !!window.WritingUI;
+  const onReader = window._currentTab === 'reader';
+  const isRoleplay = S.currentMode === 'roleplay';
+  const page = isWriting ? 'writing' : (onReader ? 'reader' : 'home');
+  // 回复落在哪条会话线：中途切页也不能把新会话记到别的线上。
+  const sendTab = window.getActiveChatTab ? window.getActiveChatTab() : 'home';
+  const sendBook = S.currentBook || '';
+  state._sendTab = sendTab;
+  state._sendBook = sendBook;
 
   try {
     const resp = await fetch(S.API + '/api/chat', {
@@ -1359,14 +1729,25 @@ async function sendVoiceMessage(wavBlob, durationSec) {
       signal: abortCtrl.signal,
       body: JSON.stringify({
         message: message,
-        mode: S.currentMode,
+        mode: isWriting ? 'writing' : S.currentMode,
+        page: page,
+        ...(isWriting
+          ? { writing_work_id: window.WritingUI.context().workId || '',
+              writing_chapter_index: window.WritingUI.context().index || 0 }
+          : {}),
         stream: 'v2',
+        turn_id: turnId,
         voice: voiceMeta || undefined,
         character_name: S.currentCharacterName || undefined,
-        max_chapter: S.currentMaxChapter,
-        book_id: S.currentMode === 'roleplay'
+        role_kind: S.currentRoleKind || 'character',
+        role_ref: S.currentRoleRef || undefined,
+        // 剧透门只在扮演模式有意义；主页/写作页不发。
+        max_chapter: (isRoleplay && !isWriting) ? S.currentMaxChapter : undefined,
+        // 阅读进度只喂 reader-notes 召回通道（与 max_chapter 的剧透门无关）
+        reading_chapter: (!isWriting && onReader) ? S.currentChapter : undefined,
+        book_id: isWriting ? '' : (isRoleplay
           ? (S.rpSelectedBookId || S.currentBook || '')
-          : (S.currentBook || ''),
+          : (onReader ? (S.currentBook || '') : '')),
         history: (() => {
           const h = S.chatHistory;
           if (h.length && h[h.length - 1].role === 'user') return h.slice(0, -1).slice(-6);
@@ -1376,10 +1757,25 @@ async function sendVoiceMessage(wavBlob, durationSec) {
       })
     });
 
+    if (!resp.ok) { await reportHttpError(resp, agentDiv, state); return; }
+
+    // Fork needs the persisted message id even before a page reload.
+    stampUserMessageId(resp, typeof userDiv === 'undefined' ? null : userDiv, state);
+
     const sid = resp.headers.get('X-Session-Id');
-    if (sid && !S.currentSessionId) {
-      S.currentSessionId = sid;
-      window.saveViewState && window.saveViewState();
+    // Adopt the session the server actually persisted to. It differs from
+    // the local id when the server had to create a new one (no id, or a
+    // page/mode mismatch — session lines never mix). The epoch check keeps
+    // a branch/tab switch made mid-stream from being overwritten; in that
+    // case the id still belongs to the line that sent it.
+    if (sid) {
+      if (state._epoch === S.chatEpoch) {
+        if (window.adoptSession) window.adoptSession(sid, { tab: sendTab, bookId: sendBook });
+        else S.currentSessionId = sid;
+        window.saveViewState && window.saveViewState();
+      } else if (window.recordTabSession) {
+        window.recordTabSession(sendTab, sid, { bookId: sendBook });
+      }
     }
 
     const reader = resp.body.getReader();
@@ -1419,20 +1815,31 @@ async function sendVoiceMessage(wavBlob, durationSec) {
       }
     }
 
-    S.chatHistory.push({ role: 'agent', content: state._fullText });
+    if (state._epoch === S.chatEpoch) {
+      pushAgentHistory(state);
+    }
     // Voice bubbles are rendered by startTypewriter on typewriter completion —
     // no duplicate rendering here.
   } catch (e) {
     if (e.name === 'AbortError') {
-      // 同 sendMessage：收尾思考行，空占位保持隐藏。
+      // 同 sendMessage：用户停止 → 补中断标记；会话切换 → 静默收尾。
       stopTypewriter(state);
       finalizeThinkRow(state);
-      setBubbleHTML(agentDiv, renderMarkdown(state._fullText));
+      if (state._stopping) {
+        markInterrupted(agentDiv, state);
+      } else {
+        setBubbleHTML(agentDiv, renderMarkdown(state._fullText));
+      }
       return;
     }
     console.error('Voice message error:', e);
     setBubbleHTML(agentDiv, renderMarkdown('请求失败: ' + e.message));
   } finally {
+    if (S._activeStream && S._activeStream.abortCtrl === abortCtrl) {
+      clearTimeout(S._activeStream.fallbackTimer);
+      S._activeStream = null;
+      setSendButtonBusy(false);
+    }
     if (S._chatAbort === abortCtrl) S._chatAbort = null;
   }
 }
@@ -1532,6 +1939,8 @@ function attachVoiceBar(bubbleDiv, audioUrl) {
 
 // ── HTML onclick access ───────────────────────────────────────────
 window.sendMessage = sendMessage;
+window.sendOrStop = sendOrStop;
+window.stopAgent = stopAgent;
 window.handleQuote = handleQuote;
 window.clearSelectionRef = clearSelectionRef;
 window.addChat = addChat;

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from file_readers.epub_semantics import resolve_spine_semantic
+from file_readers.epub_semantics import map_epub3_type, resolve_spine_semantic
 from file_readers.html_skeleton import _clean_inline_tags
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -167,6 +167,14 @@ def _format_html(html_content: str, as_paragraphs: bool = False) -> str | list[s
 
 _STYLE_ATTR_RE = re.compile(r'style="([^"]*)"', re.IGNORECASE)
 
+# NCX 单遍扫描：开/闭标签用来数嵌套深度，navLabel 给标题，content 给落点。
+_NCX_NODE_RE = re.compile(
+    r"<navPoint\b[^>]*>|</navPoint\s*>"
+    r"|<navLabel\b[^>]*>\s*<text>(.*?)</text>"
+    r'|<content\s+src="([^"]*)"',
+    re.DOTALL | re.IGNORECASE,
+)
+
 
 def _inline_style(attrs: str) -> str:
     """Extract the inline ``style="..."`` payload from a <p> attribute string."""
@@ -271,6 +279,15 @@ class EpubReader:
         self._toc: list[dict] = []                 # [{"label": ..., "src": ...}, ...]
         self._toc_to_spine: dict[int, int] = {}    # TOC index → spine index
         self._spine_to_toc: dict[int, int] = {}    # spine index → TOC index (reverse)
+        # 过滤前的完整 NCX 目录 —— _filter_front_matter_toc 会把「扉页/版权/目录」
+        # 这类条目从展示目录里摘掉，但它们的标签是 _classify_chapter 的关键词
+        # 依据（"扉页"→cover、"版权信息"→copyright），必须留一份给分类兜底。
+        self._toc_all: list[dict] = []
+        self._spine_to_label_all: dict[int, str] = {}  # spine idx → 未过滤 NCX 标签
+        # spine idx → 该书目录里的层级（0 = 最外层）。一个文件可能挂多个 NCX
+        # 节点（人类简史 spine[6] 同时挂着「第一章」和它的四个小节），取**最浅**
+        # 的那个 —— 那才是这个文件在目录树里的身份。
+        self._spine_to_depth: dict[int, int] = {}
         self._cover_image_id: str | None = None    # manifest item id of cover image
         # ── Structural semantics (front/back matter identification) ──
         self._guide_refs: list[tuple[str, str]] = []      # (guide type, href) — EPUB2
@@ -453,7 +470,13 @@ class EpubReader:
 
         Conservative: only removes unambiguous non-content pages.
         Does NOT remove prefaces, introductions, or forewords (real content).
+
+        Filtering affects the DISPLAY toc only.  A full copy is kept in
+        ``_toc_all`` because these labels are exactly what
+        ``_classify_chapter`` keys on ("扉页"→cover, "版权信息"→copyright);
+        discarding them would strand the page on a meaningless filename.
         """
+        self._toc_all = list(self._toc)
         _FM_LABELS_RE = re.compile(
             r"^(扉页|封面|版权(?:页|信息|声明)?|书名页?|图书信息"
             r"|出版信息|目录|目次"
@@ -472,19 +495,33 @@ class EpubReader:
 
     def _build_toc_spine_map(self) -> None:
         """Map each TOC entry to its corresponding spine index via href matching."""
-        if not self._toc or not self._spine_ids:
+        if not self._spine_ids:
             return
-        for toc_idx, toc_entry in enumerate(self._toc):
-            toc_src = toc_entry.get("src", "")
-            if not toc_src:
+
+        # 第一个声明该 href 的 spine 胜出（与逐条 break 的原语义一致）。
+        href_to_spine: dict[str, int] = {}
+        for si, item_id in enumerate(self._spine_ids):
+            href = self._item_map.get(item_id, "").split("#")[0]
+            if href:
+                href_to_spine.setdefault(href, si)
+
+        # 未过滤目录 → spine → label：被 _filter_front_matter_toc 摘掉的条目
+        # （扉页/版权/目录…）在这里仍有标签，供 get_chapter_label 兜底。
+        for entry in self._toc_all:
+            si = href_to_spine.get(entry.get("src", "").split("#")[0])
+            if si is None:
                 continue
-            toc_href = toc_src.split("#")[0]
-            for spine_idx, item_id in enumerate(self._spine_ids):
-                href = self._item_map.get(item_id, "").split("#")[0]
-                if href == toc_href:
-                    self._toc_to_spine[toc_idx] = spine_idx
-                    self._spine_to_toc[spine_idx] = toc_idx
-                    break
+            self._spine_to_label_all.setdefault(si, entry.get("label", ""))
+            d = entry.get("depth")
+            if d is not None and (si not in self._spine_to_depth
+                                  or d < self._spine_to_depth[si]):
+                self._spine_to_depth[si] = d
+
+        for toc_idx, toc_entry in enumerate(self._toc):
+            si = href_to_spine.get(toc_entry.get("src", "").split("#")[0])
+            if si is not None:
+                self._toc_to_spine[toc_idx] = si
+                self._spine_to_toc[si] = toc_idx
 
     def _build_semantic_indexes(self) -> None:
         """Map guide / landmarks hrefs to spine indices (same href matching
@@ -548,7 +585,11 @@ class EpubReader:
         Looks at the ``<body epub:type>`` declaration and the first
         ``<section|article|aside|nav epub:type>``.  When the body declares a
         container type (frontmatter/backmatter) and a more specific inner
-        type exists, the inner one wins.  Results are cached in
+        type exists, the inner one wins — but only if that inner type is
+        itself mappable to a chapter_type.  An inner ``epub:type`` outside
+        the vocabulary (e.g. a ``landmarks`` nav) is not "more specific",
+        so the outer container type is kept rather than dropping the page's
+        structural signal entirely.  Results are cached in
         ``_spine_semantics``; pass *html* to reuse content already read
         (avoids a second archive read during import).
         """
@@ -578,8 +619,12 @@ class EpubReader:
                     r'["\']([^"\']+)["\']',
                     html, re.IGNORECASE,
                 )
+                inner_t = _norm(m_inner.group(1)) if m_inner else None
+                # 内层只有「更具体」时才该赢。若它映射不到枚举（如 landmarks
+                # 这类不在词表里的容器 nav），退回外层容器类型 —— 否则整页
+                # 丢掉结构信号，最终只能退化成按文件名猜。
                 self._spine_semantics[spine_idx] = (
-                    _norm(m_inner.group(1)) if m_inner else body_t
+                    inner_t if inner_t and map_epub3_type(inner_t) else body_t
                 )
             else:
                 self._spine_semantics[spine_idx] = body_t
@@ -802,47 +847,76 @@ class EpubReader:
             href = self._item_map.get(item_id, "")
             stem = Path(href).stem
             label = stem.replace("_", " ").replace("-", " ").title()
-            self._toc.append({"label": label, "src": href})
+            self._toc.append({"label": label, "src": href, "depth": 0})
 
     def _parse_ncx_content(self, ncx_xml: str) -> None:
-        """Parse EPUB 2 NCX markup."""
-        for m in re.finditer(
-            r'<navPoint[^>]*>.*?<navLabel>\s*<text>(.*?)</text>',
-            ncx_xml,
-            re.DOTALL,
-        ):
-            label = html_mod.unescape(re.sub(r"<[^>]+>", "", m.group(1)).strip())
-            if label:
-                # <content> tag lives after </navLabel>, outside the regex match range.
-                navpoint_end = ncx_xml.find('</navPoint>', m.end())
-                if navpoint_end == -1:
-                    navpoint_end = len(ncx_xml)
-                src_match = re.search(r'<content\s+src="([^"]*)"', ncx_xml[m.start():navpoint_end])
-                src = src_match.group(1) if src_match else ""
-                # NCX src paths are relative to the OPF directory.
-                # item_map stores paths relative to zip root (prefixed with _opf_dir).
-                # Resolve so that _build_toc_spine_map() can match them.
-                if src and self._opf_dir and not src.startswith(self._opf_dir):
-                    src = self._opf_dir + src
-                self._toc.append({"label": label, "src": src})
+        """Parse EPUB 2 NCX markup — keeping the ``navPoint`` nesting depth.
+
+        ``depth`` 是这本书**自己的目录层级**（部分 > 章 > 小节）。旧实现用一条
+        ``<navPoint…><navLabel>`` 正则逐条抓，嵌套关系全丢 —— 人类简史的三层
+        目录被拍成 123 条平表，章表因此无法表达从属关系，也看不出哪个节点是
+        「章」哪个是「小节」。``depth`` 从 0 起（最外层 navPoint 为 0）。
+        """
+        stack: list[dict] = []
+        for m in _NCX_NODE_RE.finditer(ncx_xml):
+            tok = m.group(0)
+            if tok.startswith("</"):
+                if stack:
+                    stack.pop()
+                continue
+            if tok.lower().startswith("<navpoint"):   # 开标签（navLabel 不匹配）
+                node = {"label": "", "src": "", "depth": len(stack)}
+                stack.append(node)
+                self._toc.append(node)
+                continue
+            if not stack:
+                continue
+            if m.group(1) is not None:           # <navLabel><text>
+                stack[-1]["label"] = html_mod.unescape(
+                    re.sub(r"<[^>]+>", "", m.group(1)).strip()
+                )
+            elif m.group(2) is not None:         # <content src="…">
+                stack[-1]["src"] = self._resolve_ncx_src(m.group(2))
+        self._toc = [e for e in self._toc if e.get("label")]
+
+    def _resolve_ncx_src(self, src: str) -> str:
+        """NCX src 相对 OPF 目录；_item_map 里的路径相对 zip 根，补上前缀。"""
+        if src and self._opf_dir and not src.startswith(self._opf_dir):
+            return self._opf_dir + src
+        return src
 
     def _parse_nav_html(self, nav_html: str) -> None:
-        """Parse EPUB 3 nav document."""
-        # <nav epub:type="toc"> → <li><a href="...">label</a></li>
+        """Parse EPUB 3 nav document — ``<ol>`` 的嵌套即目录层级。
+
+        与 NCX 版同样保留 ``depth``（0 = 最外层），两种格式的消费方一致。
+        """
         toc_section = re.search(
             r'<nav[^>]*toc[^>]*>(.*?)</nav>', nav_html, re.DOTALL
         )
-        if toc_section:
-            for m in re.finditer(
-                r'<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>', toc_section.group(1), re.DOTALL
-            ):
-                src = m.group(1)
-                label = html_mod.unescape(re.sub(r"<[^>]+>", "", m.group(2)).strip())
-                if label and src:
-                    # Resolve relative to OPF dir
-                    if not src.startswith(self._opf_dir) and not src.startswith("/"):
-                        src = self._opf_dir + src
-                    self._toc.append({"label": label, "src": src})
+        if not toc_section:
+            return
+        depth = 0
+        for m in re.finditer(
+            r"<ol\b[^>]*>|</ol\s*>|<a[^>]*href=\"([^\"]*)\"[^>]*>(.*?)</a>",
+            toc_section.group(1),
+            re.DOTALL | re.IGNORECASE,
+        ):
+            tok = m.group(0)
+            if tok.lower().startswith("<ol"):
+                depth += 1
+                continue
+            if tok.startswith("</"):
+                depth = max(0, depth - 1)
+                continue
+            src, label = m.group(1), html_mod.unescape(
+                re.sub(r"<[^>]+>", "", m.group(2)).strip()
+            )
+            if label and src:
+                if not src.startswith(self._opf_dir) and not src.startswith("/"):
+                    src = self._opf_dir + src
+                self._toc.append(
+                    {"label": label, "src": src, "depth": max(0, depth - 1)}
+                )
 
         # <nav epub:type="landmarks"> — explicit front/back matter links.
         # Searched INSIDE the landmarks section only, so a nav with
@@ -911,17 +985,34 @@ class EpubReader:
         self._ensure_loaded()
         return self._read_spine_html(spine_index)
 
+    def get_chapter_depth(self, spine_index: int) -> int:
+        """该书目录里这个 spine 的层级；没有 NCX 信息时返回 -1。
+
+        0 = 最外层（人类简史里是「第一部分 认知革命」这一档），1 = 章，
+        2 = 小节。用于把平铺的章表还原成书自己的目录树。
+        """
+        self._ensure_loaded()
+        return self._spine_to_depth.get(spine_index, -1)
+
     def get_chapter_label(self, spine_index: int) -> str:
         """Get the best label for a spine item.
 
-        Returns the NCX label if this spine index has a TOC entry,
-        otherwise generates a label from the filename.
+        Returns the NCX label if this spine index has a TOC entry.  Entries
+        dropped from the display toc as front matter (扉页/版权/目录…) still
+        yield their label here — that label is the classification keyword,
+        while a filename like "part0001" carries no meaning at all.
+        Otherwise generates a label from the filename.
         """
         self._ensure_loaded()
         if spine_index in self._spine_to_toc:
             toc_idx = self._spine_to_toc[spine_index]
             if toc_idx < len(self._toc):
                 return self._toc[toc_idx].get("label", "")
+
+        # 前置页兜底：展示目录里已摘掉，但标签对分类仍然有效。
+        fm_label = self._spine_to_label_all.get(spine_index)
+        if fm_label:
+            return fm_label
 
         # Fallback: generate from filename
         if spine_index < len(self._spine_ids):

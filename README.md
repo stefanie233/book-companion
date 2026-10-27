@@ -10,12 +10,14 @@
 - **💬 三种伴读模式** —— 沉浸伴读（不剧透）/ 俯瞰分析（全局视角）/ 发散探索（联网搜索与外部知识），人格由 `SOUL.md` 定义、可自行改写
 - **🧠 分层长期记忆** —— L0–L3 管线（原子记忆 → 场景归纳 → 用户画像），画像与记忆可查看、可编辑
 - **🕸️ BookGraph 知识图谱** —— 三段式抽取（Scout → Explorer → Recorder）构建人物/事件/地点关系网，SSE 实时提取进度，浏览器内力导向可视化
+- **✍️ 写作工作台（WriteGraph）** —— 作品树、文档式编辑、版本图（泳道）、风格透镜与写作 git（暂存 / 提交 / 合并 / 撤销 / 摘取）
+- **🖋️ 作者图谱（AuthorGraph）** —— 序跋采集、作者档案、时间线、正文声音采集与来源证据链
 - **🎭 角色扮演 + 音色** —— 图谱角色信息注入对话；按描述铸造音色、按参考音频复制音色（依赖提供对应能力的语音 API）
 - **🗜️ 结构化上下文压缩** —— 纯确定性算法压缩会话历史，无 LLM 参与，配合上下文用量计量
 - **🧰 工具系统** —— 四级工具暴露 + BM25 工具检索 + 白名单子 Agent，控制每轮 token 开销
-- **🌐 Web 前端** —— 书架 / 阅读 / 对话 / 图谱 / 角色扮演 / 控制台；会话分叉、恢复、导出 Markdown
+- **🌐 Web 前端** —— 书架 / 阅读 / 对话 / 图谱 / 作者档案 / 写作 / 角色扮演 / 控制台；会话分叉、恢复、导出 Markdown
 - **🎙️ 可选语音输入** —— 本地 ASR 模型（约 231 MB，安装时可选）
-- **🔒 本地优先** —— 四个 SQLite 库分立存储，API Key 只存本地
+- **🔒 本地优先** —— 六个 SQLite 库分立存储，API Key 只存本地
 
 ## 🚀 快速开始
 
@@ -100,8 +102,10 @@ start.bat        :: 启动 Agent + API 服务，等待就绪后自动打开浏�
 - **书架** —— 书源扫描导入、章节目录
 - **阅读** —— 正文阅读 + 边读边聊
 - **图谱** —— BookGraph 可视化（类型轮盘过滤、邻居聚焦、节点详情）
+- **作者档案** —— AuthorGraph 档案页（身份、年谱、作品、声音、来源）
+- **写作** —— 作品树、文档式编辑、版本图、风格透镜
 - **角色扮演** —— 与书中角色对话，支持角色音色
-- **控制台** —— Provider / 模型管理
+- **控制台** —— Provider / 模型 / 用量管理
 
 ## 🏗️ 架构一览
 
@@ -109,30 +113,40 @@ start.bat        :: 启动 Agent + API 服务，等待就绪后自动打开浏�
 启动: main.py → config → 各 Service → runtime（ReAct 循环）
 对话: 输入 → /命令 或 run_turn → 流式 LLM + 工具调用
         → 记忆管线（召回注入 + 同步）→ 结构化压缩 → SQLite 持久化
-图谱: Scout → Explorer → Recorder → graph.db → 前端可视化 / 对话注入
+图谱: Scout → 骨架趟 → Explorer → 裁决环 → Recorder → graph.db → 前端可视化 / 对话注入
+作者: 序跋采集 → 来源补全 → 声音采集 → 档案投影 → authors.db → 档案页 / 写作透镜
+写作: 素材召回 → 细节卡 / 风格透镜 → 组装 → 版本图（git）→ writing.db
 音色: 描述铸造 → 参考音频复制 → 角色扮演语音输出
 ```
 
 | 域   | 入口                                                           | 存储            |
 | --- | ------------------------------------------------------------ | ------------- |
-| 主引擎 | `main.py` `runtime.py` `tools.py` `commands.py` `compact.py` | —             |
+| 主引擎 | `main.py` `runtime.py` `tools/` `commands.py` `compact.py` `chat_context.py` | —             |
+| API  | `api_server.py` `api/routes/`                                | —             |
 | 书库  | `services/` `file_readers/`                                  | `books.db`    |
 | 会话  | `session.py` `services/session_service.py`                   | `sessions.db` |
 | 记忆  | `memory_store.py` `memory_manager.py` `memory_pipeline/`     | `memory.db`   |
 | 图谱  | `bookgraph/` `storage/graph_db.py`                           | `graph.db`    |
-| 音色  | `voices.py` `tools.py`                                       | `memory.db`   |
-| 前端  | `reader/`（14 个 ES 模块 + 内嵌 cytoscape）                         | —             |
+| 作者  | `authorgraph/` `storage/authors_db.py`                       | `authors.db`  |
+| 写作  | `writegraph/` `services/writing_service.py`                  | `writing.db`  |
+| 音色  | `voices.py` `tools/voice.py`                                 | `memory.db`   |
+| 前端  | `reader/`（25 个 ES 模块 + 内嵌库）                              | —             |
 | 提示词 | `prompts/*.md` `persona.py`                                  | —             |
 
 ```
 book-companion/
 ├── main.py               # 入口：CLI Agent + API 服务（127.0.0.1:8766）
 ├── runtime.py            # ReAct 对话循环、系统提示分层
+├── api_server.py / api/  # HTTP 组合根 + 按域拆分的路由
+├── tools/                # 工具注册表与内置工具集
 ├── setup.bat / start.bat # Windows 一键安装 / 启动
-├── services/             # 书库、导入、会话服务
+├── services/             # 书库、导入、会话、写作服务
 ├── memory_pipeline/      # L0–L3 记忆管线
-├── bookgraph/            # 图谱抽取三段流水线
-├── storage/              # 四库 SQLite 封装
+├── bookgraph/            # 图谱抽取流水线
+├── authorgraph/          # 作者档案、来源与声音采集
+├── writegraph/           # 写作账本、透镜与版本图
+├── writebench/           # 写作能力评测台（离线）
+├── storage/              # 六库 SQLite 封装
 ├── reader/               # Web 前端（js/ 模块 + lib/ 内嵌库）
 ├── prompts/              # 提示词模板（Markdown）
 ├── skills/               # 可插拔技能
@@ -142,7 +156,7 @@ book-companion/
 
 ## 💾 数据存储
 
-全部本地，四个 SQLite 库分立（共享 `BaseDatabase` 基类）：
+全部本地，六个 SQLite 库分立（共享 `BaseDatabase` 基类）：
 
 | 库             | 内容                 |
 | ------------- | ------------------ |
@@ -150,6 +164,8 @@ book-companion/
 | `sessions.db` | 会话、消息、消息分片         |
 | `memory.db`   | 分层记忆、画像、音色角色绑定     |
 | `graph.db`    | 图谱节点 / 边 / 别名 / 引文 |
+| `writing.db`  | 作品、章节草稿、版本图        |
+| `authors.db`  | 作者身份、来源、证据、声音特征    |
 
 配置与产物在 `data/`：`config/providers.json`、`memory/persona.md`、`scenes/`、`voice/refs/` 等。删库即重置，无云端依赖。
 
@@ -162,4 +178,4 @@ book-companion/
 
 [MIT](LICENSE) © 2026 stefanie233
 
-本项目参考/派生自若干第三方 MIT 项目，其版权声明逐字收录于 [NOTICE](NOTICE)；`reader/lib/` 下的内嵌前端库随分发原样保留各自许可头。
+本项目参考/派生自若干第三方项目（MIT / BSD-2-Clause / ISC），其版权声明逐字收录于 [NOTICE](NOTICE)；`reader/lib/` 下的内嵌前端库随分发原样保留各自许可头。

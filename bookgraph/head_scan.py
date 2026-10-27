@@ -21,13 +21,15 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from typing import Any, Callable, Coroutine
 
 import aiohttp
 
+from bookgraph.llm_call import output_budget
 from config import Config
+from llm_json import loads_tolerant
+from provider_store import config_for
 
 log = logging.getLogger("bookgraph")
 
@@ -185,6 +187,30 @@ def _merge_identity(identity: dict[str, dict], items: list[dict]) -> None:
             identity[field] = {"value": val, "evidence": ev}
 
 
+def _coerce_boundaries(raw) -> dict[str, str]:
+    """把模型给的 boundaries 收成 ``{key: region}``。
+
+    ``llm_json`` 管的是**语法**宽容（围栏、裸引号），这里管的是**形状**宽容 ——
+    两回事。提示词给的是字典样例，但模型完全可以合理地回一个列表：实测火山
+    引擎回 ``{"F#0-0": "toc"}``，DeepSeek 官方回
+    ``[{"key": "F#0-0", "boundary": "toc"}]``。只认一种形状 = 换个模型就崩，
+    而且崩在提取之前，整本书白跑。
+    """
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    out: dict[str, str] = {}
+    for item in (raw or []) if isinstance(raw, list) else []:
+        if isinstance(item, dict):
+            key = item.get("key") or item.get("chunk_key") or item.get("chunk_id")
+            region = (item.get("boundary") or item.get("region")
+                      or item.get("type") or item.get("value"))
+            if key and region:
+                out[str(key)] = str(region)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            out[str(item[0])] = str(item[1])
+    return out
+
+
 def _preface_line_reached(boundaries: dict[str, str]) -> bool:
     """Stop predicate: last <=PREFACE_CONSECUTIVE regions all 'preface'."""
     regs = list(boundaries.values())
@@ -219,7 +245,7 @@ async def _call_once(session: aiohttp.ClientSession, config: Config,
         ],
         "stream": False,
         "temperature": 0.0,
-        "max_tokens": 16000,
+        "max_tokens": output_budget(config),
     }
     headers = {
         "Authorization": f"Bearer {config.api_key}",
@@ -285,6 +311,7 @@ async def run_head_scan(
       {verdict, preface_start, boundaries, identity, promo_chunks,
        confidence, calls, scanned, reason}
     """
+    config = config_for(config, "bookgraph.head_scan")
     boundaries: dict[str, str] = {}
     identity: dict[str, dict] = {}
     fail_streak = 0
@@ -300,8 +327,7 @@ async def run_head_scan(
                                msg, chunk_key=None, log_cb=log_cb)
     calls += 1
     if ok and isinstance(res, dict):
-        for key, region in (res.get("boundaries") or {}).items():
-            boundaries[key] = region
+        boundaries.update(_coerce_boundaries(res.get("boundaries")))
         _merge_identity(identity, res.get("identity") or [])
     else:
         log.warning("HeadScan: first round unusable (%r)", type(res).__name__)
@@ -392,25 +418,5 @@ async def run_head_scan(
 
 
 def _parse_json(content: str) -> dict | None:
-    """Tolerant JSON parse: direct → code fence → first { to last }."""
-    if not content:
-        return None
-    content = content.strip()
-    try:
-        return json.loads(content)
-    except json.JSONDecodeError:
-        pass
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    start = content.find("{")
-    end = content.rfind("}")
-    if start >= 0 and end > start:
-        try:
-            return json.loads(content[start:end + 1])
-        except json.JSONDecodeError:
-            pass
-    return None
+    """Tolerant JSON parse — 阶梯与裸引号修复见 ``llm_json.loads_tolerant``。"""
+    return loads_tolerant(content, expect=dict)

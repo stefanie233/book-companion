@@ -7,6 +7,8 @@
 <link rel="icon" href="data:,"><!-- suppress /favicon.ico 404 -->
 <link rel="stylesheet" href="style.css">
 <link rel="stylesheet" href="console.css">
+<link rel="stylesheet" href="writing.css">
+<link rel="stylesheet" href="author-dossier.css">
 <script>
   // Apply saved day/night theme before paint to avoid flash of wrong theme.
   try {
@@ -83,6 +85,9 @@
   <div class="tab" onclick="switchTab('reader')" title="阅读">
     <i data-lucide="book-open"></i><span class="tab-label">阅读</span>
   </div>
+  <div class="tab" onclick="switchTab('write')" title="写作">
+    <i data-lucide="pen-line"></i><span class="tab-label">写作</span>
+  </div>
   <div class="tab" onclick="switchTab('theme')" title="主题">
     <i data-lucide="palette"></i><span class="tab-label">主题</span>
   </div>
@@ -128,22 +133,41 @@
       </div>
     </div>
       <div class="shelf-section-header" id="shelfStickyHeader">
-        <h2 class="shelf-section-title"><i data-lucide="library"></i> 全部藏书 <span class="shelf-count" id="shelfCount"></span></h2>
+        <div class="shelf-header-lead">
+          <h2 class="shelf-section-title"><i data-lucide="library"></i> 全部藏书 <span class="shelf-count" id="shelfCount"></span></h2>
+          <button id="shelfImportBtn" class="import-books-btn" onclick="toggleImportPanel()" title="扫描本地书库导入新书">
+            <i data-lucide="download"></i> 导入书籍
+          </button>
+        </div>
         <div class="shelf-header-actions">
+          <div class="shelf-reorder-bar" id="shelfReorderBar" hidden>
+            <span class="srb-hint">拖动书本调整顺序</span>
+            <button class="srb-done" onclick="exitShelfReorder()"><i data-lucide="check"></i> 完成</button>
+          </div>
           <button class="scene-toggle" id="sceneToggle" onclick="toggleShelfScene()" title="切换到夜晚"><i data-lucide="moon"></i></button>
-          <div class="shelf-sort-bar" id="shelfSortBar">
-            <button class="sort-btn" data-key="time" onclick="setSort('time')">
-              <span class="sort-label">时间</span>
-              <span class="sort-dir" id="sort-dir-time"></span>
+          <div class="shelf-sort-wrap" id="shelfSortWrap">
+            <button class="sort-trigger" id="shelfSortTrigger" onclick="toggleSortPanel()" title="排序">
+              <i data-lucide="arrow-up-down"></i>
+              <span class="sort-trigger-label" id="shelfSortLabel">导入时间</span>
             </button>
-            <button class="sort-btn" data-key="title" onclick="setSort('title')">
-              <span class="sort-label">书名</span>
-              <span class="sort-dir" id="sort-dir-title"></span>
-            </button>
-            <button class="sort-btn" data-key="author" onclick="setSort('author')">
-              <span class="sort-label">作家</span>
-              <span class="sort-dir" id="sort-dir-author"></span>
-            </button>
+            <div class="sort-panel" id="shelfSortPanel">
+              <div class="sort-option" data-key="time" onclick="setSort('time')">
+                <i data-lucide="calendar-plus"></i><span class="so-label">导入时间</span><span class="so-dir"></span>
+              </div>
+              <div class="sort-option" data-key="title" onclick="setSort('title')">
+                <i data-lucide="type"></i><span class="so-label">书名</span><span class="so-dir"></span>
+              </div>
+              <div class="sort-option" data-key="author" onclick="setSort('author')">
+                <i data-lucide="user-round"></i><span class="so-label">作家</span><span class="so-dir"></span>
+              </div>
+              <div class="sort-option" data-key="recent" onclick="setSort('recent')">
+                <i data-lucide="clock"></i><span class="so-label">最近打开</span><span class="so-dir"></span>
+              </div>
+              <div class="sort-option" data-key="custom" onclick="setSort('custom')">
+                <i data-lucide="list-ordered"></i><span class="so-label">自定义</span><span class="so-dir"></span>
+                <button class="so-edit" onclick="event.stopPropagation();enterShelfReorder()" title="调整顺序"><i data-lucide="grip-vertical"></i></button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -152,7 +176,7 @@
       <div class="scene-journal-art"><img id="journalSticker" src="assets/journal-corner.png" alt="" /></div>
       <div class="shelf-empty" id="shelfEmpty" style="display:none">
         <p>书库是空的</p>
-        <p class="shelf-empty-hint">点击右下角 <i data-lucide="download"></i> 导入书籍，或把文件放到 data/watch/ 目录自动导入</p>
+        <p class="shelf-empty-hint">点击上方 <i data-lucide="download"></i> 导入书籍，或把文件放到 data/watch/ 目录自动导入</p>
     </div>
   </div>
 </div>
@@ -199,6 +223,172 @@
 </div>
 </div><!-- end #page-reader -->
 
+		<!-- Write page -->
+		<div class="page" id="page-write">
+		  <div class="write-shell">
+		    <aside class="write-rail">
+		      <div class="write-rail-head">
+		        <div class="write-workspace" id="writeWorkspace">
+		          <button class="write-workspace-btn" id="writeWorkspaceBtn"
+		                  aria-haspopup="listbox" aria-expanded="false"
+		                  aria-controls="writeWorkspaceMenu" title="切换写作台">
+		            <span class="write-workspace-kicker">写作台</span>
+		            <span class="write-workspace-name" id="writeWorkspaceName">未选择作品</span>
+		            <i data-lucide="chevron-down" class="write-workspace-caret"></i>
+		          </button>
+		        </div>
+		        <button class="write-icon-btn" id="writeNewWorkBtn" title="新建作品"><i data-lucide="plus"></i></button>
+		        <div class="write-workspace-menu" id="writeWorkspaceMenu" hidden>
+		          <div class="write-workspace-menu-head">
+		            <span>切换写作台</span>
+		            <span class="write-workspace-count" id="writeWorkspaceCount"></span>
+		          </div>
+		          <label class="write-workspace-search" id="writeWorkspaceSearchWrap" hidden>
+		            <i data-lucide="search"></i>
+		            <input type="text" id="writeWorkspaceSearch" placeholder="搜索作品…"
+		                   autocomplete="off" spellcheck="false" aria-label="搜索作品">
+		          </label>
+		          <div class="write-workspace-list" id="writeWorkspaceList" role="listbox"
+		               aria-label="作品列表"></div>
+		          <button type="button" class="write-workspace-new" id="writeWorkspaceNew">
+		            <i data-lucide="plus"></i><span>新建作品</span>
+		          </button>
+		        </div>
+		      </div>
+		      <div class="write-tree" id="writeChapterList"></div>
+		    </aside>
+		    <section class="write-main">
+		      <header class="write-main-head">
+		        <input class="write-title-input" id="writeChapterTitle" placeholder="章标题">
+		        <button class="write-vcs-badge" id="writeVcsBadge" title="版本与分支">
+		          <i data-lucide="git-branch"></i>
+		          <span id="writeVcsBranchLabel">main</span>
+		          <span class="write-vcs-dirty" id="writeVcsDirty" hidden>●</span>
+		        </button>
+		        <div class="write-view-tabs" id="writeViewTabs">
+		          <button class="write-view-tab active" data-view="editor">正文</button>
+		          <button class="write-view-tab" data-view="map">地图</button>
+		          <button class="write-view-tab" data-view="curve">曲线</button>
+		        </div>
+		        <div class="write-actions">
+		          <span class="write-editor-state" id="writeEditorState" hidden>未保存</span>
+		          <button class="write-btn write-icon-btn" id="writeUndoBtn" title="撤销 (Ctrl+Z)" disabled>&#8630;</button>
+		          <button class="write-btn write-icon-btn" id="writeRedoBtn" title="重做 (Ctrl+Y)" disabled>&#8631;</button>
+		          <button class="write-btn" id="writeRevertSaveBtn" title="丢弃暂存稿，回到上次保存" hidden>还原</button>
+		          <button class="write-btn" id="writeParkBtn" title="暂存 (Ctrl+Shift+S)：落盘但不算保存点">暂存</button>
+		          <button class="write-btn" id="writeSaveBtn" title="保存 (Ctrl+S)">保存</button>
+		          <button class="write-btn primary" id="writeGenBtn">生成正文</button>
+		        </div>
+		      </header>
+		      <div class="write-style-bar" id="writeStyleBar" hidden>
+		        <span class="write-style-label">参考风格</span>
+		        <select class="write-style-select" id="writeStyleSelect">
+		          <option value="">不启用</option>
+		        </select>
+		        <span class="write-style-note" id="writeStyleNote"></span>
+		        <button class="write-mini-btn" id="writeStyleCheckBtn" hidden>对照检查</button>
+		      </div>
+		      <div class="write-view" id="writeEditorView">
+		        <textarea class="write-editor" id="writeEditor" placeholder="选一章开始写，或点「生成正文」让模型起草。"></textarea>
+		      </div>
+		      <div class="write-view" id="writeMapView" hidden>
+		        <div class="write-map-host" id="writeMapHost"></div>
+		      </div>
+		      <div class="write-view" id="writeCurveView" hidden>
+		        <div class="write-curve-host" id="writeCurveHost"></div>
+		      </div>
+		      <div class="write-view" id="writeDiffView" hidden>
+		        <div class="write-diff-head">
+		          <span id="writeDiffTitle">差异</span>
+		          <div class="write-actions">
+		            <button class="write-btn" id="writeDiffRevert" hidden>撤销此提交</button>
+		            <button class="write-btn" id="writeDiffPick" hidden>摘取到当前分支</button>
+		            <button class="write-btn" id="writeDiffRestore" hidden>回滚到此处</button>
+		            <button class="write-btn" id="writeDiffClose">返回</button>
+		          </div>
+		        </div>
+		        <div class="write-diff-body" id="writeDiffBody"></div>
+		      </div>
+		      <div class="write-view" id="writeMergeView" hidden>
+		        <div class="write-diff-head">
+		          <span id="writeMergeTitle">解决冲突</span>
+		          <div class="write-actions">
+		            <button class="write-btn primary" id="writeMergeApply">完成</button>
+		            <button class="write-btn" id="writeMergeCancel">放弃</button>
+		          </div>
+		        </div>
+		        <div class="write-diff-body" id="writeMergeBody"></div>
+		      </div>
+		      <div class="write-status" id="writeStatus"></div>
+		    </section>
+		    <aside class="write-side" id="writeSide">
+		      <div class="write-side-head">
+		        <div class="write-side-tabs">
+		          <button class="write-side-tab active" data-pane="review">审稿</button>
+		          <button class="write-side-tab" data-pane="vcs">版本</button>
+		        </div>
+		        <button class="write-icon-btn" id="writeSideClose" title="收起"><i data-lucide="x"></i></button>
+		      </div>
+		      <div class="write-review-pane" id="writeReviewPane" hidden>
+		        <div class="write-review-head">
+		          <button class="write-btn primary" id="writeReviewRun">开始审稿</button>
+		          <span class="write-review-score" id="writeReviewScore"></span>
+		        </div>
+		        <div class="write-style-findings" id="writeStyleFindings" hidden></div>
+		        <div class="write-findings" id="writeFindings"></div>
+		        <div class="write-revisions" id="writeRevisions"></div>
+		      </div>
+		      <div class="write-vcs-pane" id="writeVcsPane" hidden>
+		        <div class="write-vcs-row">
+		          <select id="writeVcsBranchSelect" title="切换分支"></select>
+		          <button class="write-btn" id="writeVcsNewBranch" title="新建岔路并切过去">＋ 分支</button>
+		        </div>
+		        <div class="write-vcs-row">
+		          <input id="writeVcsMessage" placeholder="提交说明（这次改了什么）">
+		          <button class="write-btn primary" id="writeVcsCommitBtn">提交</button>
+		          <button class="write-btn" id="writeVcsAmendBtn" title="把漏改的带进上一次提交">修正</button>
+		        </div>
+		        <div class="write-vcs-row">
+		          <button class="write-btn" id="writeVcsStashBtn" title="收起当前改动">暂存</button>
+		          <button class="write-btn" id="writeVcsTagBtn" title="给当前提交打标签">打标签</button>
+		          <button class="write-btn" id="writeVcsReflogBtn" title="找回切换前的位置">找回位置</button>
+		        </div>
+		        <div class="write-vcs-section">
+		          <div class="write-vcs-title">工作区 <span id="writeVcsCount"></span></div>
+		          <div class="write-vcs-changes" id="writeVcsChanges"></div>
+		        </div>
+		        <div class="write-vcs-section">
+		          <div class="write-vcs-title">历史
+		            <label class="write-vcs-filter"><input type="checkbox" id="writeVcsAllBranches" checked> 全部分支</label>
+		            <label class="write-vcs-filter"><input type="checkbox" id="writeVcsOnlyChapter"> 只看本章</label>
+		          </div>
+		          <div class="write-vcs-log" id="writeVcsLog"></div>
+		        </div>
+		        <div class="write-vcs-section">
+		          <div class="write-vcs-title">分支 <span id="writeVcsBranchCount"></span></div>
+		          <div class="write-vcs-list" id="writeVcsBranches"></div>
+		        </div>
+		        <div class="write-vcs-section">
+		          <div class="write-vcs-title">标签</div>
+		          <div class="write-vcs-list" id="writeVcsTags"></div>
+		        </div>
+		        <div class="write-vcs-section">
+		          <div class="write-vcs-title">暂存 <span id="writeVcsStashCount"></span></div>
+		          <div class="write-vcs-list" id="writeVcsStashes"></div>
+		        </div>
+		        <div class="write-vcs-section" id="writeVcsReflogSection" hidden>
+		          <div class="write-vcs-title">位置记录</div>
+		          <div class="write-vcs-list" id="writeVcsReflog"></div>
+		        </div>
+		        <div class="write-vcs-section">
+		          <div class="write-vcs-title">反馈 <span id="writeVcsFeedbackCount"></span></div>
+		          <div class="write-vcs-list" id="writeVcsFeedback"></div>
+		        </div>
+		      </div>
+		    </aside>
+		  </div>
+		</div>
+
 		<!-- Graph page -->
 		<div class="page" id="page-graph">
 		  <div class="graph-secondary-nav" id="graphSecNav">
@@ -210,6 +400,9 @@
 		      <option value="">选择书籍...</option>
 		    </select>
 		    <button id="graphLayoutToggle" onclick="window.toggleGraphLayout()" title="切换布局"><i data-lucide="layout-grid"></i> 布局: 力导向</button>
+		    <!-- 作者简介：这位作者的生平与作品，铺在同一根时间轴上。
+		         它属于「关于这本书」的旁支，不参与扮演流程，所以放在这里而不是选角器里。 -->
+		    <button id="graphAuthorBtn" class="graph-pill-btn" onclick="window.openGraphAuthor()" title="作者简介 · 生平与作品时间轴"><i data-lucide="user-round"></i> 作者简介</button>
 		  </div>
 		  <div class="graph-page-layout" id="graphPageLayout">
 		    <div class="graph-type-wheel" id="graphTypeWheel">
@@ -239,6 +432,58 @@
 		      <div class="graph-detail-body" id="graphDetailBody"></div>
 		    </div>
 		    <button class="graph-detail-toggle" id="graphDetailToggle" onclick="window.toggleGraphDetail()" title="展开/收起详情"><i data-lucide="panel-right"></i></button>
+		  </div>
+		  <!-- 作者简介：图谱页里的**第二层视图**，不是弹窗。
+		       它与图谱共用同一块画布区域 —— 同一个页面、同一条工具条、
+		       同一片画布背景，只是把画布内容从力导向图换成时间轴。
+		       所以这里没有遮罩、没有圆角对话框、没有关闭叉号。 -->
+		  <div class="atl-view" id="authorTimelineView" hidden>
+		    <div class="atl-head">
+		      <div class="atl-head-text">
+		        <span class="atl-eyebrow"><i data-lucide="history"></i> 作者简介</span>
+		        <div class="atl-title-row">
+		          <span id="atlTitle">作者时间轴</span>
+		          <span class="atl-sub" id="atlSub"></span>
+		        </div>
+		      </div>
+		      <button class="atl-back" onclick="closeAuthorTimeline()" title="关闭作者简介，回到图谱">
+		        <i data-lucide="arrow-left"></i> 返回图谱
+		      </button>
+		    </div>
+		    <div class="atl-body" id="atlBody"></div>
+		  </div>
+		  <!-- 作者档案（设计稿 05）：图谱页里的第二层视图。
+		       时间轴保留为旧视图，档案页的「全屏时间轴」会切回去。 -->
+		  <div class="ado-view" id="authorDossierView" hidden>
+		    <div class="ado-head">
+		      <div class="ado-head-text">
+		        <span class="ado-eyebrow"><i data-lucide="user-round"></i> 作者档案</span>
+		        <div class="ado-title-row">
+		          <span id="adoTitle">作者档案</span>
+		          <span class="ado-sub" id="adoSub"></span>
+		        </div>
+		      </div>
+		      <div class="ado-head-actions">
+		        <button class="ado-write" id="adoWriteBtn" hidden
+		                onclick="adoUseForWriting()"
+		                title="把这位作者的正文文风作为写作参考（默认关闭）">
+		          <i data-lucide="pen-line"></i> 用于写作参考
+		        </button>
+		        <button class="ado-back" onclick="closeAuthorDossier()" title="关闭作者档案，回到图谱">
+		          <i data-lucide="arrow-left"></i> 返回图谱
+		        </button>
+		      </div>
+		    </div>
+		    <div class="ado-tabs" id="adoTabs" role="tablist" aria-label="作者档案分区"></div>
+		    <div class="ado-body" id="adoBody" role="tabpanel"></div>
+		    <div class="ado-drawer-scrim" id="adoScrim" hidden onclick="closeAuthorDrawer()"></div>
+		    <aside class="ado-drawer" id="adoDrawer" hidden role="dialog" aria-modal="true" aria-label="来源与引文">
+		      <div class="ado-drawer-head">
+		        <span id="adoDrawerTitle">来源</span>
+		        <button type="button" class="ado-drawer-close" onclick="closeAuthorDrawer()" aria-label="关闭来源抽屉">×</button>
+		      </div>
+		      <div class="ado-drawer-body" id="adoDrawerBody"></div>
+		    </aside>
 		  </div>
 		  <div class="graph-manage-panel" id="graphManagePanel" style="display:none">
 		    <div class="graph-manage-body" id="graphManageBody">加载中...</div>
@@ -418,6 +663,7 @@
 <div class="page" id="page-console">
   <div class="console-secondary-nav" id="consoleSecNav">
     <button class="console-secnav-tab active" data-view="drivers" onclick="window.switchConsoleView('drivers')">驱动控制台</button>
+    <button class="console-secnav-tab" data-view="binding" onclick="window.switchConsoleView('binding')">模型绑定</button>
     <button class="console-secnav-tab" data-view="usage" onclick="window.switchConsoleView('usage')">用量分析</button>
   </div>
   <div class="console-view" id="consoleViewDrivers">
@@ -430,6 +676,16 @@
       <button class="console-add-card" onclick="ConsoleUI.openEditor()">
         <i data-lucide="plus"></i> 新增连接
       </button>
+    </div>
+  </div>
+  <div class="console-view" id="consoleViewBinding" style="display:none">
+    <div class="console-panel">
+      <p class="console-hint">把每个 LLM 调用点绑定到一条连接和一个模型。未绑定的调用点继承上一级，最终跟随主模型（当前：<span id="bindingMainModel">—</span>）。选好连接或模型即保存；「解绑」回退到上一级。改动在下一次调用时生效，在途请求不受影响。</p>
+      <div class="binding-toolbar">
+        <span class="binding-summary" id="bindingSummary"></span>
+        <label class="binding-toggle"><input type="checkbox" id="bindingOnlyBound" onchange="BindingUI.toggleOnlyBound(this.checked)"> 只看已单独绑定</label>
+      </div>
+      <div class="binding-list" id="bindingList"><!-- rendered by binding.js --></div>
     </div>
   </div>
   <div class="console-view" id="consoleViewUsage" style="display:none">
@@ -478,6 +734,29 @@
     <div class="chat-log" id="chatLog">
       <div class="msg agent">书伴加载中...</div>
     </div>
+    <!-- 阅读模式预选：只在阅读页的空会话里浮在聊天框中央；发出第一条
+         消息后消失 —— 会话的阅读模式就此冻结，中途不再可变。 -->
+    <div class="mode-prelude" id="modePrelude">
+      <div class="mode-prelude-hint">选一种读法 · 开始对话后固定</div>
+      <div class="mode-seg" id="modeSeg" role="radiogroup" aria-label="阅读模式">
+        <span class="mode-seg-thumb" aria-hidden="true"></span>
+        <button type="button" class="mode-seg-opt active" data-mode="immersive"
+                role="radio" aria-checked="true" onclick="setMode('immersive')"
+                title="沉浸伴读：不剧透，同步你的阅读节奏">
+          <i data-lucide="book-open"></i><span>沉浸伴读</span>
+        </button>
+        <button type="button" class="mode-seg-opt" data-mode="overview"
+                role="radio" aria-checked="false" onclick="setMode('overview')"
+                title="俯瞰分析：全局视角，结构化分析，可剧透">
+          <i data-lucide="scan-eye"></i><span>俯瞰分析</span>
+        </button>
+        <button type="button" class="mode-seg-opt" data-mode="divergent"
+                role="radio" aria-checked="false" onclick="setMode('divergent')"
+                title="发散探索：跨领域联想，外部视角">
+          <i data-lucide="sparkles"></i><span>发散探索</span>
+        </button>
+      </div>
+    </div>
     <div class="selection-ref" id="selectionTag">
       <span class="ref-icon"><i data-lucide="pin"></i></span>
       <span>引用</span><span id="selTagSrc">书中</span><span>:</span>
@@ -486,29 +765,14 @@
     </div>
     <div class="chat-input-area">
       <div class="chat-mode-bar">
+        <button id="newSessionBtn" class="mode-toggle new-session-btn" onclick="newSession()" title="开始一个新会话">
+          <span class="mode-icon"><i data-lucide="message-square-plus"></i></span>
+          <span class="mode-label">新会话</span>
+        </button>
         <button id="roleplayEntryBtn" class="mode-toggle roleplay-entry" onclick="startRolePlaySetup()" title="与书中角色对话">
           <span class="mode-icon"><i data-lucide="drama"></i></span>
           <span class="mode-label">角色对话</span>
         </button>
-        <button id="modeToggle" class="mode-toggle" onclick="toggleModePicker()" title="切换阅读模式">
-          <span class="mode-icon"><i data-lucide="book-open"></i></span>
-          <span class="mode-label" id="modeLabel">沉浸伴读</span>
-          <span class="mode-caret"><i data-lucide="chevron-down"></i></span>
-        </button>
-        <div class="mode-picker" id="modePicker">
-          <div class="mode-option" data-mode="immersive" onclick="setMode('immersive')">
-            <span class="mo-name">沉浸伴读</span>
-            <span class="mo-desc">不剧透，同步节奏，共情陪伴</span>
-          </div>
-          <div class="mode-option" data-mode="overview" onclick="setMode('overview')">
-            <span class="mo-name">俯瞰分析</span>
-            <span class="mo-desc">全局视角，结构化分析，可剧透</span>
-          </div>
-          <div class="mode-option" data-mode="divergent" onclick="setMode('divergent')">
-            <span class="mo-name">发散探索</span>
-            <span class="mo-desc">跨领域联想，外部视角</span>
-          </div>
-        </div>
         <button id="ctxUsageBtn" class="mode-toggle ctx-usage-toggle" onclick="toggleCtxUsage()" title="上下文用量">
           <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
             <circle class="ctx-ring-track" cx="12" cy="12" r="9" fill="none" stroke-width="3"/>
@@ -531,6 +795,7 @@
             <button class="subnav-tab active" data-tab="all" onclick="switchSubnavTab('all')">全部</button>
             <button class="subnav-tab" data-tab="books" onclick="switchSubnavTab('books')">按书籍</button>
             <button class="subnav-tab" data-tab="characters" onclick="switchSubnavTab('characters')">按角色</button>
+            <button class="subnav-tab" data-tab="writing" onclick="switchSubnavTab('writing')">写作</button>
           </div>
           <div class="session-panel-body" id="sessionList">加载中...</div>
         </div>
@@ -539,7 +804,7 @@
         <button class="mic-btn" id="micBtn" onclick="window.toggleRecording()" title="语音输入"><i data-lucide="mic"></i></button>
         <textarea id="chatInput" rows="1" placeholder="输入问题...（可先选中书页文字）"
                   onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMessage();}"></textarea>
-        <button class="send-btn" onclick="sendMessage()">发送</button>
+        <button class="send-btn" id="sendBtn" onclick="window.sendOrStop()">发送</button>
       </div>
     </div>
 
@@ -580,6 +845,8 @@
 <script type="module" src="js/context-usage.js"></script>
 <script type="module" src="js/app.js"></script>
 <script type="module" src="js/console.js"></script>
+<script type="module" src="js/binding.js"></script>
+<script type="module" src="js/writing.js"></script>
 <script type="module" src="js/usage.js"></script>
 <script type="module" src="js/graph-progress-ui.js"></script>
 <script type="module" src="js/graph-viz.js"></script>
@@ -587,6 +854,8 @@
 <script type="module" src="notes-panel.js"></script>
 <script type="module" src="graph-panel.js"></script>
 <script type="module" src="tags-panel.js"></script>
+<script type="module" src="js/author-timeline.js"></script>
+<script type="module" src="js/author-dossier.js"></script>
 <script>
 // Lucide icons - auto-refresh on DOM change (debounced).
 // MutationObserver catches dynamically inserted [data-lucide] elements

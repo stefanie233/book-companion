@@ -20,10 +20,10 @@ not create new nodes. New character discovery is Scout/Explorer's job.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import Any
+
+from llm_json import loads_tolerant
 
 from storage.graph_db import GraphDB, TABLE_NODES
 import usage_log
@@ -119,7 +119,9 @@ async def extract_from_dialogue(
     try:
         with usage_log.source_scope("bookgraph", ref_id=book_id):
             try:
-                raw = await api_client.complete(system, prompt, timeout=120)
+                raw = await api_client.complete(
+                    system, prompt, timeout=120,
+                    scenario="bookgraph.incremental")
             except TypeError:
                 # complete() doesn't accept timeout parameter
                 raw = await api_client.complete(system, prompt)
@@ -240,31 +242,14 @@ def _get_character_names(graph_db: GraphDB, book_id: str) -> list[str]:
 
 
 def _parse_observations(raw: str) -> list[dict]:
-    """Parse LLM JSON response into list of observation dicts."""
-    # Try direct parse first
-    try:
-        data = json.loads(raw)
-        return data.get("new_observations", [])
-    except json.JSONDecodeError:
-        pass
+    """Parse LLM JSON response into list of observation dicts.
 
-    # Try extracting JSON block from markdown
-    match = re.search(r'```json\s*([\s\S]*?)```', raw)
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            return data.get("new_observations", [])
-        except json.JSONDecodeError:
-            pass
-
-    # Try finding JSON object
-    match = re.search(r'\{[\s\S]*\}', raw)
-    if match:
-        try:
-            data = json.loads(match.group())
-            return data.get("new_observations", [])
-        except json.JSONDecodeError:
-            pass
-
-    log.warning("incremental: failed to parse LLM response")
-    return []
+    阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``。旧阶梯另有一个洞：
+    响应是合法 JSON 但不是对象（如 ``[1,2]``）时 ``.get`` 抛 AttributeError
+    且无人接 —— 现在被 ``expect=dict`` 挡在前面。
+    """
+    data = loads_tolerant(raw, expect=dict)
+    if not data:
+        log.warning("incremental: failed to parse LLM response")
+        return []
+    return data.get("new_observations", [])

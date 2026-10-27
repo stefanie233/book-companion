@@ -1,0 +1,47 @@
+{
+  "id": "c01_old_house",
+  "split": "train",
+  "kind": "cold_start",
+  "brief": "回忆性散文。考的是：具体物象、克制抒情、把参考素材化成自己的细节。",
+  "work": {
+    "title": "旧屋",
+    "genre": "回忆性散文",
+    "premise": "拆迁前最后一次回到老屋，整理母亲留下的东西。",
+    "narrative_pov": "第一人称",
+    "target_chars": 1600,
+    "style_profile": {
+      "hard_rules": ["不直接抒情，情绪由物件与动作承担", "时间线只有今天下午到傍晚"]
+    }
+  },
+  "chapter": {"index": 1, "title": "旧屋"},
+  "contract": {
+    "purpose": "叙述者回到拆迁前的老屋，在母亲房间的缝纫机抽屉里发现一件未做完的小衣服。",
+    "must_hit_now": [
+      "回到老屋并进入母亲的房间",
+      "发现缝纫机抽屉里未做完的小衣服",
+      "想起母亲教自己踩缝纫机的一件具体旧事"
+    ],
+    "must_preserve": ["叙述者与母亲的关系保持克制，不直接说出想念"],
+    "forbidden_cross": [
+      "不直接写出母亲已经去世",
+      "不写拆迁队到来",
+      "不使用梦境或幻觉"
+    ],
+    "ending_state": "叙述者把小衣服放回抽屉，只带走抽屉里的一枚顶针",
+    "story_time": "深秋傍晚",
+    "target_chars": 1600
+  },
+  "prior": [],
+  "facts": [],
+  "promises": [],
+  "references": {
+    "query": ["母亲", "旧物", "缝纫", "回忆", "克制", "房间", "手", "等待"],
+    "authors": [{"author_id": "au-c70e8aa3ff984e0a", "scene_type": "memory"}],
+    "books": [{"stable_book_id": "sb-af8ab345fdc349f8", "book_id": "b176d5959dbd55b6", "label": "我与地坛"}]
+  },
+  "check": {
+    "must_hit_keywords": [["房间"], ["缝纫机"], ["抽屉"]],
+    "forbidden_keywords": ["母亲去世", "母亲已经走了", "拆迁队"],
+    "leak_names": ["地坛", "史铁生"]
+  }
+}

@@ -7,14 +7,30 @@ import { selectBook } from './reader.js';
 
 // ── Sort persistence ──────────────────────────────────────────────
 
-const SHELF_SORT_DEFAULTS = { key: 'time', dir: 'asc' };
+// 五种排序：导入时间 / 书名 / 作家 / 最近打开 / 自定义。
+// key 是持久化契约（localStorage 的 bc_shelf_sort），改名要同步白名单。
+const SORT_KEYS = ['time', 'title', 'author', 'recent', 'custom'];
+
+const SORT_LABELS = {
+  time: '导入时间',
+  title: '书名',
+  author: '作家',
+  recent: '最近打开',
+  custom: '自定义',
+};
+
+// 切到一个新 key 时的默认方向。「最近打开」自然要最近在前，其余正序。
+// 「导入时间」保持 asc —— 这是改动前就有的默认观感，不动它。
+const SORT_DEFAULT_DIR = {
+  time: 'asc', title: 'asc', author: 'asc', recent: 'desc', custom: 'asc',
+};
 
 export function loadShelfSort() {
   try {
     const raw = localStorage.getItem('bc_shelf_sort');
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (['time', 'title', 'author'].includes(parsed.key) && ['asc', 'desc'].includes(parsed.dir)) {
+      if (SORT_KEYS.includes(parsed.key) && ['asc', 'desc'].includes(parsed.dir)) {
         S.shelfSort = { key: parsed.key, dir: parsed.dir };
       }
     }
@@ -42,6 +58,25 @@ export function sortBooks(books) {
     if (key === 'author') {
       return sign * compareStringAsc((a.author || '').trim(), (b.author || '').trim());
     }
+    if (key === 'recent') {
+      const ta = a.last_opened_at || 0;
+      const tb = b.last_opened_at || 0;
+      // 从未打开过的（0）永远沉底，不随方向翻转 ——
+      // 否则正序时「从没读过的书」会占满榜首。
+      if (!ta || !tb) return ta ? -1 : (tb ? 1 : 0);
+      return sign * (ta - tb);
+    }
+    if (key === 'custom') {
+      const ra = a.sort_order || 0;
+      const rb = b.sort_order || 0;
+      // 未参与过手工排版的（0）永远沉底，新导入的书不会插到用户
+      // 精心排好的顺序前面。两者都未排名时按导入时间排，保证稳定。
+      if (!ra || !rb) {
+        if (ra !== rb) return ra ? -1 : 1;
+        return (a.time_created || 0) - (b.time_created || 0);
+      }
+      return sign * (ra - rb);
+    }
     return 0;
   });
 
@@ -49,29 +84,366 @@ export function sortBooks(books) {
 }
 
 export function updateShelfSortUI() {
-  document.querySelectorAll('#shelfSortBar .sort-btn').forEach(btn => {
-    const key = btn.dataset.key;
-    const dirSpan = document.getElementById('sort-dir-' + key);
-    if (key === S.shelfSort.key) {
-      btn.classList.add('active');
-      dirSpan.innerHTML = S.shelfSort.dir === 'asc' ? '<i data-lucide="chevron-up"></i>' : '<i data-lucide="chevron-down"></i>';
-    } else {
-      btn.classList.remove('active');
-      dirSpan.textContent = '';
-    }
+  // 触发器上直接写当前排序名，面板关着也知道现在按什么排。
+  const label = document.getElementById('shelfSortLabel');
+  if (label) label.textContent = SORT_LABELS[S.shelfSort.key] || '排序';
+
+  document.querySelectorAll('#shelfSortPanel .sort-option').forEach(opt => {
+    const active = opt.dataset.key === S.shelfSort.key;
+    opt.classList.toggle('active', active);
+    const dirSpan = opt.querySelector('.so-dir');
+    if (!dirSpan) return;
+    // 方向箭头只挂在激活项上；chevron-up = 正序，down = 倒序
+    dirSpan.innerHTML = active
+      ? (S.shelfSort.dir === 'asc'
+          ? '<i data-lucide="chevron-up"></i>'
+          : '<i data-lucide="chevron-down"></i>')
+      : '';
   });
 }
 
+// ── Sort panel (collapsed dropdown) ───────────────────────────────
+
+export function toggleSortPanel() {
+  const wrap = document.getElementById('shelfSortWrap');
+  if (!wrap) return;
+  wrap.classList.toggle('open');
+  if (wrap.classList.contains('open')) updateShelfSortUI();
+}
+
+export function closeSortPanel() {
+  const wrap = document.getElementById('shelfSortWrap');
+  if (wrap) wrap.classList.remove('open');
+}
+
+let _sortPanelBound = false;
+
+export function initSortPanel() {
+  if (_sortPanelBound) return;
+  _sortPanelBound = true;
+
+  // 点面板外收起。注意触发按钮自己也在 #shelfSortWrap 里，所以
+  // 「点按钮开面板」那一次点击走到这里会因为 closest 命中而直接返回，
+  // 不会开了又立刻关。
+  document.addEventListener('click', e => {
+    const wrap = document.getElementById('shelfSortWrap');
+    if (!wrap || !wrap.classList.contains('open')) return;
+    if (e.target && e.target.closest && e.target.closest('#shelfSortWrap')) return;
+    closeSortPanel();
+  });
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeSortPanel();
+  });
+
+  // 滚动时收起：面板锚在 sticky 头部上，而头部滚动时会压缩变形，
+  // 面板挂在那儿会显得错位。
+  const pageHome = document.getElementById('page-home');
+  if (pageHome) pageHome.addEventListener('scroll', closeSortPanel, { passive: true });
+}
+
 export function setSort(key) {
+  if (!SORT_KEYS.includes(key)) return;
   if (S.shelfSort.key === key) {
     S.shelfSort.dir = S.shelfSort.dir === 'asc' ? 'desc' : 'asc';
   } else {
     S.shelfSort.key = key;
-    S.shelfSort.dir = 'asc';
+    S.shelfSort.dir = SORT_DEFAULT_DIR[key] || 'asc';
   }
   saveShelfSort();
   updateShelfSortUI();
   loadShelf();
+  // 选「自定义」只切换视图，**不**自动进整理模式。
+  // 曾经试过「首次切到自定义且整库没排过版就自动进整理模式」，结果是
+  // 用户只想看看新排序，书架却当场没了封面倾斜、三个角标也消失 ——
+  // 看起来就是「书架坏了」。整理模式必须由面板里那枚 grip 按钮显式触发。
+}
+
+// ── 整理模式：拖动书本排自定义顺序 ────────────────────────────────
+//
+// 只在「自定义」排序下有意义。进入后整个书架退化成一块可拖拽的排序面板：
+//   · 停掉封面倾斜 —— 它同样是指针驱动的，会和拖拽抢 pointermove
+//   · 关掉 hover 抬升、入场动画、卡片角标（防止拖到一半误触删除）
+//   · 点击不再打开书
+//
+// 落位策略：拖动过程中 DOM 完全不动，只移动一条「插入位」指示条；
+// 松手时才按新顺序整体重渲染（整理模式下 shelve-in 已关，重建是瞬时的），
+// 再按 data-id 做一次 FLIP，让书本滑到新位置而不是瞬移过去。
+
+let _reorderMode = false;
+let _drag = null;            // 当前拖拽：{ el, id, pointerId, startX/Y, lastX/Y, active, raf }
+let _dropIndex = -1;         // 插入位（相对「除被拖卡片外」的扁平列表）
+let _reorderDirty = false;   // 有未落库的改动
+let _saveTimer = null;
+
+const DRAG_THRESHOLD = 4;    // px：小于它算点击，不算拖动
+const EDGE_ZONE = 60;        // px：距滚动容器上下边缘多近开始自动滚动
+const EDGE_SPEED = 9;        // px/帧
+
+export function enterShelfReorder() {
+  if (_reorderMode) return;
+  const grid = document.getElementById('shelfGrid');
+  if (!grid) return;
+  _reorderMode = true;              // 先置位：下面的 loadShelf 会走重渲染，靠它决定动画抑制
+  releaseAllTilt();                 // 先把倾斜控制器收手，别和拖拽抢指针
+  grid.classList.add('reordering', 'no-enter-anim');
+  document.body.classList.add('shelf-reordering');
+  const bar = document.getElementById('shelfReorderBar');
+  if (bar) bar.hidden = false;
+  closeSortPanel();
+  // 整理模式编辑的就是自定义顺序，视图必须先切过去 —— 否则在「书名」
+  // 视图下拖出来的顺序会被当成自定义顺序存下来，用户下次切回自定义
+  // 会看到一个自己没排过的顺序。
+  if (S.shelfSort.key !== 'custom') {
+    S.shelfSort.key = 'custom';
+    S.shelfSort.dir = SORT_DEFAULT_DIR.custom;
+    saveShelfSort();
+    updateShelfSortUI();
+    loadShelf();
+  }
+}
+
+export function exitShelfReorder() {
+  if (!_reorderMode) return;
+  _reorderMode = false;
+  endDrag();
+  const grid = document.getElementById('shelfGrid');
+  // 只摘 .reordering；.no-enter-anim 故意留着（见 style.css 里的说明）
+  if (grid) grid.classList.remove('reordering');
+  document.body.classList.remove('shelf-reordering');
+  const bar = document.getElementById('shelfReorderBar');
+  if (bar) bar.hidden = true;
+  if (_reorderDirty) {
+    _reorderDirty = false;
+    saveCustomOrder();
+  }
+}
+
+// 按 DOM 顺序取书架上当前的书籍 id。行只是布局产物，文档顺序就是扁平顺序。
+function currentOrderIds() {
+  const grid = document.getElementById('shelfGrid');
+  if (!grid) return [];
+  return [...grid.querySelectorAll('.scene-book')].map(el => el.dataset.id);
+}
+
+function saveCustomOrder() {
+  const ids = currentOrderIds();
+  if (!ids.length) return;
+  fetch(S.API + '/api/books/order', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ids }),
+  }).catch(() => { /* 下次拖动还会再存一次，不必打扰用户 */ });
+}
+
+// 每拖完一次就存一次（debounce）。攒到「完成」才存的话，拖到一半关掉
+// 页面/切走标签页的损失是完全不可见的 —— 而那时用户已经付出了排序动作。
+function scheduleSave() {
+  if (_saveTimer) clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => { _saveTimer = null; saveCustomOrder(); }, 600);
+}
+
+let _reorderBound = false;
+
+export function initShelfReorder() {
+  if (_reorderBound) return;
+  _reorderBound = true;
+  const grid = document.getElementById('shelfGrid');
+  if (!grid) return;
+
+  // 委托在 #shelfGrid 上绑一次即可 —— 它自己从不被替换，
+  // 只有 innerHTML 会被重建，所以不必像倾斜控制器那样每次重渲染重绑。
+  grid.addEventListener('pointerdown', e => {
+    if (!_reorderMode || _drag) return;
+    if (e.button) return;                                  // 只接左键 / 单指
+    const el = e.target && e.target.closest ? e.target.closest('.scene-book') : null;
+    if (!el) return;
+    e.preventDefault();                                    // 别起原生拖拽与选词
+    _drag = {
+      el, id: el.dataset.id, pointerId: e.pointerId,
+      startX: e.clientX, startY: e.clientY,
+      lastX: e.clientX, lastY: e.clientY,
+      active: false, raf: 0,
+    };
+    // 捕获指针：拖到窗口外也不丢事件。捕获后事件仍会冒泡到 window。
+    try { el.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+
+  window.addEventListener('pointermove', onReorderMove, { passive: false });
+  window.addEventListener('pointerup', onReorderUp);
+  window.addEventListener('pointercancel', onReorderUp);
+  window.addEventListener('resize', endDrag);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) endDrag();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && _reorderMode) exitShelfReorder();
+  });
+}
+
+function onReorderMove(e) {
+  if (!_drag || e.pointerId !== _drag.pointerId) return;
+  _drag.lastX = e.clientX;
+  _drag.lastY = e.clientY;
+  if (!_drag.active) {
+    const dx = e.clientX - _drag.startX;
+    const dy = e.clientY - _drag.startY;
+    if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;  // 仍算点击
+    _drag.active = true;
+    _drag.el.classList.add('dragging');
+    const grid = document.getElementById('shelfGrid');
+    if (grid) grid.classList.add('dragging-active');
+  }
+  e.preventDefault();                       // 拖动时别让页面跟着滚
+  if (!_drag.raf) _drag.raf = requestAnimationFrame(dragTick);
+}
+
+function onReorderUp(e) {
+  if (!_drag || e.pointerId !== _drag.pointerId) return;
+  if (_drag.active) commitDrag();
+  else endDrag();                           // 没超过阈值 = 点击，什么也不做
+}
+
+function dragTick() {
+  if (!_drag || !_drag.active) return;
+  _drag.raf = 0;
+  const dx = _drag.lastX - _drag.startX;
+  const dy = _drag.lastY - _drag.startY;
+  _drag.el.style.transform =
+    `translate3d(${dx}px, ${dy}px, 0) scale(1.06) rotate(-1.5deg)`;
+  updateDropIndex();
+  autoscroll();
+  if (_drag && _drag.active) _drag.raf = requestAnimationFrame(dragTick);
+}
+
+// 拖到滚动容器上下边缘附近时自己滚 —— 书多了必然要跨屏拖
+function autoscroll() {
+  const page = document.getElementById('page-home');
+  if (!page || !_drag) return;
+  const r = page.getBoundingClientRect();
+  if (_drag.lastY < r.top + EDGE_ZONE) page.scrollTop -= EDGE_SPEED;
+  else if (_drag.lastY > r.bottom - EDGE_ZONE) page.scrollTop += EDGE_SPEED;
+}
+
+// 插入位指示条：绝对定位在 #shelfGrid 内（它是 position: relative），
+// 靠 transform 移动 + CSS transition 平滑滑到新位置。
+function updateDropIndex() {
+  const grid = document.getElementById('shelfGrid');
+  if (!grid || !_drag) return;
+  let slot = document.getElementById('shelfDropSlot');
+  if (!slot) {
+    slot = document.createElement('div');
+    slot.id = 'shelfDropSlot';
+    slot.className = 'shelf-drop-slot';
+    grid.appendChild(slot);
+  }
+  const others = [...grid.querySelectorAll('.scene-book')].filter(el => el !== _drag.el);
+  _dropIndex = computeInsertIndex(others, _drag.lastX, _drag.lastY);
+
+  // 指示条摆在「插入位置之前那张卡」的左边；插到末尾就摆最后一张的右边
+  const atEnd = !others[_dropIndex];
+  const ref = others[_dropIndex] || others[others.length - 1];
+  if (!ref) { slot.style.display = 'none'; return; }
+  const r = ref.getBoundingClientRect();
+  const gridRect = grid.getBoundingClientRect();
+  const x = atEnd ? r.right - gridRect.left + 5 : r.left - gridRect.left - 7;
+  slot.style.display = 'block';
+  slot.style.height = r.height + 'px';
+  slot.style.transform = `translate3d(${x}px, ${r.top - gridRect.top}px, 0)`;
+}
+
+// 取「离指针最近的那张卡」，再看指针落在它中心左侧还是右侧。
+// 距离按垂直加权 —— 不加权的话跨行拖动会被相邻行的卡片横向距离带偏。
+function computeInsertIndex(cards, x, y) {
+  let best = cards.length, bestDist = Infinity, after = false;
+  for (let i = 0; i < cards.length; i++) {
+    const r = cards[i].getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const d = Math.abs(y - cy) * 3 + Math.abs(x - cx);
+    if (d < bestDist) { bestDist = d; best = i; after = x > cx; }
+  }
+  return after ? best + 1 : best;
+}
+
+function commitDrag() {
+  const grid = document.getElementById('shelfGrid');
+  const drag = _drag;
+  if (!grid || !drag) { endDrag(); return; }
+
+  // 一次极短的拖动可能在第一帧 rAF 跑起来之前就松手了，此时插入位还是 -1。
+  // 不补算的话会被当成「插到末尾」，书会莫名跳到最后一本。
+  if (_dropIndex < 0) updateDropIndex();
+
+  // 落位前先记下每张卡的位置，重渲染后按 data-id 对回去做 FLIP
+  const before = new Map();
+  grid.querySelectorAll('.scene-book').forEach(el => {
+    before.set(el.dataset.id, el.getBoundingClientRect());
+  });
+
+  const others = [...grid.querySelectorAll('.scene-book')].filter(el => el !== drag.el);
+  const ids = others.map(el => el.dataset.id);
+  const at = Math.max(0, Math.min(_dropIndex < 0 ? ids.length : _dropIndex, ids.length));
+  ids.splice(at, 0, drag.id);
+
+  endDrag();
+
+  const byId = new Map((_lastShelfBooks || []).map(b => [b.id, b]));
+  const next = ids.map(id => byId.get(id));
+  if (next.some(b => !b)) return;          // 有对不上的就整体放弃，别把书架弄乱
+  _lastShelfBooks = next;
+  renderShelfRows(next);                   // 整理模式下 shelve-in 已关，重建是瞬时的
+  flipFrom(before);
+  _reorderDirty = true;
+  scheduleSave();
+}
+
+// FLIP：先按旧位置把每张卡「瞬移回去」，下一帧再放开过渡让它滑到新位置。
+// 被拖那张记的是它被拖走后的位置，所以它会从手上飞回落点。
+function flipFrom(before) {
+  if (_reducedMotion) return;              // 减弱动效：直接落位，不做位移动画
+  const grid = document.getElementById('shelfGrid');
+  if (!grid) return;
+  const moved = [];
+  grid.querySelectorAll('.scene-book').forEach(el => {
+    const prev = before.get(el.dataset.id);
+    if (!prev) return;
+    const now = el.getBoundingClientRect();
+    const dx = prev.left - now.left;
+    const dy = prev.top - now.top;
+    if (Math.abs(dx) < 0.5 && Math.abs(dy) < 0.5) return;
+    el.style.transition = 'none';
+    el.style.transform = `translate3d(${dx}px, ${dy}px, 0)`;
+    moved.push(el);
+  });
+  if (!moved.length) return;
+  requestAnimationFrame(() => {
+    moved.forEach(el => {
+      el.style.transition = 'transform .26s var(--ease-out)';
+      el.style.transform = '';
+    });
+  });
+  setTimeout(() => {
+    moved.forEach(el => {
+      el.style.removeProperty('transition');
+      el.style.removeProperty('transform');
+    });
+  }, 360);
+}
+
+// 收掉一次拖拽的全部痕迹（中途取消与松手落位都走这里）
+function endDrag() {
+  if (!_drag) return;
+  const drag = _drag;
+  _drag = null;
+  if (drag.raf) cancelAnimationFrame(drag.raf);
+  drag.el.style.removeProperty('transform');
+  drag.el.classList.remove('dragging');
+  const slot = document.getElementById('shelfDropSlot');
+  if (slot) slot.remove();
+  const grid = document.getElementById('shelfGrid');
+  if (grid) grid.classList.remove('dragging-active');
+  _dropIndex = -1;
 }
 
 // ── Scene (day / night) ───────────────────────────────────────────
@@ -158,7 +530,19 @@ export function initStickyCompact() {
     }
   }
   let ticking = false;
+  // Freeze decorative infinite animations (ribbon sway / dust motes) while
+  // the shelf is actively scrolling. They resume ~140ms after the last
+  // scroll tick; the pause is visually imperceptible but removes dozens of
+  // independently animating layers from the scroll compositor's budget.
+  let scrollIdleTimer = null;
   pageHome.addEventListener('scroll', function () {
+    if (!document.body.classList.contains('is-scrolling-home')) {
+      document.body.classList.add('is-scrolling-home');
+    }
+    clearTimeout(scrollIdleTimer);
+    scrollIdleTimer = setTimeout(function () {
+      document.body.classList.remove('is-scrolling-home');
+    }, 140);
     if (ticking) return;
     ticking = true;
     requestAnimationFrame(function () { update(); ticking = false; });
@@ -198,11 +582,11 @@ function sceneBookHtml(b, idx) {
   const ribbon = b.last_read_at ? '<span class="book-ribbon"></span>' : '';
   const delay = Math.min(idx * 45, 900);
   return `
-      <div class="scene-book" style="${bookStyleVars(b)}--d:${delay}ms" onclick="openBookFromShelf('${b.id}')" title="${title}">
+      <div class="scene-book" data-id="${escapeHtmlAttr(b.id)}" style="${bookStyleVars(b)}--d:${delay}ms" onclick="openBookFromShelf('${b.id}')" title="${title}">
         <div class="scene-book-lift">
         ${ribbon}
         <div class="scene-book-inner">
-          <img src="${coverUrl}" alt="${title}" loading="lazy"
+          <img src="${coverUrl}" alt="${title}" loading="lazy" decoding="async"
                onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
           <div class="book-cover-placeholder" style="display:none"><span>${initials}</span></div>
           <i class="book-glare"></i>
@@ -210,9 +594,11 @@ function sceneBookHtml(b, idx) {
             <div class="scrim-title">${title}</div>
             <div class="scrim-author">${author}</div>
           </div>
-          <button class="book-graph-btn" onclick="event.stopPropagation();openGraphPanel('${b.id}','${title.replace(/'/g, "\\'")}')" title="图谱分析"><i data-lucide="network"></i></button>
-          <button class="book-tag-btn" onclick="event.stopPropagation();openTagPanel('${b.id}','${title.replace(/'/g, "\\'")}')" title="章节标注"><i data-lucide="sticky-note"></i></button>
-          <button class="shelf-delete-btn" onclick="event.stopPropagation();deleteBook('${b.id}')" title="删除此书"><i data-lucide="x"></i></button>
+          <div class="book-actions">
+            <button class="book-act" onclick="event.stopPropagation();openGraphPanel('${b.id}','${title.replace(/'/g, "\\'")}')" title="图谱分析" aria-label="图谱分析"><i data-lucide="network"></i></button>
+            <button class="book-act" onclick="event.stopPropagation();openTagPanel('${b.id}','${title.replace(/'/g, "\\'")}','${author.replace(/'/g, "\\'")}')" title="标注与书籍信息" aria-label="标注与书籍信息"><i data-lucide="sticky-note"></i></button>
+            <button class="book-act book-act-danger" onclick="event.stopPropagation();deleteBook('${b.id}')" title="删除此书" aria-label="删除此书"><i data-lucide="trash-2"></i></button>
+          </div>
         </div>
         </div>
       </div>`;
@@ -345,6 +731,9 @@ function initShelfTilt() {
 
   scene.addEventListener('pointermove', e => {
     if (_reducedMotion) return;
+    // 整理模式下指针归拖拽控制器所有，倾斜彻底让位。
+    // 两个控制器都是 pointermove 驱动的，不靠事件顺序、靠这个闸门隔离。
+    if (_reorderMode) return;
     // 触屏没有「悬停」语义：手指按住不放时指针不会离开，
     // 姿态会永久卡在最后一次的位置。直接不接管。
     if (e.pointerType === 'touch') return;
@@ -393,8 +782,16 @@ function renderShelfRows(books) {
   const perRow = currentPerRow();
   _lastShelfBooks = books;
   _lastPerRow = perRow;
+  // 整理模式下渲染出来的卡片不能播入场动画：CSS 动画会盖掉拖拽写的内联
+  // transform，而且每次落位重渲染都会重播一遍。退出整理模式时这个类故意
+  // 不摘，留到这里在非整理模式的下一次渲染才摘 —— 详见 style.css 的说明。
+  grid.classList.toggle('no-enter-anim', _reorderMode);
   const rows = [];
   for (let i = 0; i < books.length; i += perRow) rows.push(books.slice(i, i + perRow));
+  // Only long shelves benefit from content-visibility (see style.css):
+  // below the threshold, realizing rows as they scroll in costs more than
+  // rendering them once up front.
+  grid.classList.toggle('is-long', rows.length > 6);
   let idx = 0;
   grid.innerHTML = rows.map(rowBooks => `
     <div class="shelf-row">
@@ -413,11 +810,36 @@ ${rowBooks.map(b => sceneBookHtml(b, idx++)).join('')}
 let _shelfResizeTimer = null;
 window.addEventListener('resize', () => {
   if (!_lastShelfBooks) return;
+  // 整理模式下不重排：DOM 重建会把正在拖的那张卡换成新节点，拖拽状态直接失效
+  if (_reorderMode) return;
   if (_shelfResizeTimer) clearTimeout(_shelfResizeTimer);
   _shelfResizeTimer = setTimeout(() => {
     if (currentPerRow() !== _lastPerRow) renderShelfRows(_lastShelfBooks);
   }, 200);
 });
+
+/** 「继续阅读」的书 —— 书架卡片与阅读页默认书共用的唯一判据。
+ *
+ *  "最近打开" and "最近读过" are two different stamps:
+ *    last_read_at   — a reading position was synced (page turn / scroll)
+ *    last_opened_at — the book was opened (POST /context), even without
+ *                     turning a page yet.
+ *  Opening B and going straight back to home must make B the continue
+ *  card; keying only on last_read_at leaves A there until B is scrolled.
+ *
+ *  ⚠️ 阅读页进入时必须用这里挑书，不能让它落到下拉框第一项：
+ *  /api/books 的顺序是 time_updated DESC，与"读到哪"毫无关系（实测
+ *  第一项是卡拉马佐夫兄弟）。两处各算一套就会出现"卡片说甲、翻开是乙"。
+ */
+export function pickContinueBook(books) {
+  return (books || [])
+    .map(function (b) {
+      return { book: b, at: Math.max(b.last_read_at || 0, b.last_opened_at || 0) };
+    })
+    .filter(function (x) { return x.at > 0; })
+    .sort(function (a, b) { return b.at - a.at; })
+    .map(function (x) { return x.book; })[0] || null;
+}
 
 export async function loadShelf() {
   try {
@@ -437,10 +859,8 @@ export async function loadShelf() {
     document.getElementById('shelfEmpty').style.display = 'none';
     document.getElementById('shelfCount').textContent = `(${data.books.length}本)`;
 
-    // Continue reading section
-    const lastRead = [...data.books]
-      .filter(b => b.last_read_at)
-      .sort((a, b) => b.last_read_at - a.last_read_at)[0] || null;
+    // Continue reading section.
+    const lastRead = pickContinueBook(data.books);
     const continueSection = document.getElementById('continueSection');
     if (lastRead) {
       continueSection.style.display = 'block';
@@ -465,8 +885,19 @@ export async function loadShelf() {
 }
 
 export function openBookFromShelf(bookId) {
-  switchTab('reader', true);              // skipLoad: 避免与下面的 selectBook 竞态
+  // 整理模式下卡片是用来拖的，不是用来开的
+  if (_reorderMode) return;
+  // 条件二：打开的不是上次读的那本书 = 读一本新书 → 阅读页开新会话。
+  // 上次读的书优先取内存里的 _lastLoadedBook；刷新后它还没值，就用
+  // 阅读线指针记着的 bookId 判断（同一本书仍可恢复今天的会话）。
+  const line = window.tabSessionFor ? window.tabSessionFor('reader') : null;
+  const lastBook = S._lastLoadedBook || (line && line.bookId) || null;
+  if (lastBook && lastBook !== bookId && window.clearTabSession) {
+    window.clearTabSession('reader');
+  }
+  // 先定书再切页：_enterChatTab 恢复阅读线时按 S.currentBook 做判断。
   S.currentBook = bookId;
+  switchTab('reader', true);              // skipLoad: 避免与下面的 selectBook 竞态
   loadBookDropdown().then(() => {
     const sel = document.getElementById('bookSelect');
     if (sel.querySelector(`option[value="${bookId}"]`)) {
@@ -481,26 +912,36 @@ export async function loadBookDropdown() {
   try {
     const resp = await fetch(S.API + '/api/books');
     const data = await resp.json();
-    if (!data.books || !data.books.length) return;
+    if (!data.books || !data.books.length) return [];
     const sel = document.getElementById('bookSelect');
     sel.innerHTML = data.books.map(b =>
       `<option value="${b.id}">${b.title.slice(0, 35)} (${b.chapter_count}章)</option>`
     ).join('');
-  } catch (e) { /* ignore */ }
+    return data.books;
+  } catch (e) { return []; }
 }
 
 export async function refreshBooks() {
-  const keepBook = S.currentBook;          // 记住当前书籍
-  await loadBookDropdown();               // 重建 <select>（会丢失选中值）
+  const books = await loadBookDropdown();   // 重建 <select>（会丢失选中值）
+  const sel = document.getElementById('bookSelect');
+  // 打开哪本书的优先级：内存里的当前书（可能是阅读线会话 / 书架点开）→
+  // 「继续阅读」真相源。绝不能留空：<select> 会停在第 1 项，而 /api/books
+  // 的顺序是 time_updated DESC（实测第一项是卡拉马佐夫兄弟），于是"继续
+  // 阅读"标着甲、点开阅读页却是乙。
+  const fallback = pickContinueBook(books);
+  const keepBook = [S.currentBook, fallback && fallback.id]
+    .find(id => id && sel.querySelector(`option[value="${id}"]`)) || null;
   if (keepBook) {
-    const sel = document.getElementById('bookSelect');
-    // 仅当下拉框中存在该书时才恢复（书可能已被删除）
-    if (sel.querySelector(`option[value="${keepBook}"]`)) {
-      sel.value = keepBook;
-    }
+    sel.value = keepBook;             // 仅当选项存在时才恢复（书可能已被删除）
+    S.currentBook = keepBook;
   }
-  if (document.getElementById('page-reader').classList.contains('active')) {
-    selectBook();
+  // 没有任何"读到哪"的记录（全新书库）时不要顺手打开下拉框第一项 ——
+  // 那不是用户选的书，只是排序的副作用。
+  if (keepBook && document.getElementById('page-reader').classList.contains('active')) {
+    await selectBook();
+    // selectBook 之后才落盘：switchTab 末尾那次 saveViewState 早于选书，
+    // 会把阅读页记成 bookId:null，刷新时就恢复不到书（退回书架页）。
+    saveViewState();
   }
 }
 
@@ -557,6 +998,41 @@ function renderScanResult(data, folder) {
   body.innerHTML = html;
 }
 
+/** 路径输入表单。window.prompt 做不到两件事：浅色示例（它的第二个参数是
+ *  预填值，不是 placeholder），以及失败后回到可编辑状态（关掉就没了）。 */
+function pathFormHtml(message) {
+  return '<div class="scan-path-form">'
+    + (message ? '<div class="scan-path-hint scan-path-error">' + escapeHtml(message) + '</div>' : '')
+    + '<div class="scan-path-hint">输入存放未入库 EPUB/MOBI 的文件夹路径：</div>'
+    + '<div class="scan-path-row">'
+    + '<input id="scanPathInput" class="scan-path-input" type="text" spellcheck="false" autocomplete="off"'
+    + ' placeholder="例如：C:\\Users\\你的用户名\\Desktop\\书库"'
+    + ' onkeydown="if(event.key===\'Enter\'){event.preventDefault();submitScanPath();}">'
+    + '<button class="primary" onclick="submitScanPath()">扫描</button>'
+    + '</div></div>';
+}
+
+function showPathForm(message, value) {
+  const body = document.getElementById('importPopupBody');
+  if (!body) return;
+  body.innerHTML = pathFormHtml(message);
+  const input = document.getElementById('scanPathInput');
+  if (!input) return;
+  // 用属性赋值而不是拼进 HTML：路径里的引号/反斜杠不必做属性转义
+  input.value = value || '';
+  input.focus();
+  input.select();
+}
+
+export function submitScanPath() {
+  const input = document.getElementById('scanPathInput');
+  if (!input) return;
+  const folder = input.value.trim();
+  if (!folder) { input.focus(); return; }
+  setScanFolder(folder);
+  scanFolder(folder);
+}
+
 async function scanFolder(folder) {
   const body = document.getElementById('importPopupBody');
   body.innerHTML = '<div style="color:var(--text-muted);font-size:var(--fs-caption);text-align:center;padding:var(--space-lg)">扫描中: ' + escapeHtml(folder) + '</div>';
@@ -565,11 +1041,9 @@ async function scanFolder(folder) {
     const data = await resp.json();
     if (data.error) {
       if (resp.status === 404) {
-        // 文件夹不可用 → 清掉记忆，下次点击按钮可重新输入
+        // 文件夹不可用 → 清掉记忆 + 直接回到可编辑表单
         try { localStorage.removeItem('bc_scan_folder'); } catch (e) {}
-        body.innerHTML = '<div style="color:#ff6b6b;text-align:center;padding:var(--space-lg)">'
-          + escapeHtml(folder) + '<br>不存在或不可访问。<br>'
-          + '<span style="color:var(--text-muted);font-size:var(--fs-caption)">点击下方按钮重新输入文件夹</span></div>';
+        showPathForm(folder + ' 不存在或不可访问，请重新输入。', folder);
       } else {
         body.innerHTML = '<div style="color:#ff6b6b;text-align:center;padding:var(--space-lg)">' + escapeHtml(data.error) + '</div>';
       }
@@ -577,12 +1051,15 @@ async function scanFolder(folder) {
     }
     renderScanResult(data, data.folder || folder);
   } catch (e) {
-    body.innerHTML = '<div style="color:#ff6b6b;text-align:center;padding:var(--space-lg)">扫描失败: ' + e.message + '</div>';
+    // 网络层失败（Failed to fetch）：请求根本没到服务端。
+    // 清掉记忆，下次打开直接回到路径填写界面，而不是反复撞同一个死路径。
+    try { localStorage.removeItem('bc_scan_folder'); } catch (_) {}
+    showPathForm('连不上服务端（' + S.API + '）：' + e.message
+      + '。确认服务在该地址运行后重试。', folder);
   }
 }
 
 export async function scanAndShowFiles() {
-  const body = document.getElementById('importPopupBody');
   const remembered = getScanFolder();
   if (remembered) {
     await scanFolder(remembered);
@@ -596,15 +1073,9 @@ export async function scanAndShowFiles() {
       renderScanResult(data, data.folder || '(默认卸货区)');
       return;
     }
-  } catch (e) { /* 网络失败 → 落到 prompt 兜底 */ }
+  } catch (e) { /* 网络失败 → 落到路径表单 */ }
 
-  const folder = window.prompt('输入待扫描文件夹路径（存放未入库 EPUB/MOBI 的目录）：');
-  if (!folder) {
-    body.innerHTML = '<div style="color:var(--text-muted);font-size:var(--fs-caption);text-align:center;padding:var(--space-lg)">已取消扫描，点击下方按钮重新扫描。</div>';
-    return;
-  }
-  setScanFolder(folder);
-  await scanFolder(folder);
+  showPathForm('', '');
 }
 
 export async function importSingleFile(filePath) {
@@ -656,8 +1127,12 @@ window.openBookFromShelf = openBookFromShelf;
 window.deleteBook = deleteBook;
 window.toggleImportPanel = toggleImportPanel;
 window.scanAndShowFiles = scanAndShowFiles;
+window.submitScanPath = submitScanPath;
 window.importSingleFile = importSingleFile;
 window.setSort = setSort;
+window.toggleSortPanel = toggleSortPanel;
+window.enterShelfReorder = enterShelfReorder;
+window.exitShelfReorder = exitShelfReorder;
 window.loadShelf = loadShelf;
 window.toggleShelfScene = toggleShelfScene;
 window.loadShelfScene = loadShelfScene;

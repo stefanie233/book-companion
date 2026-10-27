@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,13 +17,27 @@ from typing import Any, Callable
 
 import aiohttp
 
+from bookgraph.chunk_summary import missing_ids, summaries_from_result
 from bookgraph.context_setter import run_context_setter
 from bookgraph.explorer import build_explorer_prompt, run_explorer
+from bookgraph.llm_call import output_budget
 from bookgraph.logging import log_llm_call
 from bookgraph.recorder import record_result, RecordStats
+from bookgraph.invariants import CORE_KINDS
+from bookgraph.scope import plan_scopes, plan_to_meta, scope_brief, top_level_units
+from bookgraph.selection import select_chunks
 from bookgraph.head_scan import run_head_scan
 from bookgraph.scout import run_scout
+from provider_store import config_for
+from bookgraph.adjudicate import (
+    apply_fixes, evidence_flags, mechanical_fixes, run_adjudicator,
+    verdict_summary)
+from bookgraph.skeleton import (
+    group_chapters, normalize_skeleton, record_skeleton, run_skeleton)
+from bookgraph.verify import (
+    challenge_lines, check_candidate, round_rank, run_verifier)
 from config import Config
+from services.chunk_annotation import annotate_chunks, form_map
 from storage.db import BookDB
 from storage.graph_db import GraphDB
 
@@ -69,7 +84,33 @@ SCOUT_MIN_CHUNKS = 50
 # How many Explorer LLM calls may run concurrently. Only the LLM calls are
 # concurrent — all graph_db writes happen serially in the reaping loop below,
 # which keeps the single SQLite connection free of interleaving.
-BATCH_CONCURRENCY = 3
+#
+# 可用环境变量压到 1–2：火山的网关有一条 **burst 增长** 保护，3 并发连着
+# 打会成片 429（实测一趟 44 次，末端两个批次直接失败、丢掉 10 块正文）。
+# 并发只影响墙钟，不影响产物 —— 限流严重时降并发比加大重试更省事。
+BATCH_CONCURRENCY = max(1, int(os.environ.get("BC_GRAPH_CONCURRENCY", "3")))
+
+
+def _split_by_scope(seq: list, by_chunk: dict, size: int | None) -> list[list]:
+    """把一串连续块切成批次，**遇到叙事域边界就断开**。
+
+    *size* 为 None 时只在域边界断开（Scout 已经定过批次大小）；
+    否则域内再按 size 分批。``by_chunk`` 为空（单域/未划域）时行为与
+    改动前逐字一致 —— 长篇不受影响。
+    """
+    out: list[list] = []
+    cur: list = []
+    cur_sid = None
+    for ch in seq:
+        sid = by_chunk.get(ch.id, "")
+        if cur and (sid != cur_sid or (size and len(cur) >= size)):
+            out.append(cur)
+            cur = []
+        cur.append(ch)
+        cur_sid = sid
+    if cur:
+        out.append(cur)
+    return out
 
 
 async def _run_batch_explorer(
@@ -88,36 +129,291 @@ async def _run_batch_explorer(
     system_prompt: str,
     jsonl_path: Path,
     extraction_focus: str = "",
-) -> tuple[int, dict | None, str | None]:
-    """Run one Explorer batch inside the concurrency semaphore.
+    scope_brief_text: str = "",
+    *,
+    verify: bool = True,
+    max_rounds: int = 2,
+    admitted: set[str] | None = None,
+    repair_mode: str = "adjudicate",
+    book_text: str = "",
+) -> tuple[int, dict | None, str | None, dict]:
+    """跑一批的提取与修补。
 
-    Returns ``(batch_index, result, error_type)``. The semaphore is held
-    while building the node index AND making the LLM call, so later batches
-    still see nodes committed by earlier ones (approximate sliding window —
-    a batch only starts once an earlier one has handed its slot back).
+    ``repair_mode="adjudicate"``（默认）：提取一次 → 机械修补 → 裁决趟对
+    **带编号的断言**下判决 → 机械执行 → 再体检。**不重提**。
+    ``repair_mode="rework"``：旧回炉环（提取 → 体检 + 证伪 → 带缺陷清单重提，
+    保留「最好的一轮」），留作回退与 A/B。
 
-    Every LLM call is logged via ``log_llm_call`` (graph_llm_logs + JSONL).
+    Returns ``(batch_index, result, error_type, verdict)``。``verdict`` 里有
+    轮数、残余缺陷数、裁决/证伪结论 —— **未经验证的那一批必须看得出来**。
+
+    信号量在整个环上持有，所以后开始的批次仍能看见前面已提交的节点
+    （近似滑动窗口）。每次 LLM 调用都经 ``log_llm_call`` 落库。
     """
     async with sem:
         done_count = graph_db.done_count(book_id)
+        chunk_ids = [d["chunk_id"] for d in chunk_dicts]
+        chunk_text = {d["chunk_id"]: d.get("content") or "" for d in chunk_dicts}
+        # 简述按块累计、跨轮保留：采纳的那一轮（可能是第 1 轮）漏写某几块时，
+        # 别让整批的简述白丢。后一轮覆盖前一轮 —— 改过的通常更准。
+        collected_summaries: dict[str, str] = {}
 
-        def _log(fields: dict) -> None:
-            log_llm_call(
-                graph_db, jsonl_path,
-                book_id=book_id, book_title=book_title, run_id=run_id,
-                phase="explorer", batch_id=batch_id, batch_index=batch_index,
-                chunk_ids=[d["chunk_id"] for d in chunk_dicts],
-                total_chunks=total, model=cfg.model,
-                scout_focus=extraction_focus,
-                **fields,
+        def _with_summaries(payload: dict) -> dict:
+            if collected_summaries:
+                payload["chunk_summaries"] = dict(collected_summaries)
+            return payload
+
+        _phase_route = {
+            "explorer": "bookgraph.explorer",
+            "extract_verifier": "bookgraph.verify",
+            "adjudicate": "bookgraph.adjudicate",
+            "adjudicate_retry": "bookgraph.adjudicate",
+        }
+
+        def _log(phase: str):
+            # Record the model that actually served this call, not the base
+            # one — a route binding may point this phase elsewhere.
+            model = config_for(cfg, _phase_route[phase]).model \
+                if phase in _phase_route else cfg.model
+
+            def _cb(fields: dict) -> None:
+                log_llm_call(
+                    graph_db, jsonl_path,
+                    book_id=book_id, book_title=book_title, run_id=run_id,
+                    phase=phase, batch_id=batch_id, batch_index=batch_index,
+                    chunk_ids=chunk_ids, total_chunks=total, model=model,
+                    scout_focus=extraction_focus, **fields,
+                )
+            return _cb
+
+        # 证伪趟的名册：这个叙事域里**已有**的实体。只给名字 —— 用来判
+        # 「这是不是同一个人」，不给关系也不给推理。
+        # 库里已有的名字（含别名）—— 体检时用来分辨「引用了旧实体」（正常）
+        # 和「真悬空」（要回炉）。少了它会把前者全误报成缺陷。
+        try:
+            known_names = graph_db.known_names(book_id)
+        except Exception:
+            log.warning("已有节点名查询失败（悬空引用判定会偏严）", exc_info=True)
+            known_names = set()
+
+        # 名册也**不按域过滤**：它的用途就是判「这是不是同一个人」，而
+        # 复现实体恰恰是跨篇的 —— 把别的篇藏起来正好让它判不了。
+        roster: list[str] = []
+        try:
+            idx = graph_db.get_node_index_two_tier(
+                book_id, {d["chapter_index"] for d in chunk_dicts
+                          if "chapter_index" in d},
+                compact_cap=60)
+            roster = [n["canonical_name"] for n in (idx.get("compact") or [])]
+        except Exception:
+            log.warning("证伪名册查询失败（不影响提取）", exc_info=True)
+
+        verdict: dict = {"rounds": 0, "verified": False, "verdict":
+                         "skipped" if not verify else "?",
+                         "mechanical": 0, "challenges": 0, "residual": 0,
+                         # 逐轮台账。没有它，「回炉到底在收敛还是空转」「采纳的
+                         # 是哪一轮」都只能靠重放日志猜（而且会猜错 —— 真正的
+                         # 评分含证伪质疑数，不只是机械缺陷数）。
+                         "history": []}
+
+        # ── 裁决模式：一次提取 + 一次裁决 + 机械修补，不重提 ─────────────
+        # 旧回炉环实测不收敛（边逐字稳定率 19%，观察 1%），而且它是拿「重提
+        # 整批」去修「某一条断言的错」，把 81% 正确的内容一起扔了。这里改成
+        # 对编号下判决：能改一个字段就不删整条，能不动的绝不重写。
+        if repair_mode == "adjudicate":
+            result, error_type = await run_explorer(
+                session, cfg, graph_db, book_id, book_title, book_author,
+                chunk_dicts, total, done_count, system_prompt,
+                log_cb=_log("explorer"),
+                scope_brief=scope_brief_text, feedback=[],
             )
+            if result is None:
+                return batch_index, None, error_type, verdict
+            collected_summaries.update(
+                summaries_from_result(result, chunk_ids))
 
-        result, error_type = await run_explorer(
-            session, cfg, graph_db, book_id, book_title, book_author,
-            chunk_dicts, total, done_count, system_prompt,
-            log_cb=_log,
-        )
-        return batch_index, result, error_type
+            # 机械能判的先判掉：别名无据、锚点出批、同批重复。
+            result, auto_ledger = mechanical_fixes(
+                result, chunk_ids, chunk_text, book_text)
+            report = check_candidate(result, chunk_ids, chunk_text, admitted,
+                                     known=known_names, book_text=book_text)
+
+            adjudicated: dict | None = None
+            ledger: list[dict] = []
+            flags: dict[str, str] = {}
+            if verify:
+                # 机械体检的结果要**一起送过去**。逐字校验早就发现「证据
+                # 不在这块正文里」，但那只是一条非阻塞的 finding —— 裁决者
+                # 看不到它，就只能靠自己逐字比对五块正文，而那件事它做不好。
+                flags = evidence_flags(result, chunk_text)
+                adjudicated = await run_adjudicator(
+                    session, cfg, book_title,
+                    [(cid, chunk_text.get(cid, "")) for cid in chunk_ids],
+                    result, roster, log_cb=_log("adjudicate"), flags=flags,
+                )
+                if adjudicated:
+                    before = len(result.get("new_edges") or [])
+                    result, ledger = apply_fixes(
+                        result, adjudicated.get("fixes") or [], set(chunk_ids))
+                    after = len(result.get("new_edges") or [])
+                    if before and after < before * 0.5:
+                        log.warning(
+                            "Batch %d: 裁决删掉了 %d/%d 条边 —— 超过一半，"
+                            "这多半是裁决失控而不是提取差",
+                            batch_index, before - after, before)
+                    report = check_candidate(result, chunk_ids, chunk_text,
+                                             admitted, known=known_names,
+                                             book_text=book_text)
+
+                    # **被拒的修改要回灌一次。** 裁决者只有一轮时，它永远
+                    # 不知道自己的修改没落地 —— 实测 14 条里 5 条因
+                    # `empty_patch` 被拒，原因全是「只写了 why、没给 patch」，
+                    # 而下一批它还会照原样犯。这里把驳回原因连同**当前**
+                    # 断言表再送一次：编号会变（前面的条目可能已被删），
+                    # 所以只给「上一条为什么被拒」，不给旧编号。
+                    rejected = [e for e in ledger if not e["applied"]]
+                    if rejected:
+                        retry_flags = evidence_flags(result, chunk_text)
+                        retry = await run_adjudicator(
+                            session, cfg, book_title,
+                            [(cid, chunk_text.get(cid, ""))
+                             for cid in chunk_ids],
+                            result, roster, log_cb=_log("adjudicate_retry"),
+                            flags=retry_flags, rejected=rejected,
+                        )
+                        if retry:
+                            fixed, ledger2 = apply_fixes(
+                                result, retry.get("fixes") or [],
+                                set(chunk_ids))
+                            if ledger2:
+                                result = fixed
+                                ledger.extend(ledger2)
+                                report = check_candidate(
+                                    result, chunk_ids, chunk_text, admitted,
+                                    known=known_names, book_text=book_text)
+                            verdict["retry_fixes_applied"] = sum(
+                                1 for e in ledger2 if e["applied"])
+                            verdict["retry_fixes_rejected"] = [
+                                e for e in ledger2 if not e["applied"]][:10]
+
+            blocking = [f for f in report.findings if f.blocking]
+            summary = verdict_summary(adjudicated, ledger)
+            verdict.update({
+                "rounds": 1,
+                # 沉默不是成功：裁决趟没吐出可解析结论 = 未经验证。
+                "verified": bool(adjudicated) and not blocking,
+                "verdict": summary["verdict"] if verify else "skipped",
+                "mechanical": len(blocking),
+                "challenges": summary["fixes_proposed"],
+                "residual": len(blocking),
+                "advisory": len(report.findings) - len(blocking),
+                "auto_fixes": len(auto_ledger),
+                # 机械体检捞出来的可疑条数。它是**裁决的输入**，不是结论 ——
+                # 记下来才能分清「这批判得干净」和「这批根本没送可疑项」。
+                "machine_flags": len(flags),
+                "fixes_applied": summary["fixes_applied"],
+                "by_action": summary["by_action"],
+                # 被拒收的修改要看得见 —— 否则「裁决提了 5 条只落了 1 条」
+                # 只能靠重放日志猜（实测 4 条 rewrite 因为字段名不同被静默丢弃）。
+                "fix_rejected": [e for e in ledger if not e["applied"]][:20],
+            })
+            verdict["history"].append({
+                "round": 1, "auto_fixes": len(auto_ledger),
+                "fixes_proposed": summary["fixes_proposed"],
+                "fixes_applied": summary["fixes_applied"],
+                "by_action": summary["by_action"],
+                "mechanical": len(blocking),
+                "codes": sorted({f.code for f in report.findings}),
+                "nodes": len(result.get("new_nodes") or []),
+                "edges": len(result.get("new_edges") or []),
+                "verifier": verdict["verdict"],
+            })
+            return batch_index, _with_summaries(result), None, verdict
+
+        feedback: list[str] = []
+        best_result: dict | None = None
+        best_rank: tuple | None = None
+        best_round = 0
+
+        for rnd in range(1, max_rounds + 1):
+            result, error_type = await run_explorer(
+                session, cfg, graph_db, book_id, book_title, book_author,
+                chunk_dicts, total, done_count, system_prompt,
+                log_cb=_log("explorer"),
+                scope_brief=scope_brief_text, feedback=feedback,
+            )
+            if result is None:
+                # 回炉轮反而崩了 → 用上一轮那份好的，别把整批丢掉
+                if best_result is not None:
+                    log.warning("Batch %d: 第 %d 轮回炉失败(%s)，保留上一轮结果",
+                                batch_index, rnd, error_type)
+                    break
+                return batch_index, None, error_type, verdict
+
+            collected_summaries.update(
+                summaries_from_result(result, chunk_ids))
+
+            report = check_candidate(result, chunk_ids, chunk_text, admitted,
+                                     known=known_names, book_text=book_text)
+            v = await run_verifier(
+                session, cfg, book_title,
+                [(cid, chunk_text.get(cid, "")) for cid in chunk_ids],
+                result, roster, log_cb=_log("extract_verifier"),
+            ) if verify else None
+            v_lines = challenge_lines(v)
+            verifier_ok = (v is not None)
+
+            # 反馈**全给**（提示项也写进去，提取器学得到）；但**只有阻塞项**
+            # 决定要不要再来一轮。为「写库时就会被归一掉的东西」烧一次完整
+            # 重提取，是这套系统里最贵的一笔冤枉钱。
+            blocking = [f for f in report.findings if f.blocking]
+            feedback = [f.render() for f in report.findings] + v_lines
+            trigger = [f.render() for f in blocking] + v_lines
+            score = len(feedback)
+            rank = round_rank(len(blocking), len(v_lines),
+                              len(result.get("new_nodes") or []),
+                              len(result.get("new_edges") or []))
+            verdict.update({
+                "rounds": rnd, "mechanical": len(blocking),
+                "challenges": len(v_lines),
+                "advisory": len(report.findings) - len(blocking),
+                "verdict": (str(v.get("verdict") or "?") if v
+                            else ("skipped" if not verify else "inconclusive")),
+            })
+            verdict["history"].append({
+                "round": rnd, "score": score, "rank": list(rank),
+                "mechanical": len(blocking), "challenges": len(v_lines),
+                "advisory": len(report.findings) - len(blocking),
+                "codes": sorted({f.code for f in report.findings}),
+                "nodes": len(result.get("new_nodes") or []),
+                "edges": len(result.get("new_edges") or []),
+                # 逐轮记证伪结论。只记最后一轮会让台账说谎 —— 采纳的可能是
+                # 第 2 轮，而最后一轮（第 3 轮）恰好 upheld，于是事件里出现
+                # 「未经验证（upheld）」这种自相矛盾的行。
+                "verifier": (str(v.get("verdict") or "?") if v
+                             else ("skipped" if not verify else "inconclusive")),
+            })
+            if best_rank is None or rank < best_rank:
+                best_rank, best_result, best_round = rank, result, rnd
+            if not trigger:
+                # 收敛 = 没有阻塞项 **且** 证伪趟确实说了话。证伪趟哑了就是
+                # 未经验证，不能冒充收敛。
+                verdict["verified"] = verifier_ok
+                verdict["best_round"] = rnd
+                return batch_index, _with_summaries(best_result), None, verdict
+
+        verdict["residual"] = (best_rank[0] + best_rank[1]) if best_rank else 0
+        verdict["best_round"] = best_round
+        verdict["verified"] = False
+        # 结论取**采纳那一轮**的，不取最后一轮的 —— 否则「upheld」会和
+        # 「未经验证」并排出现，读的人没法判断到底信谁。
+        for h in verdict["history"]:
+            if h["round"] == best_round:
+                verdict["verdict"] = h["verifier"]
+                verdict["challenges"] = h["challenges"]
+                verdict["mechanical"] = h["mechanical"]
+                break
+        return batch_index, _with_summaries(best_result), None, verdict
 
 
 # ── Main orchestrator ─────────────────────────────────────────────────────
@@ -149,6 +445,10 @@ class GraphOrchestrator:
         batch_size: int = 5,
         progress_cb: ProgressCallback | None = None,
         use_scout: bool = True,
+        verify: bool = True,
+        verify_rounds: int = 3,
+        repair_mode: str = "adjudicate",
+        run_skeleton_pass: bool = True,
     ) -> ExtractionResult:
         """Run full extraction loop for a book.
 
@@ -159,6 +459,15 @@ class GraphOrchestrator:
             progress_cb: Optional callback for SSE progress events.
             use_scout: Whether to run the scout phase (Phase 0) before
                        extraction.  Auto-disabled for books with < 50 chunks.
+            verify: 开裁决/证伪趟。关掉它 = 「一次提取 + 机械修补」直接落库。
+            verify_rounds: 旧回炉模式的轮数上限（每轮 = 一次提取 + 一次证伪）。
+                ``repair_mode="adjudicate"`` 时无意义（永远只跑一轮）。
+            repair_mode: ``"adjudicate"``（默认）= 一次提取 + 对编号下判决 +
+                机械修补；``"rework"`` = 旧回炉环（重提整批），保留用于
+                A/B 与回退。
+            run_skeleton_pass: 提取前先跑一趟「骨架」（实体 + 结构关系）。
+                它是全局的：同一人跨场景才认得出，亲缘结构才拼得全。失败时
+                退回逐批提取并出声。
 
         Resumable: skips chunks already marked done.
         """
@@ -179,6 +488,8 @@ class GraphOrchestrator:
         }
 
         total = len(all_chunks)
+        # 全书正文：别名准入要用它（「全书没这个写法」= 外部知识，不是别名）。
+        book_text = "\n".join((ch.content or "") for ch in all_chunks)
 
         # ── 1b. Run identity ─────────────────────────────────────────────
         # A run_id scopes every progress row + LLM call log for this run.
@@ -197,13 +508,46 @@ class GraphOrchestrator:
             "total_chunks": total,
         })
 
-        # ── 2. Register chunks in graph_db (idempotent) ───────────────────
-        for ch in all_chunks:
-            content_hash = hashlib.sha256(
-                (ch.content or "").encode("utf-8")
-            ).hexdigest()[:16]
+        # ── 2. 锚点重连 + 登记块 ──────────────────────────────────────────
+        # 重导会重新生成 book_chunks.id，而图谱的边/引文/观察/节点首现锚点都
+        # 指着旧 id（实测 9 本里 8 本交集为 0）。**必须在 register_chunk 之前
+        # 重连** —— 重指之后 is_chunk_done(新 id) 才为真，跨重导的续跑才真正
+        # 正确；晚了就是把旧行当分母、把已提过的块再提一遍。
+        current = [{
+            "chunk_id": ch.id,
+            "chapter_index": ch.chapter_index,
+            "chunk_index": ch.chunk_index,
+            "content_hash": hashlib.sha256(
+                (ch.content or "").encode("utf-8")).hexdigest()[:16],
+        } for ch in all_chunks]
+        try:
+            rl = self.graph_db.relink_chunks(book_id, current)
+            if rl.relinked or rl.ambiguous or rl.unresolved or rl.status_kept:
+                log.info("Relink: %s", rl.summary())
+                self.graph_db.record_event(
+                    book_id, "relink",
+                    step_label=f"锚点重连 · {rl.resolved}/{rl.total}",
+                    detail=json.dumps({
+                        "resolved": rl.resolved, "total": rl.total,
+                        "by_hash": rl.by_hash, "by_coord": rl.by_coord,
+                        "merged": rl.merged,
+                        "ambiguous": len(rl.ambiguous),
+                        "unresolved": len(rl.unresolved),
+                        "nodes_relinked": rl.nodes_relinked,
+                        "obs_reanchored": rl.obs_reanchored,
+                    }, ensure_ascii=False), run_id=run_id)
+                self._emit(progress_cb, {
+                    "type": "relink", "book_id": book_id, "run_id": run_id,
+                    "resolved": rl.resolved, "total": rl.total,
+                    "unresolved": len(rl.unresolved),
+                })
+        except Exception:
+            log.warning("锚点重连失败（不影响本轮提取）", exc_info=True)
+
+        for c in current:
             self.graph_db.register_chunk(
-                ch.id, book_id, ch.chapter_index, ch.chunk_index, content_hash
+                c["chunk_id"], book_id, c["chapter_index"],
+                c["chunk_index"], c["content_hash"],
             )
 
         # ── 3. Init chapter nodes ─────────────────────────────────────────
@@ -235,24 +579,35 @@ class GraphOrchestrator:
         if cached_ctx:
             try:
                 book_context = json.loads(cached_ctx)
-                log.info("ContextSetter: cache hit")
+                if "narrative_structure" not in (book_context or {}):
+                    # 老缓存（本次改动之前落的）：它连目录都没看过，判不出
+                    # 「一个世界还是几个世界」。当未命中重跑一次 —— 一次调用，
+                    # 顺带把目录喂给它，它的**全部**输出都变准（原来只拿得到
+                    # 书名+作者）。判回 single 时下游行为与改动前一字不差。
+                    log.info("ContextSetter: 老缓存缺 narrative_structure，重跑")
+                    cached_ctx, book_context = None, None
+                else:
+                    log.info("ContextSetter: cache hit")
             except json.JSONDecodeError:
                 cached_ctx = None
 
         if not cached_ctx:
+            ctx_cfg = config_for(self.config, "bookgraph.context_setter")
             async with aiohttp.ClientSession() as session:
                 def _log_ctx(fields: dict) -> None:
                     log_llm_call(
                         self.graph_db, self._jsonl_path,
                         book_id=book_id, book_title=book.title, run_id=run_id,
                         phase="context", total_chunks=total,
-                        model=self.config.model,
+                        model=ctx_cfg.model,
                         **fields,
                     )
                 book_context = await run_context_setter(
-                    session, self.config.api_key, self.config.api_base,
-                    self.config.model, book.title, book.author or "",
+                    session, ctx_cfg.api_key, ctx_cfg.api_base,
+                    ctx_cfg.model, book.title, book.author or "",
                     log_cb=_log_ctx,
+                    unit_titles=[u["title"] for u in top_level_units(chapters)],
+                    max_tokens=output_budget(self.config),
                 )
             if book_context is not None:
                 self.graph_db.set_meta(
@@ -301,7 +656,8 @@ class GraphOrchestrator:
                         chunk_ids=[c.id for c in head_chunks
                                    if c.chapter_index <= 3],
                         total_chunks=len(head_chunks),
-                        model=self.config.model,
+                        model=config_for(self.config,
+                                         "bookgraph.head_scan").model,
                         **fields,
                     )
                 head_scan = await run_head_scan(
@@ -338,7 +694,34 @@ class GraphOrchestrator:
                 }, ensure_ascii=False),
                 run_id=run_id)
 
-        explorer_prompt = build_explorer_prompt(book_context)
+        # 文本形态回流：导入期判定的形态（哪些排版承载什么性质的文本）注入提取
+        # 提示词。提取器只看得到块文本、看不到排版 —— 不回流，信里第一人称的
+        # 口吻就会被归给叙述者（详见 explorer._render_text_forms）。
+        # 读不到就静默跳过：形态是增益，不是提取的前置条件。
+        try:
+            text_forms = self.books_db.list_text_forms(book_id)
+        except Exception:
+            text_forms = []
+        if text_forms:
+            self.graph_db.record_event(
+                book_id, "text_forms_injected", run_id=run_id,
+                step_label=f"文本形态注入 · {len(text_forms)} 条")
+        explorer_prompt = build_explorer_prompt(book_context, text_forms)
+        # 形态映射只进 system prompt 是不够的 —— 提取器读的块文本是扁平的，映射表
+        # 无处落地。这里再算一份 {选择器: 形态名}，把**逐段**标签渲染进送给 LLM
+        # 的那份 content（绝不写回库，见 services/chunk_annotation）。
+        forms = form_map(text_forms)
+
+        # kind 词表 = **保留字** ∪ 本书建议词表。保留字必须在里面：
+        # incremental._get_character_names、get_node_index_two_tier 的
+        # `kind='character'` 优先级、get_node_detail 的引文分支、前端
+        # graph-viz.js 的 KIND_COLORS 都硬编码认它，缺一个就**静默**弄坏
+        # 对话观察提取与角色内核。词表外的 kind 不硬改，只记进缺陷清单。
+        kind_vocab = set(CORE_KINDS) | {
+            str(k).strip()
+            for k in ((book_context or {}).get("suggested_kinds") or [])
+            if str(k).strip()
+        }
 
         # ── 5. Phase 0: Scout (optional, cached) ──────────────────────────
         scout_plan: dict | None = None
@@ -367,7 +750,10 @@ class GraphOrchestrator:
                     ),
                     "chunk_index": ch.chunk_index,
                     "content": ch.content or "",
+                    "paragraph_sigs": ch.paragraph_sigs,
+                    "paragraph_offsets": ch.paragraph_offsets,
                 } for ch in all_chunks]
+                annotate_chunks(chunk_dicts, forms)
 
                 async with aiohttp.ClientSession() as session:
                     def _log_scout(fields: dict) -> None:
@@ -377,7 +763,8 @@ class GraphOrchestrator:
                             phase="scout",
                             chunk_ids=[d["chunk_id"] for d in chunk_dicts],
                             total_chunks=total,
-                            model=self.config.model,
+                            model=config_for(self.config,
+                                             "bookgraph.scout").model,
                             **fields,
                         )
                     scout_plan = await run_scout(
@@ -467,39 +854,119 @@ class GraphOrchestrator:
                 log.info("Scout: no usable plan, falling back to mechanical batching")
                 scout_plan = None
 
+        # ── 5b. 输入裁剪：消费已完成的归属分类 ────────────────────────────
+        # 同一条链上有三份「这块是什么」的判断：classifier 的 chapter_type
+        # （含人手在标注面板改过的覆盖层）、head_scan 的区域标签、Scout 在
+        # 500 字截断上的重判 —— 而只有信息最少的那份在起作用。这里把前两份
+        # 接上，Scout 降为兜底，两份打架的地方**报出来**而不是偷偷选一边。
+        # 诊断与实测见 bookgraph/selection.py。
+        chapter_types: dict[int, str] = {}
+        try:
+            chapter_types = {c.chapter_index: c.chapter_type
+                             for c in self.books_db.get_chapters(book_id)}
+        except Exception:
+            log.warning("读 chapter_type 失败，本轮按全书提取", exc_info=True)
+        sel = select_chunks(all_chunks, chapter_types,
+                            (head_scan or {}).get("boundaries") or {},
+                            excluded_ids)
+        dropped = set(sel.drop)
+        for cid, reason in sel.drop.items():
+            # Scout 那批上面已经标过，且带 content_warnings 里的具体理由，别覆盖它
+            if reason != "scout":
+                self.graph_db.mark_chunk_excluded(cid, reason)
+        if dropped or sel.conflicts:
+            detail = {"kept": len(sel.keep), "dropped": len(dropped),
+                      "by_type": sel.counts.get("by_type", 0),
+                      "by_region": sel.counts.get("by_region", 0),
+                      "by_scout": sel.counts.get("by_scout", 0),
+                      "conflicts": sel.conflicts[:20]}
+            log.info("Selection: %s", sel.summary())
+            self._emit(progress_cb, {
+                "type": "content_filtered", "book_id": book_id,
+                "run_id": run_id, "excluded_count": len(dropped),
+                "total_chunks": total, "detail": detail,
+            })
+            self.graph_db.record_event(
+                book_id, "content_filtered",
+                step_label=f"输入裁剪 · {sel.summary()}",
+                detail=json.dumps(detail, ensure_ascii=False), run_id=run_id)
+
+        kept_chunks = [ch for ch in all_chunks if ch.id not in dropped]
+
+        # ── 5c. 叙事域：集类书各篇各自成域 ────────────────────────────────
+        # 用户最先提的那个病：「短篇小说集会跨章节串流，导致文本污染」。
+        # 域由**两份判断共同**决定 —— 语义裁决（context_setter 拿目录判
+        # narrative_structure）+ 机械守卫（顶层单元标题带不带序号）。任何一份
+        # 缺席就退成全书单域，**长篇的行为一字不变**。诊断见 bookgraph/scope.py。
+        scope_plan = plan_scopes(
+            chapters, kept_chunks,
+            narrative_structure=(book_context or {}).get("narrative_structure", ""),
+        )
+        try:
+            self.graph_db.set_meta("scope_plan", json.dumps(
+                plan_to_meta(scope_plan, kept_chunks), ensure_ascii=False))
+        except Exception:
+            log.warning("落库 scope_plan 失败（不影响提取）", exc_info=True)
+        if scope_plan.is_split:
+            log.info("Scope: %s", scope_plan.summary())
+            detail = {
+                "source": scope_plan.source, "reason": scope_plan.reason,
+                "scopes": [{"scope_id": s.scope_id, "label": s.label,
+                            "chunks": len(s.chunk_ids)} for s in scope_plan.scopes],
+            }
+            self.graph_db.record_event(
+                book_id, "scopes_planned",
+                step_label=f"叙事域 · {scope_plan.summary()}",
+                detail=json.dumps(detail, ensure_ascii=False), run_id=run_id)
+            self._emit(progress_cb, {
+                "type": "scopes_planned", "book_id": book_id, "run_id": run_id,
+                "scope_count": len(scope_plan.scopes),
+                "labels": [s.label for s in scope_plan.scopes],
+            })
+        elif scope_plan.conflicts:
+            # 「沉默不是成功」：裁决与结构打架时说清楚，不偷偷选一边。
+            log.info("Scope: 拒绝划域 — %s", scope_plan.conflicts[0])
+            self.graph_db.record_event(
+                book_id, "scopes_planned",
+                step_label=f"叙事域 · 单域（{scope_plan.reason}）",
+                detail=json.dumps({"source": scope_plan.source,
+                                   "reason": scope_plan.reason,
+                                   "conflicts": scope_plan.conflicts},
+                                  ensure_ascii=False), run_id=run_id)
+
         # ── 6. Build batch list ───────────────────────────────────────────
         if scout_plan and scout_plan.get("batch_plan"):
             # Scout-driven batches
             batch_plan = scout_plan["batch_plan"]
             batch_list: list[list[Any]] = []
             seen_ids: set[str] = set()
-            # Pre-seed seen_ids with excluded so they aren't treated as leftover
-            seen_ids.update(excluded_ids)
+            # Pre-seed seen_ids with dropped so they aren't treated as leftover
+            seen_ids.update(dropped)
             for bp in batch_plan:
-                batch_chunks: list[Any] = []
+                seg: list[Any] = []
                 for cid in bp.get("chunk_ids", []):
-                    if cid not in seen_ids and cid not in excluded_ids:
+                    if cid not in seen_ids and cid not in dropped:
                         ch = chunk_by_id.get(cid)
                         if ch:
-                            batch_chunks.append(ch)
+                            seg.append(ch)
                             seen_ids.add(cid)
-                if batch_chunks:
-                    batch_list.append(batch_chunks)
-            # Append any leftover chunks not in scout plan (but not excluded)
+                # Scout 按情节节拍分批，可能一批横跨两篇 —— 在域边界上切开
+                batch_list.extend(_split_by_scope(seg, scope_plan.by_chunk, None))
+            # Append any leftover chunks not in scout plan (but not dropped)
             leftover = [ch for ch in all_chunks
-                        if ch.id not in seen_ids and ch.id not in excluded_ids]
+                        if ch.id not in seen_ids and ch.id not in dropped]
             if leftover:
                 log.info("Scout missed %d chunks — appending as final batch", len(leftover))
-                batch_list.append(leftover)
+                batch_list.extend(
+                    _split_by_scope(leftover, scope_plan.by_chunk, batch_size))
             log.info("Scout plan: %d batches (vs %d mechanical)%s",
                      len(batch_list), (total + batch_size - 1) // batch_size,
-                     f" — {len(excluded_ids)} excluded" if excluded_ids else "")
+                     f" — {len(dropped)} dropped" if dropped else "")
         else:
-            # Mechanical fallback
-            batch_list = [
-                all_chunks[i:i + batch_size]
-                for i in range(0, total, batch_size)
-            ]
+            # Mechanical fallback —— 也要跳过被裁掉的块、也不跨域。
+            # 旧代码这里直接用 all_chunks，于是 Scout 的排除在它没产出计划时
+            # **静默失效**（过滤只活在 scout-plan 那条分支里）。
+            batch_list = _split_by_scope(kept_chunks, scope_plan.by_chunk, batch_size)
 
         total_batches = len(batch_list)
 
@@ -509,7 +976,31 @@ class GraphOrchestrator:
         # writes so SQLite's single connection is never interleaved.
         batch_stats: list[dict] = []
 
+        # Scout 点名的关键人物**无条件准入** —— 主角可能在某一批里一条关系都
+        # 没挂上（他只是在场），但那不代表他不是实体。
+        key_chars = [str(c.get("name") or "").strip()
+                     for c in ((scout_plan or {}).get("key_characters") or [])
+                     if str(c.get("name") or "").strip()]
+
         async with aiohttp.ClientSession() as session:
+            # ── 骨架趟：先认清成员与结构，再逐批读 ────────────────────────
+            # 必须在**这个** session 里跑 —— 上面几个阶段各自开了自己的
+            # ``async with ClientSession()``，名字会泄漏到外层，但连接已经关了；
+            # 拿那个跑会得到 “Session is closed”（实测）。
+            # 产出（规范名 / 别称 / 一句话身份 / 亲缘与社会关系）会出现在后面
+            # 每个批次的名字索引里 —— 批次不再从零开始认人。
+            skeleton_stats: dict | None = None
+            if run_skeleton_pass and kept_chunks:
+                try:
+                    skeleton_stats = await self._run_skeleton_phase(
+                        session, book, chapter_titles, kept_chunks, run_id,
+                        progress_cb, book_context=book_context)
+                except Exception:
+                    # 骨架趟失败不该拖垮整次提取 —— 退回「没有骨架」的旧行为，
+                    # 但要出声（沉默不是成功）。
+                    log.warning("骨架趟失败，退回逐批提取", exc_info=True)
+                    skeleton_stats = None
+
             sem = asyncio.Semaphore(BATCH_CONCURRENCY)
             pending: dict[int, asyncio.Task] = {}
             batch_by_index: dict[int, list[Any]] = {}
@@ -582,7 +1073,10 @@ class GraphOrchestrator:
                     ),
                     "chunk_index": ch.chunk_index,
                     "content": ch.content or "",
+                    "paragraph_sigs": ch.paragraph_sigs,
+                    "paragraph_offsets": ch.paragraph_offsets,
                 } for ch in batch_chunks_]
+                annotate_chunks(chunk_dicts, forms)
 
                 # Augment explorer prompt with scout extraction focus
                 batch_explorer_prompt = explorer_prompt
@@ -593,6 +1087,15 @@ class GraphOrchestrator:
                     if extraction_focus:
                         batch_explorer_prompt = explorer_prompt + f"\n\n**本批提取重点**：{extraction_focus}"
 
+                # 叙事域：本批属于哪一篇 —— 只在 user message 里带一句域简报。
+                # **实体索引不按域过滤**（见 explorer.py 的说明：过滤会让复现
+                # 实体被反复重命名）。单域（长篇）时简报为空，行为不变。
+                batch_scope_brief = ""
+                if scope_plan.is_split:
+                    sc = scope_plan.get(scope_plan.scope_of(batch_chunks_[0].id))
+                    if sc is not None:
+                        batch_scope_brief = scope_brief(sc, scope_plan)
+
                 batch_ids[batch_index] = batch_id
                 batch_labels[batch_index] = step_label
                 batch_by_index[batch_index] = batch_chunks_
@@ -602,6 +1105,11 @@ class GraphOrchestrator:
                         book_id, book.title, book.author or "",
                         run_id, batch_id, batch_index, chunk_dicts, total,
                         batch_explorer_prompt, self._jsonl_path, extraction_focus,
+                        scope_brief_text=batch_scope_brief,
+                        verify=verify, max_rounds=verify_rounds,
+                        admitted=set(key_chars),
+                        repair_mode=repair_mode,
+                        book_text=book_text,
                     )
                 )
 
@@ -615,13 +1123,16 @@ class GraphOrchestrator:
                 for task in done:
                     batch_index = pending_by_task[task]
                     try:
-                        _, result, error_type = task.result()
+                        _, result, error_type, verdict = task.result()
                     except Exception as exc:
                         # One unexpected per-batch failure shouldn't cancel the
                         # remaining pending batches — mark it failed, move on.
                         log.error("Batch %d/%d: UNEXPECTED ERROR: %s",
                                   batch_index, total_batches, exc)
                         result, error_type = None, "exhausted_retries"
+                        verdict = {"verified": False, "verdict": "error",
+                                   "rounds": 0, "mechanical": 0,
+                                   "challenges": 0, "residual": 0}
                     batch_chunks_ = batch_by_index[batch_index]
                     batch_id = batch_ids[batch_index]
                     step_label = batch_labels[batch_index]
@@ -657,8 +1168,48 @@ class GraphOrchestrator:
                         # Record result
                         chunk_ids = [ch.id for ch in batch_chunks_]
                         stats = record_result(
-                            self.graph_db, book_id, chapter_node_ids, chunk_ids, result
+                            self.graph_db, book_id, chapter_node_ids, chunk_ids, result,
+                            batch_id=batch_id,
+                            vocabulary=kind_vocab, key_characters=key_chars,
+                            # 锚点首现块由系统算（见 recorder._first_mention）——
+                            # 模型填的是 evidence 所在块，证伪器为此报了 14 条质疑。
+                            chunk_text={ch.id: (ch.content or "")
+                                        for ch in batch_chunks_},
                         )
+                        # 每块一句话 —— 与图谱同源、落在 books.db（见
+                        # ``bookgraph/chunk_summary``）。漏写的块记下来，
+                        # 补录脚本按空值扫，不在这里重烧一轮提取。
+                        summaries = summaries_from_result(result, chunk_ids)
+                        if summaries:
+                            self.books_db.set_chunk_summaries(summaries)
+                            miss = missing_ids(chunk_ids, summaries)
+                            if miss:
+                                log.warning(
+                                    "Batch %d/%d 简述 %d/%d，漏 %d 块"
+                                    "（可由 scripts/backfill_chunk_summaries.py 补）",
+                                    batch_index, total_batches, len(summaries),
+                                    len(chunk_ids), len(miss))
+                        else:
+                            log.warning(
+                                "Batch %d/%d 没有返回 chunk_summaries —— 这 %d 块"
+                                "检索时退回原文", batch_index, total_batches,
+                                len(chunk_ids))
+                        # 缺陷清单落进度行 —— P4 按批回炉时从这里取。
+                        # 「沉默不是成功」：孤儿、漂移、词表外都要看得见。
+                        defects = {
+                            "orphan_dropped": stats.orphan_dropped[:50],
+                            "kind_drift": stats.kind_drift[:50],
+                            "kind_off_vocab": sorted(set(stats.kind_off_vocab))[:50],
+                            "unresolved_admitted": stats.unresolved_admitted[:50],
+                            "identity_warnings": stats.identity_warnings[:50],
+                        }
+                        if any(defects.values()):
+                            log.info("Batch %d/%d 缺陷: 孤儿丢弃 %d · kind 漂移 %d · "
+                                     "词表外 %d · 兜底建节点 %d",
+                                     batch_index, total_batches,
+                                     len(stats.orphan_dropped), len(stats.kind_drift),
+                                     len(stats.kind_off_vocab),
+                                     len(stats.unresolved_admitted))
                         self.graph_db.record_progress(
                             book_id, batch_id, batch_index, step_label, "done",
                             detail=json.dumps({
@@ -667,9 +1218,36 @@ class GraphOrchestrator:
                                 "new_aliases": stats.new_aliases,
                                 "new_quotes": stats.new_quotes,
                                 "merge_candidates": stats.merge_candidates,
-                            }),
+                                "unresolved": stats.unresolved,
+                                "defects": defects,
+                                "verify": verdict,
+                            }, ensure_ascii=False),
                             run_id=run_id,
                         )
+                        # **沉默不是成功**：没验干净的批次必须看得见，不能混在
+                        # 一堆「完成」里冒充收敛。
+                        if not verdict.get("verified"):
+                            log.warning(
+                                "Batch %d/%d 未经验证（%s，回炉 %d 轮，残余 %d 条）",
+                                batch_index, total_batches,
+                                verdict.get("verdict"), verdict.get("rounds", 0),
+                                verdict.get("residual", 0))
+                            self.graph_db.record_event(
+                                book_id, "batch_unverified",
+                                step_label=f"第 {batch_index} 批未经验证 · "
+                                           f"{verdict.get('verdict')}",
+                                detail=json.dumps({
+                                    "batch_index": batch_index,
+                                    "batch_id": batch_id,
+                                    "verify": verdict,
+                                }, ensure_ascii=False), run_id=run_id)
+                            self._emit(progress_cb, {
+                                "type": "batch_unverified", "book_id": book_id,
+                                "run_id": run_id, "batch_id": batch_id,
+                                "batch_index": batch_index,
+                                "total_batches": total_batches,
+                                "verify": verdict,
+                            })
 
                         done_now = self.graph_db.done_count(book_id)
                         log.info(
@@ -750,6 +1328,107 @@ class GraphOrchestrator:
             batch_stats=batch_stats,
             scout_plan=scout_plan,
         )
+
+    async def _run_skeleton_phase(self, session, book, chapter_titles: dict,
+                                  chunks: list, run_id: str, progress_cb,
+                                  book_context: dict | None = None) -> dict:
+        """跑骨架趟：按章切组、逐组提取、合并落库。
+
+        分组而不是一次喂完整本，是为了长书也不爆上下文；组间用**已确认的
+        实体名册**串起来（后一组沿前一组的叫法），与批次提取器同一条约束。
+        """
+        blocks: list[tuple[int, str, str]] = []
+        cur_idx = None
+        buf: list[str] = []
+        for ch in sorted(chunks, key=lambda c: (c.chapter_index, c.chunk_index)):
+            if ch.chapter_index != cur_idx:
+                if cur_idx is not None:
+                    blocks.append((cur_idx, chapter_titles.get(cur_idx, ""),
+                                   "\n".join(buf)))
+                cur_idx = ch.chapter_index
+                buf = []
+            buf.append(ch.content or "")
+        if cur_idx is not None:
+            blocks.append((cur_idx, chapter_titles.get(cur_idx, ""),
+                           "\n".join(buf)))
+
+        groups = group_chapters(blocks)
+        self._emit(progress_cb, {
+            "type": "skeleton_start", "book_id": book.id, "run_id": run_id,
+            "groups": len(groups), "chapters": len(blocks),
+        })
+        self.graph_db.record_event(
+            book.id, "skeleton_start",
+            step_label=f"骨架趟 · {len(blocks)} 章 / {len(groups)} 组",
+            run_id=run_id)
+
+        entities: list[dict] = []
+        relations: list[dict] = []
+        seen: set[str] = set()
+        notes: list[str] = []
+        for i, group in enumerate(groups, 1):
+            roster = sorted(seen)
+            parsed = await run_skeleton(
+                session, self.config, book.title, book.author or "", group,
+                roster=roster, part=i, total_parts=len(groups),
+                collection=((book_context or {}).get("narrative_structure")
+                            == "collection"),
+                log_cb=self._skeleton_log_cb(book, run_id, i),
+            )
+            if parsed is None:
+                notes.append(f"第 {i} 组无结果")
+                continue
+            es, rs, ns = normalize_skeleton(parsed)
+            notes.extend(ns)
+            for e in es:
+                if e["name"] not in seen:
+                    seen.add(e["name"])
+                    entities.append(e)
+            relations.extend(rs)
+
+        stats = record_skeleton(self.graph_db, book.id, entities, relations,
+                                [{"chunk_id": c.id,
+                                  "chapter_index": c.chapter_index,
+                                  "content": c.content or ""}
+                                 for c in chunks])
+        stats["notes"] = notes[:20]
+        stats["groups"] = len(groups)
+        # **空骨架不是成功。** 实测一次跑里骨架调用被限流打掉，落库的是
+        # 「实体 0 · 别名 0 · 关系 0」，事件台账却写 `done` —— 下游只看到
+        # 「这本书没有人物」。失败要能一眼看出来。
+        stats["ok"] = bool(entities or relations)
+        if not stats["ok"]:
+            log.error("骨架趟产出为空：%d 组全部失败（%s）—— 后续批次没有"
+                      "规范名与亲缘边", len(groups), "; ".join(notes[:3]))
+        if stats.get("evidence_unverified"):
+            # 骨架关系不过裁决环，这里是它唯一的体检口。
+            log.warning("骨架趟有 %d/%d 条关系的证据不是逐字原文（例：%s）",
+                        len(stats["evidence_unverified"]), stats["relations"],
+                        stats["evidence_unverified"][0])
+        self.graph_db.record_event(
+            book.id, "skeleton_done",
+            step_label=(f"骨架{'（失败）' if not stats['ok'] else ''} · "
+                        f"实体 {stats['entities']} · 别名 {stats['aliases']}"
+                        f" · 关系 {stats['relations']}"),
+            detail=json.dumps(stats, ensure_ascii=False), run_id=run_id)
+        self._emit(progress_cb, {
+            "type": "skeleton_done", "book_id": book.id, "run_id": run_id,
+            "detail": {k: v for k, v in stats.items() if k != "notes"},
+        })
+        log.info("Skeleton: %s", stats)
+        return stats
+
+    def _skeleton_log_cb(self, book, run_id: str, part: int):
+        def _cb(fields: dict) -> None:
+            log_llm_call(
+                self.graph_db, self._jsonl_path,
+                book_id=book.id, book_title=book.title, run_id=run_id,
+                phase="skeleton", batch_id=f"skeleton-{part}",
+                batch_index=part, chunk_ids=[], total_chunks=0,
+                model=config_for(self.config,
+                                 "bookgraph.skeleton").model, **fields,
+            )
+        return _cb
 
     def _emit(self, cb: ProgressCallback | None, event: dict):
         """Safely call progress callback."""

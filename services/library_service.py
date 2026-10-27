@@ -225,7 +225,9 @@ def _classify_chapter(
     postscript, appendix, bibliography, index, notes.
 
     Priority:
-      1. *structural_type* (L1/L3 signal) — any valid enum wins directly.
+      1. *structural_type* (L1/L3 signal) — a valid non-body enum wins
+         directly; ``"body"`` carries no information and falls through to
+         the label rules below.
       2. Label keywords: prefix-anchored multi-char hints, suffix rules for
          modifier-prefixed titles, then exact-title matches for ambiguous
          single chars ("序", "跋", "注").
@@ -238,7 +240,11 @@ def _classify_chapter(
     ``total <= 0`` (unknown chapter count) skips positional checks, matching
     the pre-change behaviour for any caller that omits index/total.
     """
-    if structural_type and structural_type in VALID_CHAPTER_TYPES:
+    # "body" 是默认值，本身不含信息 —— 若让它短路，EPUB2 guide 的
+    # type="text"（"正文起点"标记）会把扉页/版权页一起压成正文，白白丢掉
+    # 标签里明确写着的 "扉页"/"版权页"。只有非 body 的结构信号才足以定论。
+    if (structural_type and structural_type in VALID_CHAPTER_TYPES
+            and structural_type != "body"):
         return structural_type
     if not title:
         return "body"
@@ -1069,7 +1075,167 @@ def _write_chapter_content(
     db.insert_chunks_for_chapter(chunk_rows)
 
 
+# ── Chunk recompute（只重算块，不碰章）─────────────────────────────────────
+
+_WS_ANY_RE = re.compile(r"\s+")
+
+
+def reuse_chunk_ids(new_rows: list[BookChunkRow],
+                    old_chunks: list[BookChunkRow]) -> dict:
+    """重导时给**内容没变**的块复用旧主键。纯函数，就地改 ``new_rows`` 的 id。
+
+    为什么必须做：``graph.db`` 把 ``graph_chunks.chunk_id`` 当锚点，边、引文、
+    观察、节点首现全挂在它上面。重导换一批新 id，这些锚点就集体悬空 ——
+    实测 9 本里 8 本交集为 0（人类简史 122/312、大棋局 55/144 事后也救不回来，
+    因为章都重切了）。
+
+    判据只有一条：**同坐标 + 逐字节相同**。重导的两边都是同一个文件解析出来的，
+    内容没变就是同一个块。
+
+    **不做** ``_plan_chunk_rebuild`` 的「空白等价」那一档：那一档是为了不把用户
+    改过的正文按新解析结果覆盖；这里两边同源，多一档只会把**真的变了**的块也
+    钉在旧主键上，反而把新内容塞进旧身份。
+    """
+    old_by_key = {(c.chapter_index, c.chunk_index): c for c in old_chunks}
+    reused = fresh = 0
+    new_keys: set[tuple[int, int]] = set()
+    for row in new_rows:
+        key = (row.chapter_index, row.chunk_index)
+        new_keys.add(key)
+        prev = old_by_key.get(key)
+        if prev is not None and prev.content == row.content:
+            row.id = prev.id
+            reused += 1
+        else:
+            fresh += 1
+    disappeared = sorted(k for k in old_by_key if k not in new_keys)
+    return {"reused": reused, "fresh": fresh,
+            "old": len(old_chunks), "disappeared": disappeared}
+
+
+def _plan_chunk_rebuild(
+    book_id: str,
+    chapters: list[BookChapterRow],
+    old_chunks: list[BookChunkRow],
+) -> tuple[list[BookChunkRow], dict]:
+    """纯函数：按章正文重算块，主键能复用就复用。不写库。
+
+    分块走 :func:`_build_chunks_for_chapter` —— 与导入完全同一个算法，所以
+    对未经改动的书，重算结果是恒等的（全库实测 4447 块逐字节相同）。
+
+    主键策略分三档，中间那档是必需的：
+
+    * 同坐标 + **逐字节相同** → 复用整行（含 ``id`` 与 ``paragraph_sigs``）
+    * 同坐标 + **规范化等价**（去掉全部空白后相同）→ **整行原样保留**
+    * 其余 → 新行、新主键
+
+    第二档挡的是既有正文污染：``_extract_paragraphs`` 会对每段 ``strip()``，
+    而 ``大棋局`` 的正文里带 ``\\r`` 残字、``地下室手记`` 的居中段带
+    ``_format_html`` 给的两个空格缩进前缀 —— 直接按新结果覆盖会**静默改写
+    这 7 章正文**，并让 4 个块换主键（图谱变孤儿）。等价即不动。
+
+    换主键是有代价的：图谱库把 ``graph_chunks.chunk_id`` 当主键，边、引文、
+    角色首次出场都挂在它上面。所以 ``new_pk`` 与 ``disappeared`` 必须报出来。
+    """
+    old_by_key = {(c.chapter_index, c.chunk_index): c for c in old_chunks}
+    new_rows: list[BookChunkRow] = []
+    new_keys: set[tuple[int, int]] = set()
+    identical_pk = equivalent_kept = new_pk = 0
+
+    for ch in chapters:
+        for row in _build_chunks_for_chapter(book_id, ch.chapter_index, ch.content):
+            key = (row.chapter_index, row.chunk_index)
+            new_keys.add(key)
+            prev = old_by_key.get(key)
+            if prev is None:
+                new_pk += 1
+            elif prev.content == row.content:
+                row.id = prev.id
+                row.paragraph_sigs = prev.paragraph_sigs
+                identical_pk += 1
+            elif _WS_ANY_RE.sub("", prev.content) == _WS_ANY_RE.sub("", row.content):
+                # 只差空白 —— 保留旧行原样，一个字节都不改
+                new_rows.append(prev)
+                equivalent_kept += 1
+                continue
+            else:
+                new_pk += 1
+            new_rows.append(row)
+
+    disappeared = sorted(k for k in old_by_key if k not in new_keys)
+    stats = {
+        "book_id": book_id,
+        "chapters": len(chapters),
+        "old_chunks": len(old_chunks),
+        "new_chunks": len(new_rows),
+        "identical_pk": identical_pk,
+        "equivalent_kept": equivalent_kept,
+        "new_pk": new_pk,
+        "disappeared": disappeared,
+    }
+    return new_rows, stats
+
+
+def recompute_book_chunks(db: BookDB, book_id: str, *, dry_run: bool = True) -> dict:
+    """只重算某本书的 ``book_chunks``，**完全不碰 ``book_chapters``**。
+
+    章号不变，所以批注（坐标在章级）、阅读进度、图谱的章级引用都不受影响；
+    块级只有 ``new_pk`` / ``disappeared`` 那部分会漂。
+
+    这是独立通道，**没有**接进 clean / edit / replace / rollback / split /
+    remove 这六条会改章正文的路径（那六条的脱节见
+    ``docs/import-subagent/README.md`` 的「已知漂移」一节）。
+    """
+    chapters = db.get_chapters(book_id)
+    old_chunks = db.get_chunks(book_id)
+    new_rows, stats = _plan_chunk_rebuild(book_id, chapters, old_chunks)
+    stats["dry_run"] = dry_run
+    if dry_run:
+        return stats
+    if new_rows:
+        db.insert_chunks(new_rows)          # 先删全书再插 + 事务 + FTS 触发器同步
+    elif old_chunks:
+        db.delete_chunks_for_book(book_id)  # insert_chunks([]) 会空转，不删旧块
+    return stats
+
+
 # ── Content Fingerprint Matching ────────────────────────────────────────
+
+
+def _fingerprint_variants(page_text: str) -> list[str]:
+    """Build whitespace-normalized fingerprint variants for chunk matching.
+
+    The viewport-top extractor can prepend things the stored chunk never
+    carries (a bare page number, ``第一章　乐园``, or a bare ``二十四章``
+    heading). Each variant removes one of those prefixes; all are tried
+    against the DB content. Variants are only added when enough text
+    remains, so stripping can't degenerate into a meaningless substring.
+    """
+    fingerprint = _norm_ws(page_text)[:80]
+    variants = [fingerprint]
+
+    # Leading page number / punctuation ("1 我是一个…", "3、要知道…").
+    fp_stripped = re.sub(r"^[\d\s.、,，:：\-—–]+", "", fingerprint)
+    if len(fp_stripped) >= 20 and fp_stripped != fingerprint:
+        variants.append(fp_stripped)
+
+    # "第<num>[章节卷篇回] <title>" — heading + short title.
+    heading_re = re.compile(
+        r"^第[0-9一二三四五六七八九十百千零两]+[章节卷篇回]\s*[^\s]{0,12}\s*"
+    )
+    # "二十四章 " — number heading without 第 (e.g. 道德经 chapter titles
+    # live in the EPUB heading but not in the stored chunk body). Strip only
+    # the marker — never the following 12 chars, which may be body text.
+    number_heading_re = re.compile(
+        r"^(?:第)?[0-9一二三四五六七八九十百千零两]+[章节卷篇回]\s*"
+    )
+    for base in (fingerprint, fp_stripped):
+        for rx in (heading_re, number_heading_re):
+            stripped = rx.sub("", base)
+            if stripped != base and len(stripped) >= 20 \
+                    and stripped not in variants:
+                variants.append(stripped)
+    return variants
 
 
 def match_page_text(
@@ -1104,37 +1270,9 @@ def match_page_text(
     # joins paragraphs with "\\n\\n" while browser-rendered text uses
     # single newlines/spaces — raw substring matching would miss every
     # fingerprint spanning a paragraph boundary (native reader).
-    fingerprint = _norm_ws(page_text)[:80]
-
-    # Variant with the leading numbering stripped: the native reader's
-    # viewport-top text can include the chapter-number heading
-    # ("1 我是一个有病的人…" / "3 要知道…"), which the DB chunk content
-    # omits — the raw fingerprint then misses EVERY chapter-opening chunk
-    # (observed in reader_sync.log: ch 1/3/8 openings all missed). Only
-    # kept when enough text remains, so a bare page number can't strip
-    # down to a meaningless substring.
-    fp_stripped = re.sub(r"^[\d\s.、,，:：\-—–]+", "", fingerprint)
-    fp_variants = [fingerprint]
-    if len(fp_stripped) >= 20 and fp_stripped != fingerprint:
-        fp_variants.append(fp_stripped)
-
-    # Variant with a Chinese chapter heading stripped. The viewport-top
-    # extractor grabs the first text node whose box crosses the viewport
-    # top — at a chapter opening that node is the <h1> heading
-    # ("第一章　乐园"), so the fingerprint becomes "第一章 乐园 <body text>".
-    # DB chunk content NEVER carries the heading, so these fingerprints
-    # missed 100% of the time (45 of 91 misses in reader_sync.log started
-    # with "第"). The numeric-strip rule above can't help — the heading is
-    # Chinese. Strip "第<num>[章节卷篇回] <title>" (title ≤12 chars, no
-    # space) so the surviving body text matches chunk 0.
-    _heading_re = re.compile(
-        r"^第[0-9一二三四五六七八九十百千零两]+[章节卷篇回]\s*[^\s]{0,12}\s*"
-    )
-    for base in (fingerprint, fp_stripped):
-        head_stripped = _heading_re.sub("", base)
-        if head_stripped != base and len(head_stripped) >= 20 \
-                and head_stripped not in fp_variants:
-            fp_variants.append(head_stripped)
+    # Prefix variants (page number / chapter heading) are shared with
+    # ``match_in_chapters`` — see :func:`_fingerprint_variants`.
+    fp_variants = _fingerprint_variants(page_text)
 
     # Layer 1: find chapter by title substring match; hint overrides it.
     candidates = db.get_chapters(book_id)
@@ -1169,18 +1307,18 @@ def match_page_text(
 
     # Layer 2: scan chunks in the matched/hint chapter for fingerprint
     chunks = db.get_chunks(book_id, matched_chapter)
-    for ck in chunks:
-        if _fp_hit(fp_variants, ck.content):
-            return {
-                "book_id": book_id,
-                "chapter_index": ck.chapter_index,
-                "chunk_index": ck.chunk_index,
-                "chapter_title": next(
-                    (ch.title for ch in candidates
-                     if ch.chapter_index == ck.chapter_index), ""
-                ),
-                "total_chunks": len(chunks),
-            }
+    hit = _find_chunk_by_fp(chunks, fp_variants)
+    if hit:
+        return {
+            "book_id": book_id,
+            "chapter_index": hit.chapter_index,
+            "chunk_index": hit.chunk_index,
+            "chapter_title": next(
+                (ch.title for ch in candidates
+                 if ch.chapter_index == hit.chapter_index), ""
+            ),
+            "total_chunks": len(chunks),
+        }
 
     # Layer 3: fallback — search remaining chapters, nearest-first from the
     # hint. Unconditional: the native reader sends an empty chapter_title
@@ -1191,18 +1329,18 @@ def match_page_text(
         if ch_idx == matched_chapter:
             continue
         ch_chunks = _to_chunks(ch_idx)
-        for ck in ch_chunks:
-            if _fp_hit(fp_variants, ck.content):
-                return {
-                    "book_id": book_id,
-                    "chapter_index": ck.chapter_index,
-                    "chunk_index": ck.chunk_index,
-                    "chapter_title": next(
-                        (ch.title for ch in candidates
-                         if ch.chapter_index == ch_idx), ""
-                    ),
-                    "total_chunks": len(ch_chunks),
-                }
+        hit = _find_chunk_by_fp(ch_chunks, fp_variants)
+        if hit:
+            return {
+                "book_id": book_id,
+                "chapter_index": hit.chapter_index,
+                "chunk_index": hit.chunk_index,
+                "chapter_title": next(
+                    (ch.title for ch in candidates
+                     if ch.chapter_index == ch_idx), ""
+                ),
+                "total_chunks": len(ch_chunks),
+            }
 
     # Layer 4: try shorter fingerprint (same nearest-first order)
     short_variants = []
@@ -1212,19 +1350,72 @@ def match_page_text(
             short_variants.append(sv)
     for ch_idx in _chapter_scan_order():
         ch_chunks = _to_chunks(ch_idx)
-        for ck in ch_chunks:
-            if _fp_hit(short_variants, ck.content):
-                return {
-                    "book_id": book_id,
-                    "chapter_index": ck.chapter_index,
-                    "chunk_index": ck.chunk_index,
-                    "chapter_title": next(
-                        (ch.title for ch in candidates
-                         if ch.chapter_index == ch_idx), ""
-                    ),
-                    "total_chunks": len(ch_chunks),
-                }
+        hit = _find_chunk_by_fp(ch_chunks, short_variants)
+        if hit:
+            return {
+                "book_id": book_id,
+                "chapter_index": hit.chapter_index,
+                "chunk_index": hit.chunk_index,
+                "chapter_title": next(
+                    (ch.title for ch in candidates
+                     if ch.chapter_index == ch_idx), ""
+                ),
+                "total_chunks": len(ch_chunks),
+            }
 
+    return None
+
+
+def match_in_chapters(
+    db: BookDB,
+    book_id: str,
+    chapters: list[int],
+    page_text: str,
+    hint: tuple[int, int] | None = None,
+) -> dict | None:
+    """Fingerprint-match inside an explicit chapter scope.
+
+    Used when the renderer supplies a structural coordinate (epub section /
+    spine index): the section decides the chapter **set**, the text decides
+    the **chunk**. Deliberately separate from :func:`match_page_text` — that
+    function lets *hint* override the chapter, which is exactly how a
+    viewport-top fingerprint at a chapter boundary traps progress in the
+    previous chapter (observed: screen on ch24, position stuck on ch23).
+
+    Returns None if the fingerprint doesn't match any scoped chapter.
+    """
+    if not page_text.strip() or not chapters:
+        return None
+    variants = _fingerprint_variants(page_text)
+    order = list(dict.fromkeys(int(c) for c in chapters))
+    if hint and hint[0] is not None:
+        order.sort(key=lambda i: abs(i - hint[0]))
+
+    titles = {ch.chapter_index: ch.title for ch in db.get_chapters(book_id)}
+
+    def _result(hit, total: int) -> dict:
+        return {
+            "book_id": book_id,
+            "chapter_index": hit.chapter_index,
+            "chunk_index": hit.chunk_index,
+            "chapter_title": titles.get(hit.chapter_index, ""),
+            "total_chunks": total,
+        }
+
+    for ch_idx in order:
+        chunks = db.get_chunks(book_id, ch_idx)
+        hit = _find_chunk_by_fp(chunks, variants)
+        if hit:
+            return _result(hit, len(chunks))
+
+    # Last resort: 40-char fingerprint, same scope.
+    short = list(dict.fromkeys(v[:40] for v in variants if len(v) >= 20))
+    if short:
+        for ch_idx in order:
+            chunks = db.get_chunks(book_id, ch_idx)
+            hit = _find_chunk_by_fp(chunks, short)
+            if hit:
+                return _result(hit, len(chunks))
     return None
 
 
@@ -1232,6 +1423,39 @@ def _fp_hit(variants: list[str], content: str) -> bool:
     """True if any fingerprint variant is a substring of the chunk."""
     norm = _norm_ws(content)
     return any(v in norm for v in variants)
+
+
+def _find_chunk_by_fp(chunks: list, variants: list[str]):
+    """在块序列里按指纹找块；命中返回该块，否则 None。
+
+    两级判据：
+    1. 单块包含 —— 常规情形（滚动中视口顶落在块内部）。
+    2. **跨块拼接** —— 视口顶文本横跨相邻两块。这不是异常：`jumpToAnchor`
+       刻意把目标块的**块首**对齐到视口顶（还留 24px 边距），顶行天然就是
+       「上一块的尾巴 + 这一块的开头」。单块包含判据对这种情况**恒 miss**，
+       于是跳转落点被判成"未命中"：示数不回刷、进度不落库，退回跳转前的
+       旧章（实测《窄门》ch20 ck5 的跳转：指纹 = ck4 尾「…5月27日」+ ck5
+       首「为何要欺骗自己呢？…」，ck4 与 ck5 都不含整串）。
+       拼接后定位偏移、再映射回所在块，命中的是**包含视口顶那一段**的块。
+    """
+    for ck in chunks:
+        if _fp_hit(variants, ck.content):
+            return ck
+    if len(chunks) < 2:
+        return None
+    norm = [_norm_ws(c.content) for c in chunks]
+    joined = " ".join(norm)
+    for v in variants:
+        at = joined.find(v)
+        if at < 0:
+            continue
+        acc = 0
+        for c, txt in zip(chunks, norm):
+            end = acc + len(txt)
+            if acc <= at <= end:
+                return c
+            acc = end + 1                    # +1：拼接用的那个空格
+    return None
 
 
 _NORM_WS = re.compile(r"\s+")

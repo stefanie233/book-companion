@@ -18,14 +18,21 @@ from storage.models import (
     BOOK_DDL,
     CHUNK_PARAGRAPH_ALTERS,
     CHUNK_SIG_ALTERS,
+    CHUNK_SUMMARY_ALTERS,
     CREATE_ANNOTATIONS,
     CREATE_BOOK_CHUNKS,
     CREATE_BOOK_FTS,
     CREATE_BOOK_FTS_TRIGGERS,
+    CREATE_BOOK_TEXT_FORMS,
     CREATE_CHAPTER_OVERRIDES,
     CREATE_IMPORT_LOG,
     CREATE_READING_SESSIONS,
     MIGRATE_FTS_TO_CHUNKS,
+    ALTER_CHAPTERS_HEADING_TAG,
+    ALTER_CHAPTERS_IN_TOC,
+    ALTER_CHAPTERS_LEVEL,
+    ALTER_CHAPTERS_PARENT_INDEX,
+    ALTER_CHAPTERS_SPINE_INDEX,
     ALTER_CHAPTERS_TYPE,
     TABLE_ANNOTATIONS,
     TABLE_BOOK_CATEGORIES,
@@ -34,6 +41,7 @@ from storage.models import (
     TABLE_BOOK_FTS,
     TABLE_BOOK_VERSIONS,
     TABLE_BOOKS,
+    TABLE_BOOK_TEXT_FORMS,
     TABLE_CHAPTER_OVERRIDES,
     TABLE_IMPORT_LOG,
     TABLE_READING_SESSIONS,
@@ -108,6 +116,24 @@ _BOOK_MIGRATIONS: list[tuple[int, str, str | list[str]]] = [
      list(CHUNK_SIG_ALTERS)),
     (19, "Chapter-type overrides: human review layer over import/AI chapter_type",
      [CREATE_CHAPTER_OVERRIDES]),
+    # 版本号必须递增取新值：判定是 ver > current_version，编号重复会被静默跳过。
+    # 默认值必须是常量 —— 非恒定默认值（strftime 之类）会让旧库直接打不开。
+    (20, "Shelf: custom order + last opened timestamp", [
+        "ALTER TABLE books ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE books ADD COLUMN last_opened_at INTEGER NOT NULL DEFAULT 0",
+    ]),
+    (21, "Text forms: 正文内部文本形态（导入分析子代理产出）",
+     [CREATE_BOOK_TEXT_FORMS]),
+    (22, "Import structure: 章出自哪个 spine 文件 + 在书目录树里的层级", [
+        ALTER_CHAPTERS_SPINE_INDEX,
+        ALTER_CHAPTERS_LEVEL,
+        ALTER_CHAPTERS_PARENT_INDEX,
+    ]),
+    (23, "Heading structure: 标题标签名 + 是否书目录的正式条目", [
+        ALTER_CHAPTERS_HEADING_TAG,
+        ALTER_CHAPTERS_IN_TOC,
+    ]),
+    (24, "Chunk summaries: bookgraph 产出的每块一句话", list(CHUNK_SUMMARY_ALTERS)),
 ]
 
 
@@ -131,16 +157,25 @@ class BookDB(BaseDatabase):
         """Insert or replace a book (same source_path = re-import)."""
         now = _now_ms()
         conn = self.get_conn()
+        # INSERT OR REPLACE 是「先删再插」：没写进语句的列会掉回 DDL 默认值。
+        # sort_order / last_opened_at 是用户侧状态（书架自定义排位、打开时间），
+        # 重导入时必须沿用旧值，否则书会莫名跳到自定义顺序末尾、打开时间归零。
+        prev = conn.execute(
+            f"SELECT sort_order, last_opened_at FROM {TABLE_BOOKS} WHERE id=?;",
+            (row.id,),
+        ).fetchone()
+        prev_sort, prev_opened = (prev[0], prev[1]) if prev else (0, 0)
         conn.execute(
             f"""INSERT OR REPLACE INTO {TABLE_BOOKS}
                 (id, title, author, author_nationality, format, source_path,
                  category_id, metadata_json, chapter_count, total_chars,
-                 status, time_created, time_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+                 status, time_created, time_updated, sort_order, last_opened_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
             (row.id, row.title, row.author, row.author_nationality, row.format,
              row.source_path, row.category_id, row.metadata_json,
              row.chapter_count, row.total_chars, row.status,
-             row.time_created or now, now),
+             row.time_created or now, now,
+             row.sort_order or prev_sort, prev_opened),
         )
         conn.commit()
         return row.id
@@ -159,10 +194,14 @@ class BookDB(BaseDatabase):
             for ch in chapters:
                 conn.execute(
                     f"""INSERT INTO {TABLE_BOOK_CHAPTERS}
-                        (id, book_id, chapter_index, title, content, char_count, status, chapter_type)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?);""",
+                        (id, book_id, chapter_index, title, content, char_count,
+                         status, chapter_type, spine_index, level, parent_index,
+                         heading_tag, in_toc)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
                     (ch.id, ch.book_id, ch.chapter_index, ch.title,
-                     ch.content, ch.char_count, ch.status, ch.chapter_type),
+                     ch.content, ch.char_count, ch.status, ch.chapter_type,
+                     ch.spine_index, ch.level, ch.parent_index,
+                     ch.heading_tag, ch.in_toc),
                 )
             conn.execute("COMMIT;")
         except Exception:
@@ -199,6 +238,40 @@ class BookDB(BaseDatabase):
             params + [limit],
         )
         return [BookRow(**dict(r)) for r in cur.fetchall()]
+
+    def set_book_order(self, ids: list[str]) -> int:
+        """Overwrite the shelf custom order from an explicit id list.
+
+        Position is the array index + 1, so 0 stays reserved for "never
+        ranked" (a book that has never taken part in a manual arrangement).
+        Unknown ids are harmless — the UPDATE simply matches no row.
+        """
+        if not ids:
+            return 0
+        conn = self.get_conn()
+        before = conn.total_changes
+        conn.execute("BEGIN;")
+        try:
+            for pos, book_id in enumerate(ids, start=1):
+                conn.execute(
+                    f"UPDATE {TABLE_BOOKS} SET sort_order=? WHERE id=?;",
+                    (pos, book_id),
+                )
+            conn.execute("COMMIT;")
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+        # 实际改到的行数（不存在的 id 匹配不到行，不该算进去）
+        return conn.total_changes - before
+
+    def touch_book_opened(self, book_id: str) -> None:
+        """Stamp 'last opened' — called when a book is opened for reading."""
+        conn = self.get_conn()
+        conn.execute(
+            f"UPDATE {TABLE_BOOKS} SET last_opened_at=? WHERE id=?;",
+            (_now_ms(), book_id),
+        )
+        conn.commit()
 
     def get_chapters(self, book_id: str) -> list[BookChapterRow]:
         conn = self.get_conn()
@@ -244,6 +317,22 @@ class BookDB(BaseDatabase):
         if chapter_index in over:
             ch.chapter_type = over[chapter_index]
         return ch
+
+    def get_chapters_by_spine(self, book_id: str,
+                              spine_index: int) -> list[BookChapterRow]:
+        """Chapters produced by one EPUB spine item.
+
+        A spine item can yield multiple DB chapters (split inside one XHTML
+        file); legacy imports leave spine_index=-1. Callers use this as a
+        *scope*, then refine with the text fingerprint.
+        """
+        conn = self.get_conn()
+        cur = conn.execute(
+            f"SELECT * FROM {TABLE_BOOK_CHAPTERS} "
+            "WHERE book_id=? AND spine_index=? ORDER BY chapter_index ASC;",
+            (book_id, int(spine_index)),
+        )
+        return [BookChapterRow(**dict(r)) for r in cur.fetchall()]
 
     def _get_chapter_overrides(self, book_id: str) -> dict[int, str]:
         """Load all overrides for a book as {chapter_index: chapter_type}."""
@@ -293,8 +382,16 @@ class BookDB(BaseDatabase):
             return {}
 
     def set_chapter_override(self, book_id: str, chapter_index: int,
-                             chapter_type: str, *, note: str = "") -> None:
-        """Upsert a human override — 覆盖层便利贴。写入/更新即时生效。"""
+                             chapter_type: str, *, note: str = "",
+                             source: str = "manual") -> None:
+        """Upsert 覆盖层便利贴 — 人工或 agent 的判断，写入/更新即时生效。
+
+        ``source`` 区分是谁盖的（'manual' 人手 / 'agent' 导入分析子代理），
+        :meth:`clear_chapter_override` 可按来源单撕一层。
+
+        agent 不覆盖人工：``source='agent'`` 撞上已有 'manual' 时整条跳过
+        （upsert 的 DO UPDATE 带 WHERE），人手的判断始终压得住机器。
+        """
         now = _now_ms()
         conn = self.get_conn()
         conn.execute(
@@ -303,8 +400,10 @@ class BookDB(BaseDatabase):
             " time_created, time_updated) VALUES (?,?,?,?,?,?,?) "
             "ON CONFLICT(book_id, chapter_index) DO UPDATE SET "
             " chapter_type=excluded.chapter_type, note=excluded.note, "
-            " time_updated=excluded.time_updated;",
-            (book_id, chapter_index, chapter_type, note, "manual", now, now),
+            " source=excluded.source, time_updated=excluded.time_updated "
+            f" WHERE NOT (excluded.source = 'agent' "
+            f" AND {TABLE_CHAPTER_OVERRIDES}.source = 'manual');",
+            (book_id, chapter_index, chapter_type, note, source, now, now),
         )
         conn.commit()
 
@@ -328,6 +427,53 @@ class BookDB(BaseDatabase):
                 (book_id, chapter_index, source),
             )
         conn.commit()
+
+    def clear_agent_layer(self, book_id: str) -> tuple[int, int]:
+        """清掉该书 agent 落的全部覆盖层与文本形态，返回 (章节数, 形态数)。
+
+        落库是**全量替换**语义：agent 每次跑出的判断集合未必相同，增量写会
+        留下上一次的残影 —— 旧逻辑推断出的 body 条目就这样残留过。
+        """
+        conn = self.get_conn()
+        n1 = conn.execute(
+            f"DELETE FROM {TABLE_CHAPTER_OVERRIDES} "
+            "WHERE book_id=? AND source='agent';", (book_id,)).rowcount
+        n2 = conn.execute(
+            f"DELETE FROM {TABLE_BOOK_TEXT_FORMS} "
+            "WHERE book_id=? AND source='agent';", (book_id,)).rowcount
+        conn.commit()
+        return n1, n2
+
+    # ── Text forms（正文内部的文本形态）──────────────────────────────────
+
+    def set_text_form(self, book_id: str, selector: str, name: str,
+                      evidence: str = "", *, source: str = "agent") -> None:
+        """Upsert 一条文本形态。来源语义与章节覆盖层一致：agent 压不过人手。"""
+        now = _now_ms()
+        conn = self.get_conn()
+        conn.execute(
+            f"INSERT INTO {TABLE_BOOK_TEXT_FORMS} "
+            "(book_id, selector, name, evidence, source, "
+            " time_created, time_updated) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(book_id, selector) DO UPDATE SET "
+            " name=excluded.name, evidence=excluded.evidence, "
+            " source=excluded.source, time_updated=excluded.time_updated "
+            f" WHERE NOT (excluded.source = 'agent' "
+            f" AND {TABLE_BOOK_TEXT_FORMS}.source = 'manual');",
+            (book_id, selector, name, evidence, source, now, now),
+        )
+        conn.commit()
+
+    def list_text_forms(self, book_id: str) -> list[dict]:
+        """该书判出的全部文本形态（旧库尚未迁移时优雅降级为空）。"""
+        conn = self.get_conn()
+        try:
+            cur = conn.execute(
+                f"SELECT * FROM {TABLE_BOOK_TEXT_FORMS} WHERE book_id=? "
+                "ORDER BY time_created ASC;", (book_id,))
+            return [dict(r) for r in cur.fetchall()]
+        except sqlite3.OperationalError:
+            return []
 
     def update_chapter(self, book_id: str, chapter_index: int,
                        content: str | None = None, char_count: int | None = None,
@@ -376,20 +522,36 @@ class BookDB(BaseDatabase):
         conn.execute("BEGIN;")
         try:
             book_id = chunks[0].book_id
+            # 重导 / 重切会先删后插，而简述是**付费产物**（bookgraph 一次
+            # 提取才有一份）。坐标与正文逐字相同 = 同一块，直接沿用，
+            # 否则重导一次全书简述全丢。
+            prev = {
+                (r[0], r[1]): (r[2] or "", r[3] or "")
+                for r in conn.execute(
+                    f"SELECT chapter_index, chunk_index, content, summary "
+                    f"FROM {TABLE_BOOK_CHUNKS} WHERE book_id=?;",
+                    (book_id,),
+                )
+            }
             conn.execute(
                 f"DELETE FROM {TABLE_BOOK_CHUNKS} WHERE book_id=?;", (book_id,)
             )
             for ch in chunks:
+                summary = ch.summary or ""
+                if not summary:
+                    old = prev.get((ch.chapter_index, ch.chunk_index))
+                    if old and old[0] == ch.content:
+                        summary = old[1]
                 conn.execute(
                     f"""INSERT INTO {TABLE_BOOK_CHUNKS}
                         (id, book_id, chapter_index, chunk_index, content,
                          char_count, paragraph_count, paragraph_offsets,
-                         paragraph_sigs)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+                         paragraph_sigs, summary)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
                     (ch.id, ch.book_id, ch.chapter_index, ch.chunk_index,
                      ch.content, ch.char_count,
                      ch.paragraph_count, ch.paragraph_offsets,
-                     ch.paragraph_sigs),
+                     ch.paragraph_sigs, summary),
                 )
             conn.execute("COMMIT;")
         except Exception:
@@ -449,6 +611,71 @@ class BookDB(BaseDatabase):
             )
         return cur.fetchone()[0]
 
+    # ── Chunk summaries（bookgraph 产出的「一块一句话」）────────────────
+
+    def set_chunk_summaries(self, items: dict[str, str]) -> int:
+        """写一批 ``{chunk_id: 一句话}``。空串视为「没有」，不覆盖已有值。
+
+        Bookgraph 每批提取完调用一次。**按 id 更新、不按坐标** —— 坐标
+        是导出量，id 才是块的身份（重切后坐标会整体平移）。
+        """
+        pairs = [(text.strip(), cid)
+                 for cid, text in (items or {}).items()
+                 if cid and isinstance(text, str) and text.strip()]
+        if not pairs:
+            return 0
+        conn = self.get_conn()
+        conn.execute("BEGIN;")
+        try:
+            cur = conn.executemany(
+                f"UPDATE {TABLE_BOOK_CHUNKS} SET summary=? "
+                "WHERE id=? AND summary='';",
+                pairs,
+            )
+            # rowcount 是**这条语句**的行数；total_changes 是连接级累计值
+            # （CLAUDE.md「merge_nodes 的搬运范围」踩过：实测报出 4971）。
+            written = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            conn.execute("COMMIT;")
+        except Exception:
+            conn.execute("ROLLBACK;")
+            raise
+        return written
+
+    def get_chunks_missing_summary(self, book_id: str,
+                                   limit: int | None = None) -> list[BookChunkRow]:
+        """取还没有简述的块（补录脚本用），按阅读顺序。"""
+        conn = self.get_conn()
+        sql = (f"SELECT * FROM {TABLE_BOOK_CHUNKS} "
+               "WHERE book_id=? AND (summary IS NULL OR summary='') "
+               "ORDER BY chapter_index ASC, chunk_index ASC")
+        params: list[Any] = [book_id]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        return [BookChunkRow(**dict(r)) for r in conn.execute(sql, params).fetchall()]
+
+    def count_chunks_with_summary(self, book_id: str) -> tuple[int, int]:
+        """``(有简述的块数, 总块数)`` —— 覆盖率是用来看的，不是猜的。"""
+        conn = self.get_conn()
+        row = conn.execute(
+            f"SELECT SUM(CASE WHEN summary<>'' THEN 1 ELSE 0 END), COUNT(*) "
+            f"FROM {TABLE_BOOK_CHUNKS} WHERE book_id=?;",
+            (book_id,),
+        ).fetchone()
+        return int(row[0] or 0), int(row[1] or 0)
+
+    def delete_chunks_for_book(self, book_id: str) -> None:
+        """Delete every chunk of a book.
+
+        Needed because :meth:`insert_chunks` returns early on an empty list
+        and so never clears anything — a rebuild that yields zero chunks
+        would otherwise leave the old ones behind.
+        """
+        conn = self.get_conn()
+        conn.execute(
+            f"DELETE FROM {TABLE_BOOK_CHUNKS} WHERE book_id=?;", (book_id,))
+        conn.commit()
+
     def delete_chunks_for_chapter(self, book_id: str, chapter_index: int) -> None:
         """Delete only the chunks belonging to one chapter.
 
@@ -480,12 +707,12 @@ class BookDB(BaseDatabase):
                     f"""INSERT INTO {TABLE_BOOK_CHUNKS}
                         (id, book_id, chapter_index, chunk_index, content,
                          char_count, paragraph_count, paragraph_offsets,
-                         paragraph_sigs)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+                         paragraph_sigs, summary)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
                     (ch.id, ch.book_id, ch.chapter_index, ch.chunk_index,
                      ch.content, ch.char_count,
                      ch.paragraph_count, ch.paragraph_offsets,
-                     ch.paragraph_sigs),
+                     ch.paragraph_sigs, ch.summary or ""),
                 )
             conn.execute("COMMIT;")
         except Exception:
@@ -629,7 +856,7 @@ class BookDB(BaseDatabase):
                 cur = conn.execute(
                     f"SELECT b.id as book_id, b.title as book_title, "
                     "ch.chapter_index, ch.title as chapter_title, "
-                    "ck.chunk_index, "
+                    "ck.chunk_index, ck.summary, "
                     f"snippet({TABLE_BOOK_FTS}, 0, '…', '…', '…', 40) as snippet "
                     f"FROM {TABLE_BOOK_FTS} "
                     f"JOIN {TABLE_BOOK_CHUNKS} ck ON {TABLE_BOOK_FTS}.rowid = ck.rowid "
@@ -657,7 +884,7 @@ class BookDB(BaseDatabase):
             cur = conn.execute(
                 f"SELECT b.id as book_id, b.title as book_title, "
                 "ch.chapter_index, ch.title as chapter_title, "
-                "ck.chunk_index, ck.content "
+                "ck.chunk_index, ck.summary, ck.content "
                 f"FROM {TABLE_BOOK_CHUNKS} ck "
                 f"JOIN {TABLE_BOOKS} b ON ck.book_id = b.id "
                 f"LEFT JOIN {TABLE_BOOK_CHAPTERS} ch "

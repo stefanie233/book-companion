@@ -6,11 +6,10 @@ Phase 2: Batch LLM judgment (single call, store/skip/update/merge)
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import Any
 
+from llm_json import loads_tolerant
 from memory_pipeline.prompts import L1_DEDUP_SYSTEM_PROMPT, format_dedup_prompt
 
 logger = logging.getLogger(__name__)
@@ -87,6 +86,7 @@ async def dedup_l1(
             user_prompt,
             model=model,
             timeout=timeout,
+            scenario="memory.l1_dedup",
         )
     except Exception as e:
         logger.warning("L1 dedup LLM call failed, defaulting all to store: %s", e)
@@ -104,28 +104,14 @@ def _parse_dedup_result(
     raw: str,
     new_memories: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Parse the LLM JSON response into dedup decisions."""
-    cleaned = raw.strip()
+    """Parse the LLM JSON response into dedup decisions.
 
-    # Strip markdown code block wrappers
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-
-    # Extract JSON array
-    array_match = re.search(r"\[[\s\S]*\]", cleaned)
-    if not array_match:
-        logger.warning("L1 dedup: no JSON array found in response")
-        return _fallback_store_all(new_memories)
-
-    try:
-        parsed = json.loads(array_match.group())
-    except json.JSONDecodeError as e:
-        logger.warning("L1 dedup: JSON parse failed: %s", e)
-        return _fallback_store_all(new_memories)
-
-    if not isinstance(parsed, list):
-        logger.warning("L1 dedup: response is not an array")
+    阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``。失败退回
+    ``_fallback_store_all``（全部当新记忆入库）—— 不丢数据，但重复记忆会累积。
+    """
+    parsed = loads_tolerant(raw, expect=list)
+    if parsed is None:
+        logger.warning("L1 dedup: no parseable JSON array in response")
         return _fallback_store_all(new_memories)
 
     decisions: list[dict[str, Any]] = []

@@ -86,6 +86,27 @@ function _onNativeSelection(cfi, range, contents) {
   const rect = _rangeToViewportRect(range, contents);
   if (!rect) return;
   _sel = { cfi, range, text, contents, doc: range.startContainer.ownerDocument, rect };
+  // Structural coordinates for the chat pipeline: the selection is "already
+  // seen" evidence. `contents.sectionIndex` is the epub spine position; the
+  // backend maps it to DB chapter(s). Do not guess chapter/chunk here —
+  // spine != chapter_index in books with front matter or split chapters.
+  S.selectionSection = contents.sectionIndex;
+  S.selectionCfi = cfi;
+  S.selectionChapter = null;
+  S.selectionChunk = null;
+  // Wider probe around the selection: a word like "杨修" appears in several
+  // chunks; ±context lets the backend pick the one the reader selected.
+  try {
+    const r2 = range.cloneRange();
+    r2.setStart(range.startContainer,
+      Math.max(0, (range.startOffset || 0) - 40));
+    r2.setEnd(range.endContainer,
+      Math.min((range.endContainer.nodeValue || '').length,
+        (range.endOffset || 0) + 120));
+    S.selectionAnchorText = (r2.toString() || text).trim().slice(0, 200);
+  } catch (_) {
+    S.selectionAnchorText = text;
+  }
   // 已在收藏/批注标记内 → 编辑态
   const inCollect = _closestMark(range, '.bc-underline');
   if (inCollect) { _showBar(rect, 'collect-edit', _sel); }

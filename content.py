@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
-# ── Budget constants (Claude Code pattern) ───────────────────────────────
+# ── Budget constants ─────────────────────────────────────────────────────
 
 MAX_RESULT_SIZE_CHARS = 50_000          # Single tool result cap
 MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000  # Per-turn total cap
@@ -36,7 +36,7 @@ class ContentBlock:
     Uses a flat dataclass with optional fields rather than a union/enum
     to keep JSON serialization simple and match the JSONL format.
     """
-    type: Literal["text", "thinking", "tool_use", "tool_result", "voice_input", "voice_output"]
+    type: Literal["text", "thinking", "tool_use", "tool_result", "voice_input", "voice_output", "interrupt"]
     text: str | None = None
     thinking: str | None = None
     signature: str | None = None

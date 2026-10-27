@@ -27,6 +27,11 @@ def _new_id() -> str:
     return str(uuid.uuid4().hex[:16])
 
 
+def _message_text(msg) -> str:
+    """All visible text blocks, concatenated (thinking/tool blocks excluded)."""
+    return "".join(b.text for b in msg.blocks if b.type == "text" and b.text)
+
+
 class SessionService:
     """Manages the full session lifecycle: CRUD, fork, migration."""
 
@@ -87,8 +92,14 @@ class SessionService:
         """Full-text search across session messages (FTS5 + LIKE fallback)."""
         return self._db.search_session_content(query, limit=limit)
 
-    def load_messages(self, session_id: str) -> Session | None:
-        """Full session load: metadata + all messages with parts."""
+    def load_messages(self, session_id: str, *,
+                      dispatch_hooks: bool = True) -> Session | None:
+        """Full session load: metadata + all messages with parts.
+
+        ``dispatch_hooks=False`` is for internal read-only comparisons
+        (legacy fork-point inference) that must not look like a user opened
+        the session.
+        """
         row = self._db.get_session(session_id)
         if not row:
             return None
@@ -130,7 +141,7 @@ class SessionService:
         session._last_persisted_count = len(session.messages)
 
         # on_session_load hook (fire-and-forget)
-        if self._hook_pipeline:
+        if dispatch_hooks and self._hook_pipeline:
             import asyncio
             try:
                 loop = asyncio.get_running_loop()
@@ -195,12 +206,18 @@ class SessionService:
     def append_message(self, session_id: str, message: ConversationMessage,
                         *, mode: str | None = None, title: str | None = None,
                         project_id: str | None = None,
-                        character_name: str | None = None) -> None:
+                        character_name: str | None = None,
+                        role_kind: str | None = None,
+                        role_ref: str | None = None) -> str:
         """Incremental append — one message, no full rewrite.
+
+        Returns the new message id. The chat endpoint hands it back to the
+        browser so a live bubble can be forked from before a page reload.
 
         Updates session's message_count and time_updated along the way.
         If the session row doesn't exist yet, ``mode``, ``title``,
-        ``project_id`` and ``character_name`` are written in the initial INSERT.
+        ``project_id``, ``character_name``, ``role_kind`` and ``role_ref``
+        are written in the initial INSERT.
         """
         # Ensure session row exists (it may have been created in-memory
         # only, deferred from create() to avoid empty-session clutter).
@@ -211,6 +228,8 @@ class SessionService:
                 mode=mode or "immersive",
                 title=title,
                 character_name=character_name or "",
+                role_kind=role_kind or "character",
+                role_ref=role_ref or "",
                 time_created=_now_ms(),
                 time_updated=_now_ms(),
             ))
@@ -241,6 +260,7 @@ class SessionService:
             message_count=self._db.get_message_count(session_id),
             time_updated=_now_ms(),
         )
+        return mid
 
     def update_title(self, session_id: str, title: str) -> None:
         """Derive and persist session title from first user message."""
@@ -310,6 +330,17 @@ class SessionService:
                     end = i if exclusive else i + 1
                     messages_to_copy = parent.messages[:end]
                     break
+        elif fork_point_index is not None:
+            # Fallback for bubbles created in a live session before the
+            # message id reached the browser (old clients / failed response).
+            # fork_point_index is a rendered-row index; for text-only
+            # transcripts that equals the message index. An assistant row
+            # means "重新回复": the preceding user message is re-sent by the
+            # client, so it must not be copied again.
+            end = max(0, min(fork_point_index, len(parent.messages)))
+            if end < len(parent.messages) and parent.messages[end].role == "assistant":
+                end = max(0, end - 1)
+            messages_to_copy = parent.messages[:end]
 
         for msg in messages_to_copy:
             child.messages.append(msg)
@@ -329,6 +360,8 @@ class SessionService:
             mode=child.mode,
             message_count=len(child.messages),
             parent_id=parent_session_id,
+            role_kind=parent_row.role_kind if parent_row else "character",
+            role_ref=parent_row.role_ref if parent_row else "",
             title=child.title,
             time_created=child.created_at_ms,
             time_updated=child.updated_at_ms,
@@ -338,38 +371,154 @@ class SessionService:
         self._insert_messages(child.session_id, child.messages)
         return child
 
+    def _fork_point_of(self, parent_id: str, child_row) -> int | None:
+        """A child's fork index — stored, or inferred for legacy rows.
+
+        ``fork_point_index`` was added after some forks already existed, and
+        those rows carry NULL, so their switcher could never render. Compare
+        the two transcripts and return the first divergent message index.
+
+        The value the frontend needs is a rendered ``.msg`` index. For
+        text-only sessions (every legacy row) one message is one row, so the
+        two are identical; a session with voice output bubbles can drift.
+        A stored index always wins over inference.
+        """
+        if child_row.fork_point_index is not None:
+            return child_row.fork_point_index
+        try:
+            psess = self.load_messages(parent_id, dispatch_hooks=False)
+            csess = self.load_messages(child_row.id, dispatch_hooks=False)
+        except Exception:
+            return None
+        if not psess or not csess:
+            return None
+        pm, cm = psess.messages, csess.messages
+        i = 0
+        while i < len(pm) and i < len(cm):
+            if (pm[i].role != cm[i].role
+                    or _message_text(pm[i]) != _message_text(cm[i])):
+                break
+            i += 1
+        if i >= len(pm) and i >= len(cm):
+            return None  # identical transcripts — no divergence to switch at
+        # The anchor is the message the user forked *from*, not the first
+        # message that happens to differ. When the parent ends exactly at
+        # the fork point, the child re-sent the parent's last message with
+        # identical text (the user pressed pencil and sent without editing),
+        # so the first divergence is the *new child message* one row later.
+        # Anchor back on the parent's last row — i.e. the user's input.
+        # If the child's next message is a *user* message instead, the
+        # last parent message was merely copied (non-exclusive fork); the
+        # anchor is then the new row after it.
+        if i >= len(pm) and i > 0:
+            if i < len(cm) and cm[i].role == "assistant":
+                return i - 1
+        return i
+
     def get_branches(self, session_id: str) -> dict:
         """Return branch info for the frontend switcher.
 
-        {current: {id, title}, parent: {id, title, fork_point_index}|None,
-         children: [{id, title, fork_point_index}, ...]}
+        {current: {id, title, fork_point_index, time_created},
+         parent:  {id, title, fork_point_index, time_created}|None,
+         siblings: [{id, title, fork_point_index, time_created}, ...],
+         children: [{id, title, fork_point_index, time_created}, ...]}
+
+        ``siblings`` are the other children of ``parent``. Without them a
+        fork point with three alternatives only ever showed parent + current
+        (2/2), because ``children`` is keyed on the *current* session.
         """
         cur_row = self._db.get_session(session_id)
         if not cur_row:
-            return {"current": None, "parent": None, "children": []}
+            return {"current": None, "parent": None,
+                    "siblings": [], "children": []}
 
-        current = {"id": cur_row.id, "title": cur_row.title or "(无标题)"}
+        own_idx = (self._fork_point_of(cur_row.parent_id, cur_row)
+                   if cur_row.parent_id else cur_row.fork_point_index)
+        current = {
+            "id": cur_row.id,
+            "title": cur_row.title or "(无标题)",
+            "fork_point_index": own_idx,
+            "time_created": cur_row.time_created,
+        }
 
         parent = None
+        siblings = []
         if cur_row.parent_id:
             prow = self._db.get_session(cur_row.parent_id)
             if prow:
                 parent = {
                     "id": prow.id,
                     "title": prow.title or "(无标题)",
-                    "fork_point_index": cur_row.fork_point_index,
+                    # Where *this* session forked off the parent. The parent
+                    # itself has no meaningful index in this group.
+                    "fork_point_index": own_idx,
+                    "time_created": prow.time_created,
                 }
+                for srow in self._db.list_children(cur_row.parent_id):
+                    if srow.id == cur_row.id:
+                        continue
+                    siblings.append({
+                        "id": srow.id,
+                        "title": srow.title or "(无标题)",
+                        "fork_point_index": self._fork_point_of(
+                            cur_row.parent_id, srow),
+                        "time_created": srow.time_created,
+                    })
 
         children = []
         for crow in self._db.list_children(session_id):
             children.append({
                 "id": crow.id,
                 "title": crow.title or "(无标题)",
-                "fork_point_index": crow.fork_point_index,
+                "fork_point_index": self._fork_point_of(session_id, crow),
+                "time_created": crow.time_created,
             })
 
-        return {"current": current, "parent": parent, "children": children}
+        return {"current": current, "parent": parent,
+                "siblings": siblings, "children": children}
 
+
+    def latest_in_family(self, session_id: str) -> str:
+        """Most recently updated session in a fork family.
+
+        Reopening the app must land on the branch the user last interacted
+        with, not whichever row happened to be saved in ``bc_view``. Fork
+        children are descendants of one root; walk up to the root, then
+        BFS the tree and pick the greatest ``time_updated``.
+
+        Returns ``session_id`` unchanged when it does not exist.
+        """
+        row = self._db.get_session(session_id)
+        if not row:
+            return session_id
+
+        # Climb to the root (guard against a corrupted parent cycle).
+        seen: set[str] = set()
+        while row and row.parent_id and row.id not in seen:
+            seen.add(row.id)
+            parent = self._db.get_session(row.parent_id)
+            if not parent:
+                break
+            row = parent
+        root_id = row.id if row else session_id
+
+        best_id, best_ts = root_id, None
+        queue = [root_id]
+        visited: set[str] = set()
+        while queue:
+            sid = queue.pop(0)
+            if sid in visited:
+                continue
+            visited.add(sid)
+            cur = self._db.get_session(sid)
+            if cur is None:
+                continue
+            ts = cur.time_updated or 0
+            if best_ts is None or ts > best_ts:
+                best_id, best_ts = cur.id, ts
+            for child in self._db.list_children(sid):
+                queue.append(child.id)
+        return best_id
 
     # ── Internal helpers ───────────────────────────────────────────────────
 
@@ -383,10 +532,15 @@ class SessionService:
                     "input": msg.usage.input_tokens,
                     "output": msg.usage.output_tokens,
                 })
+            # Preserve the original timestamp when copying (fork) or
+            # re-saving a transcript loaded from the DB. Freshly built
+            # messages carry 0 and get "now". Without this, every copied
+            # message in a branch is stamped with the fork time, so the
+            # child's history appears to have been sent all at once.
             self._db.insert_message(MessageRow(
                 id=mid, session_id=session_id,
                 role=msg.role, usage=usage_json,
-                time_created=_now_ms(),
+                time_created=msg.time_created or _now_ms(),
             ))
             for block in msg.blocks:
                 block_data = _block_to_dict(block)
@@ -412,4 +566,6 @@ class SessionService:
             parent_id=row.parent_id,
             character_name=row.character_name or "",
             fork_point_index=row.fork_point_index,
+            role_kind=row.role_kind or "character",
+            role_ref=row.role_ref or "",
         )

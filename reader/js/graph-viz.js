@@ -6,6 +6,7 @@
 
 import { S } from './state.js';
 import { escapeHtml, escapeHtmlAttr } from './utils.js';
+import { jumpToPosition } from './app.js';
 
 // ══════════════════════════════════════════════════════════════════════
 // Constants
@@ -127,6 +128,7 @@ let currentLayout = 'force';
 let typeWheelState = {};        // { character: 'selected'|'connected'|'hidden', ... }
 let selectedNodeId = null;      // currently open in detail panel
 let currentGraphBookId = null;  // bookId currently rendered
+let nodeJumpTarget = null;      // {bookId, chapter, chunk} — 详情面板「跳转原文」的目标
 let booksWithGraph = [];        // [{ book_id, title, node_count }]
 let graphLoading = false;       // guard against concurrent loadGraphForBook calls
 
@@ -584,6 +586,7 @@ function renderGraph(nodes, edges) {
         kind: n.kind,
         description: n.description || '',
         chapter: n.chapter,
+        chunk: n.chunk,
         aliases: n.aliases || [],
         size: nodeSize(deg),
         degree: deg,
@@ -783,6 +786,7 @@ function clearFocus() {
 function openEdgeDetail(edge) {
   if (!cy) return;
   selectedNodeId = null;
+  nodeJumpTarget = null;
   cy.nodes().removeClass('detail-open');
   applyEdgeFocus(edge);
 
@@ -870,6 +874,18 @@ function openNodeDetail(node) {
   `;
   if (data.chapter != null) {
     html += `<span class="detail-chapter"><i data-lucide="book-open"></i> 首次出场：第 ${data.chapter + 1} 章</span>`;
+    // 「跳转原文」：落到该实体**首次出场的那一段**（chapter/chunk 由
+    // GraphDB.get_full_graph 从 first_appearance_chunk_id join 现算）。
+    // 章号是导出量、段落才是落点 —— 只跳章会停在章首。
+    if (currentGraphBookId) {
+      nodeJumpTarget = {
+        bookId: currentGraphBookId,
+        chapter: data.chapter,
+        chunk: data.chunk != null ? data.chunk : 0,
+      };
+      html += '<button class="detail-jump-btn" onclick="window.jumpToGraphNodeSource()">'
+        + '<i data-lucide="book-open"></i> 跳转原文 · 第 ' + (data.chapter + 1) + ' 章</button>';
+    }
   }
   if (data.aliases && data.aliases.length) {
     html += '<div class="detail-aliases">别称：'
@@ -878,6 +894,22 @@ function openNodeDetail(node) {
   }
   if (data.description) {
     html += `<p class="detail-desc">${escapeHtml(data.description)}</p>`;
+  }
+
+  // 读者笔记 —— agent 自己的笔记本（见 docs/reader-notes-design.md）。
+  // 不按阅读进度过滤：用户有权翻阅；披露门管的是 agent 主动提及。
+  const notes = data.notes || [];
+  if (notes.length) {
+    html += '<div class="detail-section detail-notes"><h4>读者笔记 ('
+      + notes.length + ')</h4>';
+    notes.forEach(function (nt) {
+      html += '<div class="reader-note">'
+        + (nt.quote ? '<div class="reader-note-quote">贴：'
+            + escapeHtml(nt.quote) + '</div>' : '')
+        + '<div class="reader-note-text">' + escapeHtml(nt.text || '') + '</div>'
+        + '</div>';
+    });
+    html += '</div>';
   }
 
   // Connected edges (merged — one edge per other-node)
@@ -929,6 +961,7 @@ function openNodeDetail(node) {
 
 export function closeGraphDetail() {
   selectedNodeId = null;
+  nodeJumpTarget = null;
   if (cy) {
     cy.nodes().removeClass('detail-open');
     clearFocus();
@@ -960,6 +993,18 @@ export function focusGraphNode(nodeId) {
   openNodeDetail(node);
 }
 
+/** 「跳转原文」：切到阅读页，落到该节点首次出场的段落。
+ *
+ *  与笔记页的批注跳转共用 app.js 的 jumpToPosition —— 切 tab、切书、
+ *  作废在途恢复定位这三件事都在那里处理（自己写 switchTab + 定位会被
+ *  refreshBooks 的异步 selectBook / restoreViewport 的延迟 display 吃掉）。 */
+export async function jumpToGraphNodeSource() {
+  const t = nodeJumpTarget;
+  if (!t) return;
+  const ok = await jumpToPosition(t.bookId, t.chapter, t.chunk, '');
+  if (!ok) alert('跳转失败：书籍可能已被删除或尚未导入。');
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Layout toggle
 // ══════════════════════════════════════════════════════════════════════
@@ -989,6 +1034,11 @@ export function toggleGraphLayout() {
 let _currentGraphView = 'graph';  // 'graph' | 'manage'
 
 export function switchGraphView(view) {
+  // 作者视图是同一页里的另一层画布：切到任何一档都先把它收起来，
+  // 否则管理面板和时间轴会同时占着页面（早返回也一样要收）。
+  if (atlViewOpen() && typeof window.closeAuthorTimeline === 'function') {
+    window.closeAuthorTimeline();
+  }
   if (view === _currentGraphView) return;
   _currentGraphView = view;
 
@@ -1144,7 +1194,15 @@ async function populateBookSelector() {
 export function onGraphBookChange() {
   const sel = document.getElementById('graphBookSelect');
   if (!sel || !sel.value) return;
+  // 在作者视图里换书 = 换一位作者看，不该在背后重算一张看不见的图
+  if (atlViewOpen()) { window.openGraphAuthor(); return; }
   loadGraphForBook(sel.value);
+}
+
+/** 作者视图是否正占着画布 —— 它是图谱页里的第二层视图，不是弹窗。 */
+function atlViewOpen() {
+  const v = document.getElementById('authorTimelineView');
+  return !!v && !v.hidden;
 }
 
 export async function loadGraphForCurrentBook() {
@@ -1241,6 +1299,7 @@ window.onTypeWheelClick = onTypeWheelClick;
 window.closeGraphDetail = closeGraphDetail;
 window.toggleGraphDetail = toggleGraphDetail;
 window.focusGraphNode = focusGraphNode;
+window.jumpToGraphNodeSource = jumpToGraphNodeSource;
 window.switchGraphView = switchGraphView;
 window.deleteGraphData = deleteGraphData;
 window.retryFailedChunks = retryFailedChunks;

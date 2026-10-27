@@ -9,6 +9,8 @@ Thin orchestration layer between the HTML-level tools in
 from __future__ import annotations
 
 import json
+import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -17,7 +19,9 @@ from file_readers.epub_reader import (
     EpubReader, _clean_html, _decode, _format_html, _format_html_styled,
 )
 from file_readers.epub_semantics import VALID_CHAPTER_TYPES
-from file_readers.html_skeleton import extract_html_skeleton, split_html_by_heading
+from file_readers.html_skeleton import (
+    extract_html_skeleton, heading_tag_of, split_html_by_heading,
+)
 from services.library_service import (
     _bookbank_dir,
     _chunk_paragraph_groups,
@@ -28,6 +32,7 @@ from services.library_service import (
     _now_ms,
     _paragraph_offsets,
     _title_match_score,
+    reuse_chunk_ids,
 )
 from storage.db import BookDB
 from storage.db import (
@@ -35,6 +40,8 @@ from storage.db import (
     TABLE_BOOK_CHUNKS,
 )
 from storage.models import BookChapterRow, BookChunkRow, BookRow
+
+logger = logging.getLogger("epub_import")
 
 
 # ── Step 1: skeleton extraction ──────────────────────────────────────────
@@ -222,7 +229,14 @@ def import_epub_with_split(
     is_reimport = book_id is not None
 
     # ── Re-import path: delete old chapters/chunks ────────────────────
+    # **先读旧块再删** —— 循环末尾会用 reuse_chunk_ids 给内容没变的块复用主键，
+    # 图谱的锚点（边/引文/观察/节点首现）才不会集体悬空。
+    old_chunks: list[BookChunkRow] = []
     if is_reimport:
+        try:
+            old_chunks = list(db.get_chunks(book_id))
+        except Exception:
+            old_chunks = []
         _delete_book_content(db, book_id)
         target_id = book_id
     else:
@@ -259,10 +273,15 @@ def import_epub_with_split(
                 agent_map = {}
 
         # ── Split every spine item and collect ────────────────────────
-        # Each entry: (label, paragraphs, spine_idx, is_first_section)
+        # Each entry: (label, paragraphs, spine_idx, is_first_section, depth,
+        #              heading_tag, in_toc)
         # paragraphs: list[{"text": str, "sig": str}] — styled paragraphs
         # (sig = 体例签名, 从源 HTML 当下抓到, 随段落流同行)
-        chapters_raw: list[tuple[str, list[dict], int, bool]] = []
+        # depth: 该书目录里的层级（0 = 最外层），-1 = 无从判断
+        # heading_tag: 切分命中的标签名（h1..h6），"" = 无标题
+        # in_toc: 1 命中书目录 / 0 未命中（图注等）/ -1 未知
+        chapters_raw: list[tuple[str, list[dict], int, bool, int, str, int]] = []
+        depth_by_label = _build_depth_index(reader)
         # L1: spine_idx → resolved structural type (content epub:type +
         # guide + landmarks), scanned from the html already read below.
         structural_map: dict[int, str] = {}
@@ -271,7 +290,9 @@ def import_epub_with_split(
             try:
                 raw_html = reader._read_spine_html(spine_idx)
             except Exception:
-                chapters_raw.append((f"(failed to read spine[{spine_idx}])", [], spine_idx, True))
+                chapters_raw.append(
+                    (f"(failed to read spine[{spine_idx}])", [], spine_idx,
+                     True, -1, "", -1))
                 continue
 
             # L1 structural semantics — content epub:type scanned from the
@@ -286,8 +307,13 @@ def import_epub_with_split(
 
             # Get the default label for this spine item (NCX fallback)
             default_label = reader.get_chapter_label(spine_idx)
+            spine_depth = reader.get_chapter_depth(spine_idx)
+            prev_depth: int | None = None
 
-            for sec_idx, (heading_text, body_html, _matched_tag) in enumerate(sections):
+            for sec_idx, (heading_text, body_html, matched_tag) in enumerate(sections):
+                # 切分器把整个元素当 matched_tag 还了回来（<h3 class="…">第一章</h3>）
+                # —— 标签名是判断「这是正文小节还是图注」的第一手依据，别扔。
+                heading_tag = heading_tag_of(matched_tag)
                 # Format body HTML to styled paragraphs: [{"text", "sig"}, …]
                 # styled 变体在清洗同时保留每段样式签名（体例随源 HTML 一起走）。
                 if body_html.strip():
@@ -316,14 +342,47 @@ def import_epub_with_split(
                     else:
                         label = f"{default_label} (part {sec_idx + 1})"
 
-                chapters_raw.append((label, body_paras, spine_idx, sec_idx == 0))
+                # 这一节的层级：先按标题对到目录节点。对不上的（图注、切分伪
+                # 条目）是**文件内部**的结构，比文件本身深一层 —— 不能沿用
+                # 「上一节」，因为图注常常紧跟在章标题后面，那会把它抬到跟章
+                # 同级（实测人类简史的图4/图5 就是这么错的）。
+                sec_depth = None
+                in_toc = -1
+                if heading_text:
+                    sec_depth = depth_by_label.get(
+                        _WS_NORM_RE.sub("", heading_text))
+                    if sec_depth is None:
+                        sec_depth = (spine_depth + 1) if spine_depth >= 0 else prev_depth
+                        # 标题在书目录里查不到 —— 图注/地图走的就是这一支。
+                        in_toc = 0
+                    else:
+                        in_toc = 1
+                elif spine_depth >= 0:
+                    # 整节就是文件本身 → 它自己在目录里的层级
+                    sec_depth = spine_depth
+                    in_toc = 1
+                else:
+                    sec_depth = prev_depth
+                if sec_depth is None:
+                    sec_depth = -1
+                prev_depth = sec_depth
+
+                chapters_raw.append(
+                    (label, body_paras, spine_idx, sec_idx == 0, sec_depth,
+                     heading_tag, in_toc))
 
         # ── Build chapter + chunk rows (same logic as import_book) ───
         total_chars = 0
         chapter_rows: list[BookChapterRow] = []
         chunk_rows: list[BookChunkRow] = []
 
-        for ch_idx, (label, paragraphs, spine_idx, is_first) in enumerate(chapters_raw):
+        # 目录树父子关系：每层最近出现过的章就是下一层的父。层号来自书自己的
+        # 目录（见 _build_depth_index），所以人类简史的「小节」会挂到它所属的
+        # 「章」下、「章」挂到「部分」下，而不是一条平表。
+        last_at_level: dict[int, int] = {}
+
+        for ch_idx, (label, paragraphs, spine_idx, is_first, depth,
+                     heading_tag, in_toc) in enumerate(chapters_raw):
             paras_text = [p["text"] for p in paragraphs]
             chapter_text = "\n\n".join(paras_text)
             groups = _chunk_paragraph_groups(paras_text)
@@ -360,6 +419,14 @@ def import_epub_with_split(
             if is_first:
                 spine_type = agent_map.get(spine_idx) or structural_map.get(spine_idx)
 
+            parent_index = -1
+            if depth >= 0:
+                parent_index = last_at_level.get(depth - 1, -1)
+                last_at_level[depth] = ch_idx
+                # 更深的层已经翻篇，留着会挂到错误的父上
+                for deeper in [d for d in last_at_level if d > depth]:
+                    del last_at_level[deeper]
+
             chapter_rows.append(BookChapterRow(
                 id=ch_id,
                 book_id=target_id,
@@ -372,6 +439,11 @@ def import_epub_with_split(
                     label, index=ch_idx, total=len(chapters_raw),
                     structural_type=spine_type,
                 ),
+                spine_index=spine_idx,
+                level=depth,
+                parent_index=parent_index,
+                heading_tag=heading_tag,
+                in_toc=in_toc,
             ))
 
             chunk_rows.extend(chunk_rows_this)
@@ -429,6 +501,14 @@ def import_epub_with_split(
             time_updated=now,
         )
 
+        # 重导：内容没变的块**复用旧主键**。这一步让图谱锚点活下来 ——
+        # 少了它，每次重导都会让边/引文/观察/节点首现集体指空。
+        if old_chunks:
+            stats = reuse_chunk_ids(chunk_rows, old_chunks)
+            logger.info("重导主键复用: %s/%s（新块 %s，消失 %s）",
+                        stats["reused"], stats["old"], stats["fresh"],
+                        len(stats["disappeared"]))
+
         # insert_book uses INSERT OR REPLACE — safe for both new and reimport.
         # Old chapters/chunks were already deleted above for reimport case.
         db.insert_book(book_row)
@@ -453,6 +533,25 @@ def _delete_book_content(db: BookDB, book_id: str) -> None:
     conn.execute(f"DELETE FROM {TABLE_BOOK_CHAPTERS} WHERE book_id = ?;", (book_id,))
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.commit()
+
+
+_WS_NORM_RE = re.compile(r"\s+")
+
+
+def _build_depth_index(reader) -> dict[str, int]:
+    """归一化标题 → 该书目录里的层级（0 = 最外层）。
+
+    层级是**书自己声明的**（NCX/nav 的嵌套深度），不是我们从 HTML 标签猜的 ——
+    人类简史 h1 是「部分」、h2 是「章」、h3 是「小节」，而别的书可能整个反过来。
+    按标题建索引是因为切分出的章节标题常常就是 NCX 标签（同一个字符串），
+    对不上的（图注之类）由调用方回退。
+    """
+    idx: dict[str, int] = {}
+    for entry in getattr(reader, "_toc_all", []) or []:
+        label, depth = entry.get("label"), entry.get("depth")
+        if label and depth is not None:
+            idx.setdefault(_WS_NORM_RE.sub("", label), depth)
+    return idx
 
 
 def _match_ncx_label(heading_text: str, toc: list[dict]) -> str:

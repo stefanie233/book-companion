@@ -37,6 +37,9 @@ let _nativeBookId = null;           // 当前 rendition 归属的 bookId（进�
 
 // ── Position model (CFI-authoritative) ───────────────────────────────
 let _committedCfi = '';             // 最近一次成功落库的视口 CFI（去重槽）
+let _committedPosKey = '';          // CFI+top/focus section 去重键：边界处 CFI 不变、
+                                    // section 变了也必须上报
+let _lastMismatchKey = '';          // 位置错位告警去重（不是每 300ms 刷一条）
 let _viewportCfi = '';              // 最近一次用户所处视口 CFI（切页/重排的恢复锚）
 let _lastDbPos = null;              // last matched {chapter, chunk}（hint + UI）
 let _lastChunkInfo = null;          // {total_chunks, chapter_title} from /chunk
@@ -51,6 +54,56 @@ let _lastSyncFail = false;          // 网络失败状态去重
 let _lastMatchMiss = false;         // 指纹未命中状态去重
 let _engageBound = false;           // 用户交互监听已挂全局
 let _programTimer = 0;              // 程序定位窗口续期定时器（display 长扫描期间持续静默）
+
+// ── 恢复定位代数 ─────────────────────────────────────────────────────
+// 恢复类定位（restoreViewport 的切页恢复、_armLateVerify 的迟到复核）都是
+// 「把视口放回上次读到的地方」，且**都不是立刻执行**——前者等宿主布局稳定
+// （≥2 帧），后者等补载静默（~2s）。用户点击笔记 / 图谱节点发起的显式跳转
+// 是**更新的意图**：若不作废这些待触发的恢复，它们会在跳转落地后把视口
+// 拉回原位（实测：笔记跳转 2 帧后被 restoreViewport 覆盖，表现为"点了没
+// 反应"；迟到复核则会隔 2s 再覆盖一次）。显式跳转前调
+// invalidatePendingRestore()，恢复路径各自比对自己捕获的代数即可。 */
+let _restoreGen = 0;
+
+/** 作废所有在途/待触发的恢复定位。显式跳转（笔记 / 图谱）前调用。 */
+export function invalidatePendingRestore() {
+  _restoreGen++;
+}
+
+/** 等阅读区真正可见（宿主拿到非零尺寸）再落跳转。返回是否等到（超时也继续）。
+ *
+ *  为什么必需：从别的 tab 点跳转时，`switchTab('reader')` 只是把
+ *  `#page-reader` 的 `display:none` 摘掉 —— **同一个 tick 里浏览器还没布局**，
+ *  `#bookPageNative` 仍是 0×0。此时 `rendition.display(cfi)` 是在零尺寸舞台上
+ *  定位：section 渲染了，滚动偏移却按零高视口算；等浏览器补上布局，
+ *  `resizeNative` 又因"宽度与 _lastResizeW 相同"跳过重排，于是没有任何一步
+ *  再把视口纠正回来 —— 视口停在跳转前的位置。
+ *  实测（点笔记卡片）：点击瞬间 host=0×0，20s 后 host=365×156 而视口纹丝不动；
+ *  同一段代码在阅读页内同步调 jumpToCfi 则 8–27ms 精确落点。这也解释了为什么
+ *  症状是**偶发**的：display() 是异步的，若浏览器恰好在其间完成布局就正常。
+ *
+ *  ⚠️ 必须让出**真实帧**，不能只做一次同步读：读 `clientWidth` 会强制同步
+ *  重排，切 tab 后紧接着读就已经是 365×156（同步判断会立刻返回 true），但
+ *  此刻 epub 的 view 容器还没走完这一帧的布局/挂载 —— 实测"同步读一次就跳"
+ *  仍然失败，而同一段代码中间隔了几帧（多一次 CDP 往返）就精确落点。
+ *  所以这里按 `_waitLayoutStableThen` 同款：连续 2 帧读到非零尺寸才放行。 */
+export async function whenHostVisible(maxMs = 1500) {
+  const t0 = Date.now();
+  const first = document.getElementById('bookPageNative');
+  // host.hidden = native 未启用（chunk 视图）→ 本函数不适用，立即放行，
+  // 免得非 EPUB 书的跳转白等一个超时。
+  if (!first || first.hidden) return false;
+  let stable = 0;
+  for (;;) {
+    if (destroyed || !rendition) return false;
+    const host = document.getElementById('bookPageNative');
+    if (!host || host.hidden) return false;
+    stable = (host.clientWidth > 0 && host.clientHeight > 0) ? stable + 1 : 0;
+    if (stable >= 2) return true;
+    if (Date.now() - t0 > maxMs) return false;
+    await new Promise(r => requestAnimationFrame(r));   // 让出真实帧
+  }
+}
 
 // ── 链路计数器（诊断用，零副作用）───────────────────────────────────
 // 为什么需要：DevTools 的 console.table 在"选中→复制→粘贴"时经常整块丢失
@@ -77,6 +130,7 @@ const _diag = {
   postOk: 0,         // ↳ 命中
   postMiss: 0,       // ↳ 未命中
   postErr: 0,        // ↳ 请求异常
+  displayTimeout: 0, // ↳ display() promise 超时未 resolve（效果已落地，见 _displayWithTimeout）
   lastCfi: '',       // 最近一次抓到的视口 CFI
   lastText: '',      // 最近一次抓到的视口文本
   lastTop: 0,        // 最近一次抓取时的 scrollTop
@@ -312,9 +366,11 @@ export function restoreViewport() {
   const host = document.getElementById('bookPageNative');
   if (!host || !host.clientWidth || !host.clientHeight) return;
   _programmaticUntil = Date.now() + PROGRAMMATIC_MS;
+  const myGen = _restoreGen;      // 显式跳转会使本轮恢复作废（见 invalidatePendingRestore）
   const w0 = host.clientWidth, h0 = host.clientHeight;
   _waitLayoutStableThen(host, w0, h0, () => {
     if (destroyed || !rendition) return;
+    if (myGen !== _restoreGen) return;
     if (!host.clientWidth || !host.clientHeight) return;
     // display:none 期间容器尺寸塌缩，epub.js 内部布局随之失效——尺寸有变时
     // 先重建布局，再定位。
@@ -453,32 +509,76 @@ function _captureViewport() {
   if (!rendition) return null;
   const scroller = _getScroller();
   if (!scroller) return null;
-  const top = scroller.scrollTop;
+  const contents = rendition.getContents() || [];
+  if (!contents.length) return null;
+
   const scrollerRect = scroller.getBoundingClientRect();
-  for (const c of rendition.getContents() || []) {
+  const viewTop = scrollerRect.top;
+  const viewBottom = scrollerRect.bottom;
+
+  // 1. Structural census. Which sections are actually on screen, and how
+  //    much of each? This is the renderer's own coordinate — no text
+  //    fitting involved. Continuous scrolling renders neighbours; the
+  //    intersection with the scroller rect filters them out.
+  const visible = [];
+  for (const c of contents) {
     const frame = c.window ? c.window.frameElement : null;
     if (!frame || !c.document) continue;
     const fr = frame.getBoundingClientRect();
-    // frame 在 scroller 内容坐标系中的位置（不依赖 offsetParent 定位链）
-    const frameTop = fr.top - scrollerRect.top + top;
-    if (top < frameTop || top >= frameTop + fr.height) continue;   // 视口顶不在本 section
-    // 几何判定命中、却取不到文本节点（视口顶正落在插图/分节空白的下沿）：
-    // 只跳过本 section 继续找候选，不整体放弃——早期版本在此处 return null，
-    // 会把一次本可上报的滚动静默丢弃。
-    const node = _textNodeAtY(c.document, top - frameTop);
-    if (!node) continue;
-    let cfi = '';
-    try {
-      const range = c.document.createRange();
+    const px = Math.max(0, Math.min(fr.bottom, viewBottom) - Math.max(fr.top, viewTop));
+    if (px <= 4) continue;
+    visible.push({ c, rect: fr, visiblePx: Math.round(px) });
+  }
+  if (!visible.length) return null;
+
+  // 2. Focus = the section occupying most of the viewport (reading intent).
+  //    Top = the section at the viewport top (restore anchor). At a chapter
+  //    boundary these differ: the top is the previous chapter's tail while
+  //    the focus is the chapter the reader is actually looking at.
+  let focus = visible[0];
+  for (const v of visible) if (v.visiblePx > focus.visiblePx) focus = v;
+  let topHit = visible.find(v => v.rect.top <= viewTop && v.rect.bottom > viewTop);
+  if (!topHit) {
+    topHit = visible.reduce((a, b) => (a.rect.top <= b.rect.top ? a : b));
+  }
+
+  const _textAt = (item, yViewport) => {
+    const y = Math.max(0, yViewport - item.rect.top);
+    const node = _textNodeAtY(item.c.document, y);
+    return node ? _collectTextFrom(node, 0, 120) : '';
+  };
+
+  let cfi = '';
+  try {
+    const y = Math.max(0, viewTop - topHit.rect.top);
+    const node = _textNodeAtY(topHit.c.document, y);
+    if (node) {
+      const range = topHit.c.document.createRange();
       range.setStart(node, 0);
       range.setEnd(node, Math.min(20, (node.nodeValue || '').length));
-      cfi = c.cfiFromRange(range) || '';
-    } catch (_) { /* CFI 抓取失败：只上报文本，不影响落库 */ }
-    const text = _collectTextFrom(node, 0, 120);
-    if (!cfi && !text) return null;
-    return { cfi, text };
-  }
-  return null;
+      cfi = topHit.c.cfiFromRange(range) || '';
+    }
+  } catch (_) { /* CFI 抓取失败：只上报文本，不影响落库 */ }
+
+  const text = _textAt(topHit, viewTop);
+  // Focus fingerprint: when the focus section starts below the viewport
+  // top, this is its first text node (heading); the backend strips the
+  // heading prefix before matching. Otherwise it is the text at the top
+  // inside the focus section.
+  const focusText = _textAt(focus, viewTop) || text;
+
+  if (!cfi && !text && !focusText) return null;
+  return {
+    cfi,
+    text,
+    focusText,
+    topSection: topHit.c.sectionIndex,
+    focusSection: focus.c.sectionIndex,
+    visibleSections: visible.map(v => ({
+      sectionIndex: v.c.sectionIndex,
+      visiblePx: v.visiblePx,
+    })),
+  };
 }
 
 /** 只要 CFI（重排锚定用）的薄封装。抓不到返回 null。 */
@@ -601,6 +701,11 @@ export async function initNative(bookId, readingProgress) {
       // 加载完成后 counter 补偿会把 scrollTop 猛拉回去（章节边界回滚 bug）。
       // 调大到 8000：section 在用户到达边界前就加载完，补偿不可见；
       // 且 init 时能把前置内容（封面/扉页等）一次性加载全。
+      // ⚠️ 2026-09-24 fork 补丁（epub.min.js continuous prepend 的 RESIZED
+      //    处理器）：counter 补偿加视口守卫——只在 view 完全位于视口上方时
+      //    补偿，且每次非零 heightDelta 都过守卫（原为一锤子 expanded 只补
+      //    首次 reframe）。迟到加载不再把用户按整章高度弹回（章节边界回滚
+      //    bug 的根治）；首次 reframe 之后的增高（字体重排等）重新纳入补偿。
       offset: 8000,
     });
     book = myBook;
@@ -655,9 +760,16 @@ export async function initNative(bookId, readingProgress) {
       _programmaticUntil = Date.now() + PROGRAMMATIC_MS;
       _programTimerArm();            // display 长扫描期间持续静默（防补偿漏窗）
       _committedCfi = readingProgress.cfi;
+      _committedPosKey = '';   // section 尚未知：首次滚动必须上报一次
       _viewportCfi = readingProgress.cfi;
       try {
-        await rendition.display(readingProgress.cfi);
+        // Bounded wait: in the continuous flow this promise can stay pending
+        // forever even though the section is already rendered and the
+        // scroller moved. A bare await here blocked everything after it —
+        // including _syncMetaFor — leaving the previous book's chapter line
+        // in the reader header (the 6s reveal fallback still showed the
+        // page, so only the示数 was wrong).
+        await _displayWithTimeout(readingProgress.cfi);
         // 冷启动特有：display 落点精确，但随后的相邻 section 补载 / 字体就绪
         // 仍可能把视口顶推走。先当场核对（常见路径直接过），不一致再等补载
         // 静默后用 display 语义重锚（见 _anchorColdStart）。
@@ -677,11 +789,20 @@ export async function initNative(bookId, readingProgress) {
       if (readingProgress.chapter != null) {
         await _syncMetaFor(readingProgress.chapter, readingProgress.chunk);
       }
+      // 恢复落点（CFI=视口顶）与阅读意图可能不同：章节边界上 CFI 在上一章
+      // 尾巴、focus 在下一章。补一次 ui-only 上报，把示数/visibleChapters
+      // 对齐到 focus（不落库，DB 仍保留真正的阅读进度）。
+      _commitViewport({ force: true, record: false });
     } else if (readingProgress && readingProgress.chapter != null) {
       await jumpToAnchor(readingProgress.chapter, readingProgress.chunk, { skipRecord: true });
     } else {
-      await rendition.display(0);
+      await _displayWithTimeout(0);
       _kickContinuousFill();          // 首开无进度：display(0) 后立即驱动补载
+      // 首开无进度时也要把示数刷成**这本新书**的。这里此前什么都不写，
+      // positionMeta 就保留着上一本书的章节标题（切书时没有任何人清）。
+      if (gen === _initGen) await _syncMetaFor(0, 0);
+      // 同样补一次 ui-only 上报：填充 visibleChapters，供本轮聊天的门使用。
+      if (gen === _initGen) _commitViewport({ force: true, record: false });
     }
     if (gen !== _initGen) {
       // 展示期间又被切换：仅当全局槽位仍指向自己时才清理，避免误伤新一轮
@@ -738,6 +859,8 @@ export function destroyNative() {
   clearTimeout(_revealTimer);
   _programTimerClear(true);           // 停掉续期器，杜绝泄漏
   _committedCfi = '';
+  _committedPosKey = '';
+  _lastMismatchKey = '';
   _viewportCfi = '';
   _userIntentUntil = 0;
   _programmaticUntil = 0;
@@ -745,6 +868,7 @@ export function destroyNative() {
   _tickUntil = 0;
   _lastDbPos = null;
   _lastChunkInfo = null;
+  S.visibleChapters = [];
   _pendingAnchorCfi = null;
   _coldRestoring = false;             // 冷启动窗口随本轮销毁一并关闭
   _deferredResize = false;
@@ -791,22 +915,59 @@ export function jumpToChapter(chapterIndex) {
   return jumpToAnchor(idx, 0);
 }
 
+/** display() 的"完成"信号：**有界等待**，不是裸 await。
+ *
+ *  为什么不能裸 await：fork 的 display promise 在某些状态下**永不 resolve**。
+ *  实测（切 tab 后从笔记页跳转）：display 明明已经渲染了目标 section、滚动容器
+ *  也移到位了（dump: sections=[7]、scroller.top=7627），promise 却 8s 不返回。
+ *  裸 await 会把整条定位链卡死 —— 45s 后 jumpToAnchor 仍未 settle，之后每次
+ *  跳转都挂在这条链上（_restoreChain 串行）。
+ *  而 display 之后的收敛循环本来就是**按几何读回**校验落点的（_computeCfiScrollTop /
+ *  _computeAnchorScrollTop），不依赖这个 promise；超时放行不会让落点变差，
+ *  只会让"已经渲染好了却没人往下走"不再发生。
+ *  display 明确失败（CFI 非法等）仍照常上抛给调用方。 */
+async function _displayWithTimeout(target, ms = 2500) {
+  const p = rendition.display(target);
+  p.catch(() => { /* 超时后它的结局已无人关心，这里只是标记已处理 */ });
+  await Promise.race([p, _wait(ms).then(() => { _diag.displayTimeout++; })]);
+}
+
 /** Jump to an exact CFI (annotation replay/bookmark navigation). Returns success.
  *  fork 的 display(cfi) 在 continuous 流里只消费到 section 级（视口停在
  *  section 顶）——精确到段落需要 display 后按 CFI→Range 几何位置收敛
- *  滚动（_scrollToCfi），与进度恢复的文本锚收敛同款思路。 */
+ *  滚动（_scrollToCfi），与进度恢复的文本锚收敛同款思路。
+ *
+ *  ⚠️ display 的 promise 与它的**效果**是两回事：实测从别的 tab 点跳转时
+ *  display 已经渲染好目标 section、滚动容器也移到位了，promise 却始终不返回
+ *  （见 _displayWithTimeout）。所以落点必须**核验**，不能只看 display 有没有
+ *  抛错；没到位就让出几帧重来。核验用 section 基（`epubcfi(/6/16`）而不是
+ *  整串：落点 CFI 由 _captureViewport 从视口顶文本节点重新生成，元素路径会
+ *  比目标差几级（/4/30 vs /4/32，同一处）。 */
 export async function jumpToCfi(cfi) {
   if (destroyed || !rendition || !cfi) return false;
   // 显式程序定位：全程覆盖 _programmaticUntil，不产生落库。
   _programmaticUntil = Date.now() + PROGRAMMATIC_MS;
-  try {
-    await rendition.display(cfi);   // section 级定位（落点=section 顶）
-  } catch (e) {
-    console.warn('[epub-reader] CFI 跳转失败:', e);
-    return false;
+  const key = _cfiAnchorKey(cfi);
+  const secKey = _cfiSectionKey(cfi);
+  let landed = false;
+  for (let attempt = 0; attempt < 3 && !landed; attempt++) {
+    if (attempt) await _wait(60);   // 让出几帧：等宿主布局/挂载落定再重来
+    try {
+      await _displayWithTimeout(cfi);   // section 级定位（落点=section 顶）
+    } catch (e) {
+      console.warn('[epub-reader] CFI 跳转失败:', e);
+      return false;
+    }
+    await _scrollToCfi(cfi);          // 段落级精修（收敛循环，抗布局漂移）
+    const cur = _captureViewport();
+    landed = !!(cur && cur.cfi
+      && (_cfiAnchorKey(cur.cfi) === key || _cfiSectionKey(cur.cfi) === secKey));
   }
-  await _scrollToCfi(cfi);          // 段落级精修（收敛循环，抗布局漂移）
+  if (!landed) {
+    console.warn('[epub-reader] CFI 跳转 3 次后视口仍未到位:', cfi);
+  }
   _committedCfi = cfi;              // 落点即已知位置：写去重槽，避免随后
+  _committedPosKey = '';            // 同上：section 未同步，首次上报放行
   _viewportCfi = cfi;               // 一次用户滚动把同一位置重复上报
   return true;
 }
@@ -817,6 +978,15 @@ export async function jumpToCfi(cfi) {
 function _cfiAnchorKey(cfi) {
   const s = cfi || '';
   const i = s.indexOf(',');
+  return i >= 0 ? s.slice(0, i) : s;
+}
+
+/** CFI 的「section 键」——只取 `epubcfi(/6/16!` 这一段（spine base）。
+ *  判"视口到没到目标 section"用它：_captureViewport 生成的落点 CFI 与目标
+ *  CFI 的元素路径会差几级，但 section 基相同。 */
+function _cfiSectionKey(cfi) {
+  const s = cfi || '';
+  const i = s.indexOf('!');
   return i >= 0 ? s.slice(0, i) : s;
 }
 
@@ -1023,7 +1193,10 @@ export function jumpToAnchor(chapterIdx, chunkIdx, opts = {}) {
     //    （skipRecord）只刷示数。
     const landed = _captureViewport();
     if (landed && landed.text) {
-      _postPosition(landed, !opts.skipRecord, true);
+      // hint 传**目标**：跳转是"要去哪"已知的显式操作，用它当 hint 让指纹
+      // 先在目标章里找（见 _postPosition 的 hint 注释）。
+      _postPosition(landed, !opts.skipRecord, true,
+        { chapter: chapterIdx, chunk: chunkIdx });
     } else {
       // 抓不到视口（视口顶为图片/纯空白）：只按目标刷示数，**不写
       // _lastDbPos、不落库**——DB 里宁可留着上一次的真实位置，也不写一个
@@ -1170,6 +1343,11 @@ export function applyThemeFromDom() {
 
 // ── 视口 → /api/sync（唯一落库入口）──────────────────────────────────
 
+/** 上报去重键：CFI 相同但 section 变了（章节边界）必须再报一次。 */
+function _posKey(vp) {
+  return (vp.cfi || '') + '|' + (vp.focusSection ?? '') + '|' + (vp.topSection ?? '');
+}
+
 /** 唯一落库入口。只有「用户意图窗口」内的调用才会真正写入：
  *   · _userIntentUntil —— 人类输入（滚轮/触摸/按键/按下）后的余辉窗口；
  *   · _programmaticUntil —— 显式定位/重排进行中，其间的滚动不是用户意图。
@@ -1206,9 +1384,13 @@ function _commitViewport(opts = {}) {
     return;
   }
   _lastExtractEmpty = false;
-  if (!vp.text) { _diag.dropNoText++; return; }        // 无文本可喂指纹桥
+  // 结构上报可以只带 focusText（视口顶落在插图/空白时）
+  if (!vp.text && !vp.focusText) { _diag.dropNoText++; return; }
   if (!forced) {
-    if (vp.cfi && vp.cfi === _committedCfi) { _diag.dropDedup++; return; }  // CFI 级去重（天然唯一）
+    // 去重键 = CFI + top/focus section。只用 CFI 会在章节边界漏报：
+    // 视口顶还停在同一段（CFI 不变），focus 已经换到下一章。
+    const posKey = _posKey(vp);
+    if (posKey && posKey === _committedPosKey) { _diag.dropDedup++; return; }
     _throttleUntil = now + REPORT_THROTTLE_MS;
   }
   _postPosition(vp, opts.record !== false, forced);
@@ -1218,9 +1400,16 @@ function _commitViewport(opts = {}) {
  *  CFI 一并记录（下次恢复直接 display(cfi)，不再重放锚链）。
  *  · record=false → 只刷示数不落库（程序恢复的落点）；
  *  · force=true  → 命中后无条件刷新示数（落点纠偏，即使与上次相同）。 */
-async function _postPosition(vp, record = true, force = false) {
+async function _postPosition(vp, record = true, force = false, hint = null) {
   const gen = _initGen;                       // 上报期间切书则本次作废
   _diag.post++;
+  // hint = 上次已知位置：连续滚动上报必然相邻，后端据此把"全书重复出现的
+  // 短文本"解析到最近的一次出现，而不是全书最早的那次（早期实现的
+  // indexOf 全库首命中会把进度跨章倒拖：实测 ch5 → ch3 → ch1）。
+  // 显式跳转传 hint 覆盖：跳转的目标是**已知**的（就是我们要去的那一块），
+  // 用旧位置当 hint 会把指纹搜索先限定在旧章，跨章跳转得全库扫一遍才命中，
+  // 同文重复时还可能命中旧章里的那一次。
+  const h = hint || _lastDbPos;
   try {
     const res = await fetch(S.API + '/api/sync', {
       method: 'POST',
@@ -1228,14 +1417,17 @@ async function _postPosition(vp, record = true, force = false) {
       body: JSON.stringify({
         // 进度归属跟随渲染中的书（切书竞态下 S.currentBook 可能已指向新书）
         bookId: _nativeBookId || S.currentBook,
-        pageText: vp.text,
+        // pageText = 视口顶（恢复锚）；focusText = 视口面积最大的 section
+        // （阅读意图）。后端结构定章、文本定块。
+        pageText: vp.text || vp.focusText || '',
+        focusText: vp.focusText || '',
         cfi: vp.cfi || '',
+        topSection: vp.topSection ?? null,
+        focusSection: vp.focusSection ?? null,
+        visibleSections: vp.visibleSections || [],
         chapterTitle: '',
-        // 上次已知位置：连续滚动上报必然相邻，后端据此把"全书重复出现的
-        // 短文本"解析到最近的一次出现，而不是全书最早的那次（早期实现的
-        // indexOf 全库首命中会把进度跨章倒拖：实测 ch5 → ch3 → ch1）。
-        hintChapter: _lastDbPos ? _lastDbPos.chapter : null,
-        hintChunk: _lastDbPos ? _lastDbPos.chunk : null,
+        hintChapter: h ? h.chapter : null,
+        hintChunk: h ? h.chunk : null,
         // 是否落库由调用方声明的事实决定（用户意图滚动 / 用户跳章落点 =
         // true；程序恢复落点 = false），本函数只负责搬运事实、不做推断。
         record: record,
@@ -1247,7 +1439,26 @@ async function _postPosition(vp, record = true, force = false) {
       _diag.postOk++;
       _lastMatchMiss = false;
       _lastSyncFail = false;
+      _committedPosKey = _posKey(vp);
       if (vp.cfi) { _committedCfi = vp.cfi; _viewportCfi = vp.cfi; }
+      // Chapters visible in the viewport (mapped by the backend). Sent with
+      // chat so the spoiler gate never sits below what the reader can see.
+      if (data.structural) {
+        S.visibleChapters = data.structural.visible_chapters || [];
+      }
+      if (data.mismatch) {
+        const mk = [
+          data.mismatch.top_section, data.mismatch.focus_section,
+          data.mismatch.top_chapter, data.mismatch.intent_chapter,
+        ].join('|');
+        if (mk !== _lastMismatchKey) {
+          _lastMismatchKey = mk;
+          console.warn('[epub-reader] position mismatch:',
+            'top ch.' + data.mismatch.top_chapter,
+            '→ intent ch.' + data.mismatch.intent_chapter,
+            'visible=' + JSON.stringify(data.mismatch.visible_chapters || []));
+        }
+      }
       const p = data.position;
       const changed = !_lastDbPos
         || p.chapter_index !== _lastDbPos.chapter
@@ -1378,7 +1589,7 @@ function _findSectionForChapter(title) {
 }
 
 async function _locateAndScrollToText(secIdx, anchor) {
-  await rendition.display(secIdx);
+  await _displayWithTimeout(secIdx);
   const scroller = _getScroller();
   if (!scroller) {
     console.warn('[epub-reader] 定位: 未找到滚动容器, 视口停留原地');
@@ -1493,7 +1704,10 @@ async function _anchorColdStart(cfi) {
     const cur = atKey();
     if (cur === key) return true;
     try {
-      await rendition.display(cfi);   // 语义重锚：把被 prepend 推走的视口拉回
+      // 语义重锚：把被 prepend 推走的视口拉回。同样要有界 —— 这个
+      // promise 在 continuous 流里可能永不 resolve，裸 await 会把
+      // _anchorColdStart 连同其后的 _syncMetaFor（示数刷新）一起卡死。
+      await _displayWithTimeout(cfi);
     } catch (_) { return false; }
   }
   return atKey() === key;
@@ -1509,8 +1723,10 @@ async function _anchorColdStart(cfi) {
  *  绝不与用户抢视口。 */
 function _armLateVerify(cfi, gen) {
   const key = _cfiAnchorKey(cfi);
+  const myGen = _restoreGen;      // 期间发生显式跳转 → 复核作废（别把跳转拉回进度）
   _waitRenderQuiet(2000, 450).then(() => {
     if (destroyed || gen !== _initGen) return;
+    if (myGen !== _restoreGen) return;
     // 期间用户已经滚动过 → 视口现在在哪由用户决定，绝不回拉
     if (Date.now() < _userIntentUntil) return;
     const cur = _captureViewport();
@@ -1836,17 +2052,20 @@ function _uninstallScrollReporter() {
  *  只读：不带 record，不落库。用于 CFI 恢复后补齐示数 —— 视口已由
  *  display(cfi) 归位，这里不需要任何定位指令。 */
 async function _syncMetaFor(chapterIdx, chunkIdx) {
+  const gen = _initGen;   // 快速切书：旧书的元信息不许写进新书的示数
   try {
     const r = await fetch(S.API + '/api/books/' + (_nativeBookId || S.currentBook)
       + '/chunk?chapter=' + chapterIdx + '&chunk=' + chunkIdx);
     if (r.ok) {
       const d = await r.json();
+      if (gen !== _initGen) return;
       _lastChunkInfo = {
         total_chunks: d.total_chunks || 1,
         chapter_title: d.chapter_title || '',
       };
     }
   } catch (_) { /* 元信息缺失不影响阅读 */ }
+  if (gen !== _initGen) return;
   S.currentChapter = chapterIdx;
   S.currentChunk = chunkIdx;
   _lastDbPos = { chapter: chapterIdx, chunk: chunkIdx };
@@ -2120,6 +2339,114 @@ if (typeof window !== 'undefined') {
         console.log('AUDIT=' + s);
         return res(s);
       }, ms || 3000));
+    },
+
+    /** 快速上滚「空降回」取证 —— flingProbe。
+     *
+     *  为什么存在：该 bug 在 fork counter 加视口守卫后仍稳定复现。静态可推出
+     *  四类候选（counter 超量 / 守卫假阴性 / 一锤子漏补 / 内容在视口上方长出），
+     *  加上浏览器 CSS scroll anchoring 这个"第二个补偿者"（fork 写于无
+     *  anchoring 的年代，两者叠加 = +2H 双重补偿），症状全部同构、读代码裁决
+     *  不了。本探针记录：fork 的每次程序性 scrollTop 写入 + 每次无写入解释的
+     *  回跳 + 现场几何（scrollTop/scrollHeight/视口顶文本），一次甩轮即可
+     *  钉死责任方。
+     *
+     *  用法（控制台粘贴后立刻快速上滚，复现一次空降）：
+     *    __reader.flingProbe(20000).then(s => console.log('FLING=' + s));
+     *
+     *  读法：
+     *    counter{d:Δ} 后紧跟 jump{dTop≈+Δ}    → fork 单独补的（内容稳定，正常）
+     *    counter{d:Δ} 后紧跟 jump{dTop≈+2Δ}   → 双重补偿实锤：scroll anchoring
+     *                                          又补了一次 → 根治=容器加
+     *                                          overflow-anchor:none（二选一，
+     *                                          让 fork 独占补偿）
+     *    jump{explained:false, dTop>200}      → 无任何程序性写入的回跳 → 浏览器
+     *                                          自己干的（anchoring 单独超调）
+     *    jump{dH>200} 且无 counter            → 视口上方内容长高且未被补偿
+     *    prepend 后无 jump 无 counter          → 补载全程零位移（守卫生效） */
+    flingProbe(ms) {
+      const m = rendition && rendition.manager;
+      const c = m && m.container;
+      if (!m || !c) return Promise.resolve('{"error":"no manager — open a book first"}');
+      return new Promise((res) => {
+        const t0 = Date.now();
+        const log = [];
+        let lastTop = c.scrollTop;
+        let lastH = c.scrollHeight;
+        let lastProgAt = -1e9;    // 最近一次程序性写入时刻（jump 归因窗口）
+        let inCounter = false;    // counter 内部调 scrollBy 时去重
+        const push = (o) => { o.at = Date.now() - t0; if (log.length < 400) log.push(o); };
+        const snap = () => {
+          const vp = _captureViewport();
+          return {
+            top: Math.round(c.scrollTop),
+            h: Math.round(c.scrollHeight),
+            txt: vp && vp.text ? String(vp.text).slice(0, 16) : '',
+            cfi: vp && vp.cfi ? _cfiAnchorKey(vp.cfi) : '',
+          };
+        };
+        let anchor = '?';
+        try { anchor = getComputedStyle(c).overflowAnchor; } catch (_) { /* 记为 ? */ }
+        push(Object.assign({ k: 'init', anchor,
+          offset: m.settings ? m.settings.offset : null }, snap()));
+        // ── 拦截 fork 全部程序性写入/补载入口（own property 覆盖，delete 即还原）──
+        const orig = {
+          counter: m.counter && m.counter.bind(m),
+          scrollBy: m.scrollBy && m.scrollBy.bind(m),
+          scrollTo: m.scrollTo && m.scrollTo.bind(m),
+          prepend: m.prepend && m.prepend.bind(m),
+          append: m.append && m.append.bind(m),
+        };
+        m.counter = (t) => {
+          inCounter = true;
+          lastProgAt = Date.now();
+          push(Object.assign({ k: 'counter', d: t && t.heightDelta, H: t && t.height }, snap()));
+          try { return orig.counter(t); } finally { inCounter = false; }
+        };
+        m.scrollBy = (x, y, silent) => {
+          lastProgAt = Date.now();
+          if (!inCounter) push(Object.assign({ k: 'scrollBy', x, y, silent: !!silent }, snap()));
+          return orig.scrollBy(x, y, silent);
+        };
+        m.scrollTo = (x, y, silent) => {
+          lastProgAt = Date.now();
+          push(Object.assign({ k: 'scrollTo', x, y, silent: !!silent }, snap()));
+          return orig.scrollTo(x, y, silent);
+        };
+        m.prepend = (sec) => {
+          lastProgAt = Date.now();
+          push(Object.assign({ k: 'prepend', sec: sec ? sec.index : null }, snap()));
+          return orig.prepend(sec);
+        };
+        m.append = (sec) => {
+          push(Object.assign({ k: 'append', sec: sec ? sec.index : null }, snap()));
+          return orig.append(sec);
+        };
+        // ── 回跳监测：上滚复现场景里 >200px 的正向 dTop 即弹回；负向是用户
+        //    自己的甩轮（噪音，不记）。dH 大变化记为"内容长高"现场。 ──
+        const onScroll = () => {
+          const dTop = c.scrollTop - lastTop;
+          const dH = c.scrollHeight - lastH;
+          if (dTop > 200 || Math.abs(dH) > 200) {
+            push(Object.assign({
+              k: 'jump', dTop: Math.round(dTop), dH: Math.round(dH),
+              explained: (Date.now() - lastProgAt) < 150,   // 紧跟程序性写入 → fork 干的
+            }, snap()));
+          }
+          lastTop = c.scrollTop; lastH = c.scrollHeight;
+        };
+        document.addEventListener('scroll', onScroll, { passive: true, capture: true });
+        const stop = () => {
+          document.removeEventListener('scroll', onScroll, true);
+          delete m.counter; delete m.scrollBy; delete m.scrollTo;   // 还原原型方法
+          delete m.prepend; delete m.append;
+          const s = JSON.stringify(log);
+          window.__lastFlingProbe = log;   // 事后可逐步检查（控制台打印会折叠）
+          console.log('FLING=' + s);
+          res(s);
+        };
+        setTimeout(stop, ms || 20000);
+      });
     },
   };
 }

@@ -119,10 +119,23 @@ def _table_counts(db_path: Path) -> dict:
     """所有真实表 + 行数——演练比对的台账基础（FTS 等虚表是派生索引，排除）。"""
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        names = [r[0] for r in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' "
-            "AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL%')")]
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'").fetchall()
+        virtual = {n for n, sql in rows
+                   if sql and sql.lstrip().upper().startswith("CREATE VIRTUAL")}
+        # FTS5 的影子表（``<虚表>_data`` / ``_idx`` / ``_docsize`` / ``_config``）
+        # **不是业务行** —— 它们是索引的内部页结构，任何一次 ``rebuild`` /
+        # ``OPTIMIZE`` 都会改变其行数，而**数据丢失的信号在内容表上**（影子表只是
+        # 内容的镜像，内容少了内容表自己会报）。实测迁移 10 重建 ``nodes_fts`` 后，
+        # 8 个图谱库的影子表全部变化、业务表一行没动 —— 不过滤就是 32 条假警报，
+        # 而假警报多了这道闸就没人看了。
+        # 旧 manifest 里记着这些表，但它们在新的 ``after`` 里不存在 → 走
+        # ``_verify_one_db`` 的 ``tbl not in after`` 分支自动跳过，无需改台账。
+        shadow = {n for n, _ in rows
+                  if any(n.startswith(v + "_") for v in virtual)}
+        names = [n for n, sql in rows
+                 if n not in virtual and n not in shadow]
         return {n: conn.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0]
                 for n in names}
     finally:
@@ -356,18 +369,18 @@ def setup_data(src_data: Path, dst_data: Path, *,
 
 
 def apply_port_fixes(dst: Path, port: int) -> list[str]:
-    """把复制品里的 8765 精确替换为靶场端口。返回每处替换统计。"""
+    """把复制品里的 8766 精确替换为靶场端口。返回每处替换统计。"""
     fixes = [
-        ("reader/js/state.js", "API: 'http://127.0.0.1:8765',", "前端 S.API"),
-        ("main.py", 'web.TCPSite(api_runner, "127.0.0.1", 8765, reuse_address=True)',
+        ("reader/js/state.js", "API: 'http://127.0.0.1:8766',", "前端 S.API"),
+        ("main.py", 'web.TCPSite(api_runner, "127.0.0.1", 8766, reuse_address=True)',
          "main.py 服务端口"),
-        ("api_server.py", "port: int = 8765,", "api_server 默认端口"),
-        ("api_server.py", "Book Companion API starting on http://127.0.0.1:8765",
+        ("api_server.py", "port: int = 8766,", "api_server 默认端口"),
+        ("api_server.py", "Book Companion API starting on http://127.0.0.1:8766",
          "api_server 启动日志"),
-        ("start.bat", "127.0.0.1:8765", "start.bat 健康检查/URL"),
+        ("start.bat", "127.0.0.1:8766", "start.bat 健康检查/URL"),
     ]
     reports: list[str] = []
-    old, new = "8765", str(port)
+    old, new = "8766", str(port)
     for rel, needle, label in fixes:
         p = dst / rel
         if not p.exists():
@@ -453,7 +466,7 @@ def generate(args) -> int:
     for w in warns:
         print(f"  [警告] {w}")
 
-    print(f"[3/6] 端口替换 8765 → {args.port}")
+    print(f"[3/6] 端口替换 8766 → {args.port}")
     for r in apply_port_fixes(dest, args.port):
         print(r)
 

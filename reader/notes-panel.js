@@ -10,7 +10,7 @@
 
 import { S } from './js/state.js';
 import { escapeHtml } from './js/utils.js';
-import { jumpToCfi } from './js/epub-reader.js';
+import { jumpToPosition } from './js/app.js';
 
 // ── State ────────────────────────────────────────────────────
 let notesPanelState = { minimized: false, x: null, y: null };
@@ -367,36 +367,13 @@ function jumpToAnnotation(annId, bookId, chapterIdx, chunkIdx, cfi) {
     alert('此注释的原文在当前版本中已不存在。重新导入书籍后可恢复。');
     return;
   }
-  window.switchTab('reader');
-  if (S.currentBook !== bookId) {
-    document.getElementById('bookSelect').value = bookId;
-    window.selectBook().then(() => _navToAnnotation(chapterIdx, chunkIdx, cfi));
-  } else {
-    _navToAnnotation(chapterIdx, chunkIdx, cfi);
-  }
-}
-
-function _navToAnnotation(chapterIdx, chunkIdx, cfi) {
-  // native 模式 + CFI → 精确跳转；失败或无 CFI 退回 chunk 语义跳转
-  if (S.renderMode === 'native' && cfi) {
-    jumpToCfi(cfi).then(ok => {
-      if (ok) return;
-      alert('精确跳转失败，回退章节定位');
-      navigateToChunk(chapterIdx, chunkIdx);
-      window.loadChunk();
-    });
-    return;
-  }
-  navigateToChunk(chapterIdx, chunkIdx);
-  window.loadChunk();
-}
-
-function navigateToChunk(chapterIdx, chunkIdx) {
-  S.currentChapter = chapterIdx;
-  document.getElementById('chapterSelect').value = chapterIdx;
-  S.currentChunk = chunkIdx;
-  document.getElementById('chunkPos').textContent = (chunkIdx + 1) + ' / ...';
-  window.loadChunk();
+  // 切 tab / 切书 / 作废在途恢复 / 落点全部交给 jumpToPosition（见其注释）：
+  // 这里曾自己 switchTab('reader') + 定位，会被 switchTab 的两条副作用吃掉
+  // —— refreshBooks 的异步 selectBook 把视口恢复到 DB 进度，restoreViewport
+  // 延迟 2 帧 display 暂存锚。两者都晚于本次跳转，表现为"点了没反应"。
+  jumpToPosition(bookId, chapterIdx, chunkIdx, cfi).then(ok => {
+    if (!ok) alert('跳转失败：书籍可能已被删除或尚未导入。');
+  });
 }
 
 // ── Export ────────────────────────────────────────────────────

@@ -9,11 +9,10 @@ called by the wingman during moment writing (Phase 3).
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from typing import Any
 
+from llm_json import loads_tolerant
 from wingman.db import WingmanDatabase, _now_ms, _new_id
 from wingman.models import TagRow
 
@@ -133,23 +132,18 @@ class TagRegistry:
         """Parse LLM tag suggestions and register new ones.
 
         Returns list of tag_ids (including existing ones for reused names).
+
+        阶梯与裸引号修复统一在 ``llm_json.loads_tolerant``；既接受对象也接受数组，
+        故不传 ``expect``。
         """
-        try:
-            suggestions = json.loads(llm_json)
-            if isinstance(suggestions, dict):
-                suggestions = [suggestions]
-        except json.JSONDecodeError:
-            # Try to extract JSON array from text
-            match = re.search(r'\[[\s\S]*\]', llm_json)
-            if match:
-                try:
-                    suggestions = json.loads(match.group())
-                except json.JSONDecodeError:
-                    logger.warning("Failed to parse LLM tag output")
-                    return []
-            else:
-                logger.warning("No JSON array found in LLM tag output")
-                return []
+        parsed = loads_tolerant(llm_json)
+        if parsed is None:
+            logger.warning("No parseable JSON in LLM tag output")
+            return []
+        suggestions = [parsed] if isinstance(parsed, dict) else parsed
+        if not isinstance(suggestions, list):
+            logger.warning("LLM tag output is neither object nor array")
+            return []
 
         tag_ids = []
         for s in suggestions[:3]:

@@ -81,10 +81,13 @@ def log_llm_call(
     latency_ms: int | None = None,
     tokens_in: int | None = None,
     tokens_out: int | None = None,
+    tokens_cached: int | None = None,
+    reasoning_tokens: int | None = None,
     status: str = "ok",
     error_detail: str | None = None,
     prompt: str = "",
     response: str = "",
+    reasoning_content: str = "",
     parsed: dict | None = None,
     node_index: dict | None = None,
     scout_focus: str = "",
@@ -104,8 +107,10 @@ def log_llm_call(
             chunk_ids=chunk_ids, total_chunks=total_chunks,
             model=model, attempt=attempt, max_attempts=max_attempts,
             latency_ms=latency_ms, tokens_in=tokens_in, tokens_out=tokens_out,
+            tokens_cached=tokens_cached, reasoning_tokens=reasoning_tokens,
             status=status, error_detail=error_detail,
             prompt=prompt, response=response,
+            reasoning_content=reasoning_content,
         )
     except Exception:
         log.warning("graph_llm_logs insert failed", exc_info=True)
@@ -133,6 +138,8 @@ def log_llm_call(
             "latency_ms": latency_ms,
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
+            "tokens_cached": tokens_cached,
+            "reasoning_tokens": reasoning_tokens,
             "prompt_hash": _sha256(prompt),
             "prompt_chars": len(prompt),
             "prompt_preview": _preview(prompt, _PROMPT_PREVIEW_CHARS),

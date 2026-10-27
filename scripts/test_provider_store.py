@@ -223,7 +223,9 @@ def test_v1_migration(tmp: Path) -> None:
     reloaded.upsert_provider({"id": "p_llm_ab01", "name": "Old",
                               "base_url": "https://o/v1"})
     assert len(reloaded.get_provider("p_llm_ab01")["models"]) == 2
-    assert json.loads(store.path.read_text(encoding="utf-8"))["version"] == 2
+    assert json.loads(store.path.read_text(encoding="utf-8"))["version"] == 3
+    # v1/v2 files carry no routes — the key defaults to absent (inherit)
+    assert reloaded.get_route("bookgraph")["provider_id"] is None
     print("  v1 migration: ok")
 
 
@@ -254,6 +256,157 @@ def test_cross_kind_binding(tmp: Path) -> None:
     print("  cross-kind binding + guess: ok")
 
 
+def test_route_binding(tmp: Path) -> None:
+    store = make_store(tmp, "routes")
+    cfg = make_config()
+    ds = store.upsert_provider({
+        "name": "DS", "base_url": "https://ds/v1", "api_key": "sk-ds",
+        "models": [{"id": "graph-fast", "kind": "llm"}]})
+    db = store.upsert_provider({
+        "name": "DB", "base_url": "https://db/v1", "api_key": "sk-db",
+        "models": [{"id": "write-pro", "kind": "llm"}]})
+
+    # unbound -> env; config_for returns the original object
+    r = store.resolve_route("bookgraph.explorer", cfg)
+    assert r.source == "env" and r.model == "env-model"
+    assert store.config_for("bookgraph.explorer", cfg) is cfg
+
+    # group binding covers every leaf
+    store.set_route("bookgraph", provider_id=ds["id"], model="graph-fast")
+    r = store.resolve_route("bookgraph.explorer", cfg)
+    assert r.source == "console" and r.model == "graph-fast"
+    assert r.base_url == "https://ds/v1" and r.key == "sk-ds"
+    view = store.config_for("bookgraph.explorer", cfg)
+    assert view.model == "graph-fast" and view.api_base == "https://ds/v1"
+    assert cfg.model == "env-model"  # base Config untouched
+
+    # leaf override beats group
+    store.set_route("bookgraph.adjudicate", provider_id=db["id"], model="write-pro")
+    assert store.resolve_route("bookgraph.explorer", cfg).model == "graph-fast"
+    assert store.resolve_route("bookgraph.adjudicate", cfg).model == "write-pro"
+    assert store.route_origin("bookgraph.adjudicate") == "bookgraph.adjudicate"
+    assert store.route_origin("bookgraph.notes") == "bookgraph"
+
+    # resolving a leaf from a group view must NOT erase the group binding
+    gview = store.config_for("bookgraph", cfg)
+    nview = store.config_for("bookgraph.notes", gview)
+    assert nview.model == "graph-fast"
+
+    # unbind leaf -> group again
+    store.set_route("bookgraph.adjudicate", provider_id="")
+    assert store.resolve_route("bookgraph.adjudicate", cfg).model == "graph-fast"
+
+    # validation: unknown key / missing model
+    for key, pid, model in (("nope.nope", ds["id"], "x"),
+                            ("bookgraph.scout", ds["id"], "")):
+        try:
+            store.set_route(key, provider_id=pid, model=model)
+            raise AssertionError(f"expected ValueError for {key}")
+        except ValueError:
+            pass
+    # non-llm model rejected on a route
+    pt = store.upsert_provider({"name": "T", "base_url": "u",
+        "models": [{"id": "voice-x", "kind": "tts"}]})
+    try:
+        store.set_route("bookgraph.scout", provider_id=pt["id"], model="voice-x")
+        raise AssertionError("expected kind mismatch ValueError")
+    except ValueError:
+        pass
+
+    # delete protection extends to routes
+    try:
+        store.delete_provider(ds["id"])
+        raise AssertionError("expected ProviderInUseError")
+    except ProviderInUseError:
+        pass
+
+    # snapshot carries routes + per-call-point effective resolution
+    snap = store.snapshot(cfg)
+    assert snap["version"] == 3 and "bookgraph" in snap["routes"]
+    cp = next(c for c in snap["callpoints"] if c["id"] == "bookgraph.explorer")
+    assert cp["origin"] == "bookgraph" and not cp["bound"]
+    assert cp["resolved"]["model"] == "graph-fast"
+    assert any(g["id"] == "bookgraph" and g["bound"] for g in snap["groups"])
+    print("  route binding: ok")
+
+
+def test_active_store_reload(tmp: Path) -> None:
+    cfg = make_config()
+    cfg.project_dir = tmp / "proj"
+    store = ProviderStore(cfg.providers_path)
+    p = store.upsert_provider({"name": "DS", "base_url": "https://ds/v1",
+                               "api_key": "k",
+                               "models": [{"id": "m", "kind": "llm"}]})
+    store.set_route("writing.review", provider_id=p["id"], model="m")
+
+    from provider_store import config_for as active_config_for
+    view = active_config_for(cfg, "writing.review")
+    assert view.model == "m" and view.api_base == "https://ds/v1"
+
+    # a write through another instance (the console) is seen on the next call
+    other = ProviderStore(cfg.providers_path)
+    other.set_route("writing.review", provider_id=p["id"], model="m2")
+    assert active_config_for(cfg, "writing.review").model == "m2"
+    print("  active store reload: ok")
+
+
+def test_stale_writer_keeps_routes(tmp: Path) -> None:
+    """Regression: changing the main model must not erase route bindings.
+
+    The console saves the whole in-memory snapshot. An instance loaded
+    before routes were written (another process / an older app object)
+    used to write its stale copy back and wipe them. Mutations now reload
+    first, so a save merges onto the newest file.
+    """
+    base = make_store(tmp, "stale")
+    p = base.upsert_provider({
+        "name": "A", "base_url": "https://a/v1", "api_key": "k",
+        "models": [{"id": "m1", "kind": "llm"}, {"id": "m2", "kind": "llm"}]})
+
+    base.set_route("bookgraph", provider_id=p["id"], model="m1")
+    stale = ProviderStore(base.path)          # snapshot BEFORE the second bind
+
+    # another writer adds a route after the stale snapshot
+    fresh = ProviderStore(base.path)
+    fresh.set_route("writing.review", provider_id=p["id"], model="m2")
+
+    # stale instance now changes the main model — routes must survive
+    stale.set_slot(SLOT_MAIN_LLM, provider_id=p["id"], model="m2")
+
+    reread = ProviderStore(base.path)
+    assert reread.get_slot(SLOT_MAIN_LLM)["model"] == "m2"
+    assert "bookgraph" in reread._data["routes"]
+    assert "writing.review" in reread._data["routes"]
+
+    # same guarantee for a provider edit on the stale instance
+    stale.set_route("bookgraph.adjudicate", provider_id=p["id"], model="m1")
+    stale.upsert_provider({"id": p["id"], "name": "A2",
+                           "base_url": "https://a/v1"})
+    reread = ProviderStore(base.path)
+    assert set(reread._data["routes"]) == {
+        "bookgraph", "writing.review", "bookgraph.adjudicate"}
+    print("  stale writer keeps routes: ok")
+
+
+def test_save_never_drops_disk_routes(tmp: Path) -> None:
+    """Even if in-memory routes are empty, a non-unbind save keeps disk ones."""
+    store = make_store(tmp, "neverdrop")
+    p = store.upsert_provider({
+        "name": "A", "base_url": "https://a/v1", "api_key": "k",
+        "models": [{"id": "m1", "kind": "llm"}, {"id": "m2", "kind": "llm"}]})
+    store.set_route("bookgraph", provider_id=p["id"], model="m1")
+
+    # simulate an exotic writer whose memory lost the routes
+    store._data["routes"] = {}
+    store._save("slot_set")
+    assert "bookgraph" in ProviderStore(store.path)._data["routes"]
+
+    # an explicit unbind must still be honoured (no resurrection)
+    store.set_route("bookgraph", provider_id="")
+    assert "bookgraph" not in ProviderStore(store.path)._data["routes"]
+    print("  save never drops disk routes: ok")
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -263,6 +416,10 @@ def main() -> None:
         test_delete_protection_and_validation(tmp)
         test_v1_migration(tmp)
         test_cross_kind_binding(tmp)
+        test_route_binding(tmp)
+        test_active_store_reload(tmp)
+        test_stale_writer_keeps_routes(tmp)
+        test_save_never_drops_disk_routes(tmp)
     print("all provider_store tests passed")
 
 

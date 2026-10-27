@@ -159,8 +159,56 @@ ALTER_SESSIONS_FORK_POINT_INDEX = f"""
 ALTER TABLE {TABLE_SESSIONS} ADD COLUMN fork_point_index INTEGER;
 """
 
+# Migration v12: 可扮演者的**种类**。这一列不是锦上添花 —— **没有它就会
+# 静默出错**。《我与地坛》里「史铁生」是叙述者节点「我」的别名，
+# `GraphDB.locate_node` 走「精确别名」一档会命中，于是「扮演作者」变成
+# 扮演书里的「我」，一句错话都不报。`role_kind` 决定去哪个库解析：
+#   character（默认，= 旧行为）-> graph.db
+#   author                     -> authors.db
+# 默认值取 character 是对的：这一列出现之前的扮演会话全是角色扮演。
+ALTER_SESSIONS_ROLE_KIND = f"""
+ALTER TABLE {TABLE_SESSIONS} ADD COLUMN role_kind TEXT NOT NULL DEFAULT 'character';
+"""
+
+# 稳定主键。作者层用 author_id（跨书不变，见 authors.db 的存在理由），
+# 角色层留空 —— 那边的主键本来就是 (book_id, 正名)，book_id 在 project_id。
+# 存 id 不存名字：名字会随去重/改名漂移，而这一列是**解析的入口**。
+ALTER_SESSIONS_ROLE_REF = f"""
+ALTER TABLE {TABLE_SESSIONS} ADD COLUMN role_ref TEXT NOT NULL DEFAULT '';
+"""
+
 ALTER_CHAPTERS_TYPE = f"""
 ALTER TABLE {TABLE_BOOK_CHAPTERS} ADD COLUMN chapter_type TEXT NOT NULL DEFAULT 'body';
+"""
+
+# Migration v22: 导入结构 —— 这一章出自哪个 spine 文件、在书目录树的哪一层。
+# 旧库只有 chapter_index（切分流水号），它与 spine 序号并不相等：导入时一个
+# spine 会被 split_html_by_heading 拆成多章（人类简史 34 个文件切出 150 章），
+# 于是按 spine 序号报上来的判断无处安放，硬按序号写就会错位。
+# 默认值必须是常量 —— 见记忆 migration-add-column-trap。
+ALTER_CHAPTERS_SPINE_INDEX = f"""
+ALTER TABLE {TABLE_BOOK_CHAPTERS} ADD COLUMN spine_index INTEGER NOT NULL DEFAULT -1;
+"""
+
+ALTER_CHAPTERS_LEVEL = f"""
+ALTER TABLE {TABLE_BOOK_CHAPTERS} ADD COLUMN level INTEGER NOT NULL DEFAULT -1;
+"""
+
+ALTER_CHAPTERS_PARENT_INDEX = f"""
+ALTER TABLE {TABLE_BOOK_CHAPTERS} ADD COLUMN parent_index INTEGER NOT NULL DEFAULT -1;
+"""
+
+# Migration v23: 标题的结构环境 —— 这一章切在哪个标题标签上、那个标题是不是书
+# 自己目录里的正式条目。人类简史的真小节是 h3、图注/地图是 h5/h6，而图注在 NCX
+# 里一条都没有，只能走「文件层级 + 1」兜底，恰好等于真小节的层级 —— 于是
+# `图2` 在树里成了 `家族秘史` 的兄弟。把这两个事实记下来，才分得开。
+# 默认值必须是常量 —— 见记忆 migration-add-column-trap。
+ALTER_CHAPTERS_HEADING_TAG = f"""
+ALTER TABLE {TABLE_BOOK_CHAPTERS} ADD COLUMN heading_tag TEXT NOT NULL DEFAULT '';
+"""
+
+ALTER_CHAPTERS_IN_TOC = f"""
+ALTER TABLE {TABLE_BOOK_CHAPTERS} ADD COLUMN in_toc INTEGER NOT NULL DEFAULT -1;
 """
 
 # ── Indexes ─────────────────────────────────────────────────────────────────
@@ -226,7 +274,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_BOOKS} (
     total_chars     INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'raw',
     time_created    INTEGER NOT NULL,
-    time_updated    INTEGER NOT NULL
+    time_updated    INTEGER NOT NULL,
+    sort_order      INTEGER NOT NULL DEFAULT 0,
+    last_opened_at  INTEGER NOT NULL DEFAULT 0
 );
 """
 
@@ -239,6 +289,11 @@ CREATE TABLE IF NOT EXISTS {TABLE_BOOK_CHAPTERS} (
     content         TEXT NOT NULL DEFAULT '',
     char_count      INTEGER NOT NULL DEFAULT 0,
     status          TEXT NOT NULL DEFAULT 'raw',
+    spine_index     INTEGER NOT NULL DEFAULT -1,
+    level           INTEGER NOT NULL DEFAULT -1,
+    parent_index    INTEGER NOT NULL DEFAULT -1,
+    heading_tag     TEXT NOT NULL DEFAULT '',
+    in_toc          INTEGER NOT NULL DEFAULT -1,
     UNIQUE(book_id, chapter_index)
 );
 """
@@ -255,9 +310,17 @@ CREATE TABLE IF NOT EXISTS {TABLE_BOOK_CHUNKS} (
     paragraph_count    INTEGER NOT NULL DEFAULT 0,
     paragraph_offsets  TEXT NOT NULL DEFAULT '[]',
     paragraph_sigs     TEXT NOT NULL DEFAULT '[]',
+    summary            TEXT NOT NULL DEFAULT '',
     UNIQUE(book_id, chapter_index, chunk_index)
 );
 """
+
+# Migration v24: 每块一句话简述（bookgraph 提取时顺手产出）。
+# 空串 = 尚未生成（旧库、未跑图谱的书、模型漏写的那几块）。
+CHUNK_SUMMARY_ALTERS = [
+    f"ALTER TABLE {TABLE_BOOK_CHUNKS} "
+    "ADD COLUMN summary TEXT NOT NULL DEFAULT '';",
+]
 
 # Migration v17: chunk 段落身份 —— 段落数 + 每段偏移 [[start,len],...] 相对 chunk content。
 # 恒定默认值（0 / '[]'），旧库走 ALTER 无重建；消费端遇空列用 _extract_paragraphs 低损回填。
@@ -427,6 +490,30 @@ CREATE TABLE IF NOT EXISTS {TABLE_CHAPTER_OVERRIDES} (
 );
 """
 
+# ── Text forms（正文内部的文本形态）────────────────────────────────────────
+# 与 chapters 的 chapter_type 互补：那边是**结构层**（哪些文件是正文），这里
+# 是**特征层**（正文内部有哪几种文本）。窄门的叙述正文（p.calibre14）与书信
+# （p.calibre19）段均长都是 70 字上下，统计上分不开，只有样式定义能区分 ——
+# 不识别的话，下游提取会把信件的口吻当成叙述者的口吻。
+#
+# 形态名称由 agent 自行归纳（书籍文字形态过于自由，无法定义通用词表），所以
+# name 是自由文本，evidence 是它给出的判断依据（可追溯性要求）。
+
+TABLE_BOOK_TEXT_FORMS = "book_text_forms"
+
+CREATE_BOOK_TEXT_FORMS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_BOOK_TEXT_FORMS} (
+    book_id      TEXT NOT NULL REFERENCES {TABLE_BOOKS}(id) ON DELETE CASCADE,
+    selector     TEXT NOT NULL,
+    name         TEXT NOT NULL DEFAULT '',
+    evidence     TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT 'agent',
+    time_created INTEGER NOT NULL,
+    time_updated INTEGER NOT NULL,
+    PRIMARY KEY (book_id, selector)
+);
+"""
+
 # ── Annotation system DDL ──────────────────────────────────────────────────
 
 CREATE_IMPORT_LOG = f"""
@@ -528,6 +615,8 @@ class SessionRow:
     keywords: str = ""
     character_name: str = ""
     fork_point_index: int | None = None
+    role_kind: str = "character"
+    role_ref: str = ""
 
 
 @dataclass
@@ -579,6 +668,8 @@ class BookRow:
     status: str = "raw"
     time_created: int = 0
     time_updated: int = 0
+    sort_order: int = 0          # 书架自定义排序位次；0 = 未排名（排在已排名之后）
+    last_opened_at: int = 0      # 最近一次打开该书的时间戳；0 = 从未打开
 
 
 @dataclass
@@ -592,6 +683,17 @@ class BookChapterRow:
     char_count: int = 0
     status: str = "raw"
     chapter_type: str = "body"
+    # 导入结构（v22）：-1 = 未知。spine_index 是这一章出自哪个 spine 文件
+    # （导入分析的 agent 按文件说话，落库要按它翻译）；level/parent_index
+    # 是这本书自己的目录树位置（0 = 最外层），取自 NCX/nav 的嵌套深度。
+    spine_index: int = -1
+    level: int = -1
+    parent_index: int = -1
+    # 标题结构环境（v23）：heading_tag 是切分命中的标签名（h1..h6），"" = 无标题
+    # （整文件成章）或非 h 标签的方法切出；in_toc：1 命中书目录 / 0 未命中 / -1 未知。
+    # 真小节通常 h3 且 in_toc=1，图注/地图通常 h5/h6 且 in_toc=0。
+    heading_tag: str = ""
+    in_toc: int = -1
 
 
 @dataclass
@@ -623,6 +725,7 @@ class BookChunkRow:
     paragraph_count: int = 0
     paragraph_offsets: str = "[]"   # JSON [[start,len],...] 每段相对 content 的偏移
     paragraph_sigs: str = "[]"      # JSON [sig,...] 每段体例签名（与 offsets 平行对齐）
+    summary: str = ""               # 一块一句话（bookgraph 产出）；空 = 未生成
 
 
 @dataclass

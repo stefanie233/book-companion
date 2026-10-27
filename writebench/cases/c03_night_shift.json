@@ -1,0 +1,47 @@
+{
+  "id": "c03_night_shift",
+  "split": "dev",
+  "kind": "cold_start",
+  "brief": "第一人称独白。考的是：不可靠叙述、动机留白、不自我辩解。",
+  "work": {
+    "title": "夜班",
+    "genre": "第一人称小说",
+    "premise": "夜班保安在门卫室值夜，一个陌生女人来找人。",
+    "narrative_pov": "第一人称",
+    "target_chars": 1500,
+    "style_profile": {
+      "hard_rules": ["叙述者可以自嘲，但不能为自己开脱", "全文只有一个场景"]
+    }
+  },
+  "chapter": {"index": 1, "title": "夜班"},
+  "contract": {
+    "purpose": "一个女人来门卫室找一个叫老陈的人，我故意给她指错路。",
+    "must_hit_now": [
+      "女人敲门并说明来意",
+      "我给她指了错误的方向",
+      "她走后我意识到自己其实认得她"
+    ],
+    "must_preserve": ["我始终不承认自己为什么指错路"],
+    "forbidden_cross": [
+      "不解释我指错路的动机",
+      "不写出女人的名字",
+      "不出现「我其实是个好人」式的自我辩解"
+    ],
+    "ending_state": "我关掉门卫室的灯，坐在黑暗里听雨",
+    "story_time": "深夜",
+    "target_chars": 1500
+  },
+  "prior": [],
+  "facts": [],
+  "promises": [],
+  "references": {
+    "query": ["独白", "自嘲", "夜晚", "陌生人", "指路", "恶意", "意识", "雨"],
+    "authors": [],
+    "books": [{"stable_book_id": "sb-28c76aa9ed7d4a38", "book_id": "27279dd5a3cc9ffb", "label": "地下室手记"}]
+  },
+  "check": {
+    "must_hit_keywords": [["门"], ["指"], ["认得"]],
+    "forbidden_keywords": ["我其实是个好人", "我之所以"],
+    "leak_names": ["地下室", "陀思妥耶夫斯基", "丽莎"]
+  }
+}

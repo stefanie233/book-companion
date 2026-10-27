@@ -2,9 +2,10 @@ Book Companion — Third-Party Notices
 ====================================
 
 Book Companion 的部分代码在结构、模式或其直接实现上参考/派生自以下
-第三方项目。以下项目均为 MIT 许可；按 MIT 的要求，其版权声明在再
-分发时须随副本保留。各"版权行"均逐字抄自上游 LICENSE 文件原文，
-请勿改写（含空格与标点）。
+第三方项目，或随分发内嵌其构建产物。以下项目均为宽松许可
+（MIT / BSD-2-Clause / ISC）；按其要求，版权声明在再分发时须随副本
+保留。各"版权行"均逐字抄自上游 LICENSE 文件原文，请勿改写
+（含空格与标点）。
 
 ─────────────────────────────────────────────────────────────────────
 
@@ -36,23 +37,48 @@ Book Companion 的部分代码在结构、模式或其直接实现上参考/派�
 
 ─────────────────────────────────────────────────────────────────────
 
-4. 内嵌前端库（reader/lib/，原样打包、未修改，均为 MIT）
+4. 内嵌前端库（reader/lib/，原样打包，以独立 <script> 挂载；
+   许可类型见各条）
    - reader/lib/cytoscape.min.js
+     许可证:  MIT
      上游:    https://github.com/cytoscape/cytoscape.js
      版权行:  Copyright (c) 2016-2024, The Cytoscape Consortium.
               （抄自文件头原文）
    - reader/lib/layout-base.js
+     许可证:  MIT
      上游:    https://github.com/iVis-at-Bilkent/layout-base
      版权行:  Copyright (c) 2019 iVis@Bilkent
    - reader/lib/cose-base.js
+     许可证:  MIT
      上游:    https://github.com/iVis-at-Bilkent/cose-base
      版权行:  Copyright (c) 2019 - present, iVis@Bilkent.
    - reader/lib/cytoscape-fcose.js
+     许可证:  MIT
      上游:    https://github.com/iVis-at-Bilkent/cytoscape.js-fcose
      版权行:  Copyright (c) 2018 - present, iVis-at-Bilkent.
+   - reader/lib/epub.min.js（epub.js 0.3.93）
+     许可证:  BSD-2-Clause
+     上游:    https://github.com/futurepress/epub.js
+     版权行:  Copyright (c) 2013, FuturePress
+   - reader/lib/jszip.min.js（JSZip 3.10.1）
+     许可证:  MIT（上游为 MIT / GPLv3 双许可，本项目按 MIT 分发）
+     上游:    https://github.com/Stuk/jszip
+     版权行:  (c) 2009-2016 Stuart Knightley <stuart [at] stuartk.com>
+              （抄自文件头原文）
+   - reader/lib/lucide.min.js（Lucide 1.27.0）
+     许可证:  ISC（部分图标源自 Feather，MIT）
+     上游:    https://github.com/lucide-icons/lucide
+     版权行:  Copyright (c) 2026 Lucide Icons and Contributors
+              Copyright (c) 2013-present Cole Bemis（Feather 部分，MIT）
+   - reader/lib/morphicons.dom.js（Morphicons 1.7.1）
+     许可证:  MIT
+     上游:    https://github.com/guillermolg00/morphicons
+     版权行:  Copyright (c) 2026 Guillermo
 
    说明: 这些文件以独立的 <script> 挂载、未经修改或内联。本文件
-         已保留其版权声明，满足 MIT 的复写要求。
+         已保留其版权声明，满足各许可证的复写要求。morphicons 构建
+         产物中的本机源路径注释前缀已归一化为 `morphicons/`，不改动
+         代码逻辑。
 
 ─────────────────────────────────────────────────────────────────────
 

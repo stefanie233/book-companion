@@ -12,10 +12,11 @@ import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from compact import (
     CompactionConfig,
+    CompactionResult,
     SummaryCompressionBudget,
     compact_and_compress,
     compact_session,
@@ -32,7 +33,10 @@ from permissions import PermissionMode, PermissionOutcome, PermissionPolicy
 from session import Session
 from skills import SkillManager
 from tools import ToolRegistry
+from provider_store import config_for
 import usage_log
+
+logger = logging.getLogger(__name__)
 
 
 # ── Traits (Python Protocols) ───────────────────────────────────────────
@@ -47,6 +51,7 @@ class ApiClient(Protocol):
         messages: list[dict],
         tools: list[dict],
         cancel_event: asyncio.Event | None = None,
+        scenario: str = "",
     ) -> AsyncGenerator[tuple[str, list[dict], TokenUsage | None], None]:
         """Send request, yield (text_delta, accumulated_tool_calls, usage_or_none).
 
@@ -105,18 +110,26 @@ class OpenAIClient:
         messages: list[dict],
         tools: list[dict],
         cancel_event: asyncio.Event | None = None,
+        scenario: str = "",
     ) -> AsyncGenerator[tuple[str, list[dict], TokenUsage | None], None]:
         """Stream LLM response chunks asynchronously.
 
         Yields (text_delta, accumulated_tool_calls, usage_or_none) for each chunk.
         Retries up to 2 times on transient network errors.
+
+        ``scenario`` picks the routed endpoint (provider_store.config_for);
+        empty = the global config.
         """
         import aiohttp
+
+        # Per-call endpoint resolution — the console may rebind this call
+        # point while another pipeline is mid-flight, so never cache it.
+        cfg = config_for(self.config, scenario) if scenario else self.config
 
         api_messages = [{"role": "system", "content": system_prompt}] + messages
 
         body: dict = {
-            "model": self.config.model,
+            "model": cfg.model,
             "messages": api_messages,
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -125,7 +138,7 @@ class OpenAIClient:
             body["tools"] = tools
 
         headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
+            "Authorization": f"Bearer {cfg.api_key}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
         }
@@ -138,7 +151,7 @@ class OpenAIClient:
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        f"{self.config.api_base}/chat/completions",
+                        f"{cfg.api_base}/chat/completions",
                         json=body,
                         headers=headers,
                         timeout=aiohttp.ClientTimeout(total=120),
@@ -242,7 +255,7 @@ class OpenAIClient:
                 # Full stream consumed — record real usage exactly once.
                 if last_usage is not None:
                     usage_log.record(
-                        model=self.config.model,
+                        model=cfg.model,
                         tokens_in=last_usage.input_tokens,
                         tokens_out=last_usage.output_tokens,
                     )
@@ -253,7 +266,7 @@ class OpenAIClient:
                     return
                 continue
 
-        usage_log.record(model=self.config.model, status="error")  # all retries exhausted
+        usage_log.record(model=cfg.model, status="error")  # all retries exhausted
         raise last_exc  # type: ignore[misc]
 
     async def complete(
@@ -263,12 +276,15 @@ class OpenAIClient:
         *,
         model: str | None = None,
         timeout: int = 30,
+        scenario: str = "",
     ) -> str | None:
         """Non-streaming completion for lightweight tasks (title gen, etc.)."""
         import aiohttp
 
+        cfg = config_for(self.config, scenario) if scenario else self.config
+
         body: dict = {
-            "model": model or self.config.model,
+            "model": model or cfg.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
@@ -277,14 +293,14 @@ class OpenAIClient:
         }
 
         headers = {
-            "Authorization": f"Bearer {self.config.api_key}",
+            "Authorization": f"Bearer {cfg.api_key}",
             "Content-Type": "application/json",
         }
 
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{self.config.api_base}/chat/completions",
+                    f"{cfg.api_base}/chat/completions",
                     json=body,
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=timeout),
@@ -294,7 +310,7 @@ class OpenAIClient:
                     data = json.loads(await resp.text())
                     u = data.get("usage") or {}
                     usage_log.record(
-                        model=model or self.config.model,
+                        model=model or cfg.model,
                         tokens_in=u.get("prompt_tokens", 0),
                         tokens_out=u.get("completion_tokens", 0),
                     )
@@ -447,11 +463,15 @@ class ConversationRuntime:
         db: Any = None,
         *,
         system_prompt: str | None = None,
+        scenario: str = "chat",
     ):
         self.session = session
         self.api_client = api_client
         self.tool_registry = tool_registry
         self.config = config
+        # Route key for model binding — sub-agents / import analysis pass
+        # their own so api_client resolves per call, not per instance.
+        self.scenario = scenario
         self.memory_store = memory_store
         self.memory_manager = memory_manager  # MemoryManager or None
         self.db = db  # storage.db.Database — for recall hook access
@@ -469,7 +489,11 @@ class ConversationRuntime:
         # Interaction mode — restore from session if available
         self._mode = session.mode if session.mode in MODE_LABELS else DEFAULT_MODE
 
-        # Build system prompt once per runtime
+        # Build system prompt once per runtime.  A caller-supplied prompt is
+        # *pinned*: run_turn() must not rebuild it — sub-agents pass their own
+        # prompt and would otherwise be handed the main agent's persona/skills
+        # prompt instead (which silently defeated SUBAGENT_SYSTEM_PROMPT).
+        self._system_prompt_pinned = system_prompt is not None
         self.system_prompt = system_prompt if system_prompt is not None else self._build_system_prompt()
 
         # Permission policy
@@ -571,7 +595,9 @@ class ConversationRuntime:
                 self.skill_manager.activate(name)
 
             # Rebuild system prompt for this turn (enables L2 context injection)
-            self.system_prompt = self._build_system_prompt(user_input=user_input)
+            # Pinned prompts (sub-agents) keep what the constructor was given.
+            if not self._system_prompt_pinned:
+                self.system_prompt = self._build_system_prompt(user_input=user_input)
 
             self.session.push_user_text(user_input)
             api_messages = self._build_api_messages()
@@ -648,7 +674,8 @@ class ConversationRuntime:
                         stream_active=True, runtime=self,
                     ))
                     async for text_chunk, accum_tools, usage in self.api_client.stream(
-                        self.system_prompt, api_messages, tools_schema, cancel_event,
+                        self.system_prompt, api_messages, tools_schema,
+                        cancel_event, scenario=self.scenario,
                     ):
                         if text_chunk:
                             last_text += text_chunk

@@ -113,7 +113,8 @@ def install_context_log_routes(app: web.Application, context_recorder) -> None:
                  else Path.home() / ".hermes" / "context_log.db")
     if hermes_db.exists():
         try:
-            app["hermes_recorder"] = ContextRecorder(hermes_db)
+            # 只读集成：Hermes 的库是**别人的文件**，不许在它上面跑 ALTER。
+            app["hermes_recorder"] = ContextRecorder(hermes_db, migrate=False)
         except Exception:
             app["hermes_recorder"] = None
     else:

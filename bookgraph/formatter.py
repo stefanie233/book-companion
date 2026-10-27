@@ -37,6 +37,20 @@ _EVENT_TYPE_LABELS = {
     "opinion": "观点",
 }
 
+
+# Provenance subjects like "LLM提取" are extraction metadata, not something the
+# character would ever think about. Printed in the role card, they tell the
+# model every turn that it is reading an AI pipeline's output.
+_PROVENANCE_SUBJECTS = {"llm提取", "模型提取", "ai提取", "llm"}
+
+
+def _subject_tag(subject: str | None) -> str:
+    s = (subject or "").strip()
+    if not s or s.lower() in _PROVENANCE_SUBJECTS:
+        return ""
+    return f"({s})"
+
+
 # ── observation scoring (trust × temporal decay) ─────────────────────────────
 # score = trust × 0.5^(age/half_life) — exponential half-life decay.
 # Half-life in days; 0 = disabled (trust only, no decay).
@@ -148,7 +162,7 @@ def format_node(detail: dict, max_chapter: int | None = None) -> str:
         lines.append("")
 
     # ── Relations ────────────────────────────────────────────────────────
-    relations = detail.get("relations") or []
+    relations = _rank_relations(detail.get("relations") or [])
     if relations:
         lines.append(f"### 关系 ({len(relations)} 条)")
         for r in relations[:20]:
@@ -212,7 +226,11 @@ def format_node(detail: dict, max_chapter: int | None = None) -> str:
                     extras.append(f"{f_q} 条台词")
                 if extras:
                     lines.append(f"未展开: {'、'.join(extras)}。")
-                lines.append(f'查看完整 -> graph_node("{name}", max_chapter=-1)')
+                # 这里曾经是 ``查看完整 -> graph_node(name, max_chapter=-1)`` ——
+                # **提示词直接把绕门的方法教给了模型**。代码把门夹上了，提示词
+                # 又递了钥匙。现在明说这是硬约束，且 ``-1`` 已被夹住。
+                lines.append("（这些要等读者读到那里。防剧透是硬约束，"
+                             "任何参数都不会越过读者的阅读进度。）")
         else:
             lines.append("### 出场")
             lines.append(", ".join(f"ch{c}" for c in timeline_sorted))
@@ -411,9 +429,60 @@ def format_timeline(detail: dict, max_chapter: int | None = None) -> str:
     return "\n".join(lines)
 
 
+def _rank_relations(relations: list[dict]) -> list[dict]:
+    """角色卡的「关键关系」排序 —— **持久关系优先，再按对方的份量**。
+
+    旧实现直接取 ``relations[:3]``，而 ``get_node_detail`` 是按章号排序的，
+    于是最先出现的三条往往是一幕戏里的动作（「她问他」「他答她」），真正
+    定义这个人的关系（父亲、爱人、妹妹）排在几十条之后看不见。实测窄门的
+    阿莉莎，前三条是 ``studies_with`` / ``asks_secrecy`` / ``comforts``。
+
+    排序键（越小越前）：
+      1. 是否持久关系（见 ``invariants.RELATION_KINDS``）—— 这是主序。
+      2. 对方节点的度数 —— 「和阿贝尔」比「和一个只出现一次的路人」重要。
+      3. 被提到的次数 —— 跨越多章的关系比一句带过的更实。
+      4. 章号 —— 同分时早出现的先来（稳定、可缓存）。
+    """
+    from bookgraph.invariants import is_durable_relation
+
+    def key(r: dict):
+        return (
+            0 if is_durable_relation(str(r.get("kind") or "")) else 1,
+            -(r.get("other_degree") or 0),
+            -(r.get("occurrences") or 1),
+            r.get("chapter") is None,
+            r.get("chapter") or 0,
+            str(r.get("other_name") or ""),
+        )
+
+    return sorted(relations, key=key)
+
+
+def _pick_relations(relations: list[dict], n: int) -> list[dict]:
+    """从排好序的关系里挑 n 条，**同一个人最多占两条**。
+
+    主角和另一个主角之间常常有 love / writes_to / confides_in / fears 好几条，
+    全占满会让卡片失去「她在这个世界里的位置」这一层信息 —— 对扮演来说，
+    「她爱杰罗姆，也怕父亲」比「她爱杰罗姆，给他写信，向他倾诉」更有用。
+    只做**一轮**补充：人不够时仍按原序补满，不为了凑多样性去拿弱关系。
+    """
+    picked: list[dict] = []
+    per_other: dict[str, int] = {}
+    for r in relations:
+        other = str(r.get("other_name") or "")
+        if per_other.get(other, 0) >= 2:
+            continue
+        picked.append(r)
+        per_other[other] = per_other.get(other, 0) + 1
+        if len(picked) >= n:
+            return picked
+    return picked
+
+
 # ── role-play kernel (identity + minimal extension, static region) ──────────
 
-def format_role_kernel(detail: dict, max_chapter: int | None = None) -> str:
+def format_role_kernel(detail: dict, max_chapter: int | None = None,
+                       chapter_label: str | None = None) -> str:
     """Format a character's role-play kernel as compact markdown.
 
     Pure function - no LLM. Lives in the system prompt static region
@@ -448,6 +517,7 @@ def format_role_kernel(detail: dict, max_chapter: int | None = None) -> str:
 
     # Key observations: facts + latest perspective per field (not all, not a conclusion)
     observations = detail.get("observations") or []
+    has_obs = False
     if observations:
         facts = [o for o in observations if o.get("event_type") == "fact"]
         persp_by_field: dict[str, dict] = {}
@@ -459,30 +529,29 @@ def format_role_kernel(detail: dict, max_chapter: int | None = None) -> str:
                     persp_by_field[f] = o
         key_obs = facts + list(persp_by_field.values())
         if key_obs:
+            has_obs = True
             lines.append("### 关键观察")
             for ob in sorted(key_obs, key=lambda x: (-_observation_score(x), x.get("chapter") is None, x.get("chapter") or 0))[:5]:
                 field_label = _FIELD_LABELS.get(ob.get("field", ""), ob.get("field", "?"))
                 val = ob.get("value", "")
                 etype = ob.get("event_type", "perspective")
                 type_tag = _EVENT_TYPE_LABELS.get(etype, etype)
-                subject = ob.get("subject")
-                subj_tag = f"({subject})" if subject else ""
+                subj_tag = _subject_tag(ob.get("subject"))
                 lines.append(f"- [{type_tag}{subj_tag}] {field_label}: {val}")
             lines.append("")
 
     # Minimal extension: top-3 relations + top-3 quotes
-    relations = detail.get("relations") or []
+    relations = _rank_relations(detail.get("relations") or [])
     if relations:
         lines.append("### 关键关系")
-        for r in relations[:3]:
+        for r in _pick_relations(relations, 3):
             rkind = r.get("kind", "?")
             other = r.get("other_name", "?")
             rch = r.get("chapter")
             rch_tag = f" ch{rch}" if rch is not None else ""
             etype = r.get("event_type", "fact")
             type_tag = _EVENT_TYPE_LABELS.get(etype, etype)
-            subject = r.get("subject")
-            subj_tag = f"({subject})" if subject else ""
+            subj_tag = _subject_tag(r.get("subject"))
             tag = f"{rkind}{rch_tag}·{type_tag}{subj_tag}"
             if r.get("direction") == "out":
                 lines.append(f"- {name} --[{tag}]--> {other}")
@@ -491,8 +560,9 @@ def format_role_kernel(detail: dict, max_chapter: int | None = None) -> str:
         lines.append("")
 
     quotes = detail.get("quotes") or []
+    has_quotes = bool(quotes)
     if quotes:
-        lines.append("### 经典台词")
+        lines.append("### 原话（语气样本，不必引用）")
         for q in quotes[:3]:
             text = q.get("text", "")
             qch = q.get("chapter")
@@ -502,11 +572,41 @@ def format_role_kernel(detail: dict, max_chapter: int | None = None) -> str:
             lines.append(f'- "{text}"{ctx_tag}{qch_tag}')
         lines.append("")
 
+    # How to use this card. Without it the model treats observations and quotes
+    # as lines to re-say (measured: the card's "把写作看作绝路之后的一条路"
+    # came back out as an aphorism). Keep it declarative — the card's own
+    # register is imitated, so a rule written as "A is X, not Y" seeds the very
+    # rhetorical tic we are trying to remove.
+    if has_obs or has_quotes:
+        lines.append("### 这份资料怎么用")
+        lines.append("上面是背景资料。用你自己的说法回应，不要拿它们撑篇幅。")
+        if has_obs:
+            lines.append("- 「关键观察」是别人对你的概括。")
+        if has_quotes:
+            lines.append("- 「原话」只是语气样本，这一回合不必引用。")
+        lines.append("- 不复述，也不扩写成格言。")
+        lines.append("")
+
     # Knowledge boundary (spoiler-aware soft constraint)
     lines.append("### 知识边界")
     if max_chapter is not None:
-        lines.append(f"沉浸模式 · 读者当前 ch{max_chapter} · 仅知悉第 {max_chapter} 章及之前的内容。")
+        # **不要把内部坐标当成人话章号。** ``chapter_index`` 是 EPUB 脊序，
+        # 窄门的前言/目录占了 13 个位置，正文第一章的坐标是 13 —— 旧文案写
+        # 「仅知悉第 13 章」，模型会对着读者说「第十三章」。给了书名就用书名。
+        where = (f"「{chapter_label}」" if chapter_label
+                 else "内部章序 ch%d" % max_chapter)
+        lines.append(f"沉浸模式 · 读者当前读到{where} · 仅知悉此处及之前的内容。")
+        lines.append("卡片里的 chN 是书内章节坐标，不等于读者看到的章序号，"
+                     "不要把它当成章号说出来。")
         lines.append("勿主动越界查询后续；读者未提及的后续情节，你尚不知晓。")
+        # 无锚点的条目**不展示**（定位不到时间线就无法证明安全），但要说出来。
+        # 「沉默不是成功」：不报的话，agent 会以为这个人的语料就这么多。
+        un = (detail.get("unanchored_observations_count", 0)
+              + detail.get("unanchored_relations_count", 0)
+              + detail.get("unanchored_quotes_count", 0))
+        if un:
+            lines.append(f"另有 {un} 条记录因提取时未标注章节，无法判断是否在读者进度内，"
+                         "已一律不展示 —— 不要凭它们作答。")
     else:
         lines.append("全局模式 · 全知视角，可引用全书任意位置的信息。")
 

@@ -1,0 +1,47 @@
+{
+  "id": "c02_tea_house",
+  "split": "train",
+  "kind": "cold_start",
+  "brief": "民国小说场面。考的是：对白张力、信息控制、不靠旁白解释过去。",
+  "work": {
+    "title": "茶楼",
+    "genre": "民国小说",
+    "premise": "江南小城茶楼，林素与三年前不告而别的旧识周启年重逢。",
+    "narrative_pov": "第三人称限知（林素）",
+    "target_chars": 2000,
+    "style_profile": {
+      "hard_rules": ["视角只在林素身上", "不写内心独白以外的解释性旁白"]
+    }
+  },
+  "chapter": {"index": 1, "title": "茶楼"},
+  "contract": {
+    "purpose": "林素在自家茶楼遇见三年前不告而别的周启年；他带来省城有人要查林家的消息。",
+    "must_hit_now": [
+      "两人在茶楼重逢",
+      "周启年说出有人在查林家",
+      "林素做出一个决定"
+    ],
+    "must_preserve": ["林素始终没有问他这三年去了哪里"],
+    "forbidden_cross": [
+      "不说明周启年这三年去了哪里",
+      "不揭示周启年的真实身份",
+      "不用旁白交代两人过去的关系"
+    ],
+    "ending_state": "林素把盏里的茶泼进天井，起身离开",
+    "story_time": "梅雨午后",
+    "target_chars": 2000
+  },
+  "prior": [],
+  "facts": [],
+  "promises": [],
+  "references": {
+    "query": ["重逢", "旧识", "茶楼", "消息", "决定", "对白", "克制", "社交"],
+    "authors": [],
+    "books": [{"stable_book_id": "sb-60763bc1e552451d", "book_id": "0dd1db9a41e5fb04", "label": "面纱"}]
+  },
+  "check": {
+    "must_hit_keywords": [["茶"], ["查"], ["林家"], ["决定"]],
+    "forbidden_keywords": ["三年前他去了", "他的真实身份是"],
+    "leak_names": ["凯蒂", "沃尔特", "香港", "湄潭府"]
+  }
+}

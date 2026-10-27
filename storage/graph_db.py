@@ -13,6 +13,7 @@ import json
 import logging
 import sqlite3
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ TABLE_LLM_LOGS = "graph_llm_logs"
 TABLE_QUOTES = "graph_quotes"
 TABLE_OBSERVATIONS = "graph_observations"
 TABLE_TAG_REGISTRY = "graph_tag_registry"
+TABLE_NOTES = "graph_notes"
 
 
 # ── DDL ───────────────────────────────────────────────────────────────────
@@ -196,34 +198,113 @@ GRAPH_DDL = [
 ]
 
 # FTS5 + triggers (v3 corrected: columns strictly aligned with the nodes table)
+#
+# 列名必须是 ``id``（= ``nodes.id``），**不能叫 ``node_id``**。external-content
+# 的 FTS5 表在查询时按**列名**回 content 表取值，声明一个 content 表上不存在的
+# 列名会让整张表**任何查询都抛** ``no such column: T.node_id`` —— 连
+# ``SELECT COUNT(*)`` 都不行。实测后果：``search_nodes`` / ``search_all`` 的
+# FTS 分支**永远**抛异常掉进 LIKE 兜底，前缀匹配与 BM25 从未生效，而 docstring
+# 一直写着「FTS5 prefix match」。（触发器写的是 ``NEW.id``，所以索引侧一直是对的
+# —— 只有查询侧坏。这个不对称正是它藏得住的原因。）
 GRAPH_FTS_DDL = [
     f"""
     CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5(
-        node_id, canonical_name, kind, description,
+        id, canonical_name, kind, description,
         content='{TABLE_NODES}', content_rowid='rowid'
     );
     """,
     f"""
     CREATE TRIGGER IF NOT EXISTS nodes_ai AFTER INSERT ON {TABLE_NODES} BEGIN
-        INSERT INTO nodes_fts(rowid, node_id, canonical_name, kind, description)
+        INSERT INTO nodes_fts(rowid, id, canonical_name, kind, description)
         VALUES (NEW.rowid, NEW.id, NEW.canonical_name, NEW.kind, NEW.description);
     END;
     """,
     f"""
     CREATE TRIGGER IF NOT EXISTS nodes_ad AFTER DELETE ON {TABLE_NODES} BEGIN
-        INSERT INTO nodes_fts(nodes_fts, rowid, node_id, canonical_name, kind, description)
+        INSERT INTO nodes_fts(nodes_fts, rowid, id, canonical_name, kind, description)
         VALUES ('delete', OLD.rowid, OLD.id, OLD.canonical_name, OLD.kind, OLD.description);
     END;
     """,
     f"""
     CREATE TRIGGER IF NOT EXISTS nodes_au AFTER UPDATE ON {TABLE_NODES} BEGIN
-        INSERT INTO nodes_fts(nodes_fts, rowid, node_id, canonical_name, kind, description)
+        INSERT INTO nodes_fts(nodes_fts, rowid, id, canonical_name, kind, description)
         VALUES ('delete', OLD.rowid, OLD.id, OLD.canonical_name, OLD.kind, OLD.description);
-        INSERT INTO nodes_fts(rowid, node_id, canonical_name, kind, description)
+        INSERT INTO nodes_fts(rowid, id, canonical_name, kind, description)
         VALUES (NEW.rowid, NEW.id, NEW.canonical_name, NEW.kind, NEW.description);
     END;
     """,
 ]
+
+
+# ── Anchor relink report ──────────────────────────────────────────────────
+
+# 两行并一行时，状态取「更好」的那个。done 是已经花过 token 的成果，
+# 不能被一次重导静默抹成 pending —— 那会让续跑白跑一遍（或反过来，
+# 把没提过的块标成已提过而永远不再提）。
+_STATUS_RANK = {"done": 3, "excluded": 2, "failed": 1, "pending": 0}
+
+
+_BRACKETS = (("《", "》"), ("〈", "〉"), ("「", "」"))
+
+
+def _bracket_variant(name: str) -> str:
+    """``《圣经》`` → ``圣经``；``圣经`` → ``《圣经》``。其它原样返回。
+
+    只在带/不带书名号之间来回换一次，不做任何别的归一 —— 这条规则要能一眼
+    看懂，才敢让它合并节点。
+    """
+    s = (name or "").strip()
+    for left, right in _BRACKETS:
+        if s.startswith(left) and s.endswith(right) and len(s) > 2:
+            return s[1:-1].strip()
+    if s:
+        left, right = _BRACKETS[0]
+        return f"{left}{s}{right}"
+    return ""
+
+
+def _better_status(a: str | None, b: str | None) -> str:
+    a, b = a or "pending", b or "pending"
+    return a if _STATUS_RANK.get(a, 0) >= _STATUS_RANK.get(b, 0) else b
+
+
+@dataclass
+class RelinkReport:
+    """``relink_chunks`` 的结果。每一条被拒绝的记录都要能说出为什么。"""
+
+    book_id: str = ""
+    total: int = 0                  # 该书的 graph_chunks 行数
+    already_ok: int = 0             # 锚点本来就对
+    by_hash: int = 0                # 按内容指纹重连
+    by_coord: int = 0               # 按 (chapter, chunk) 坐标重连
+    merged: int = 0                 # 重连到一条已存在的行（内容合并）
+    ambiguous: list[dict] = field(default_factory=list)   # 多个候选 → 拒绝
+    unresolved: list[dict] = field(default_factory=list)  # 找不到 → 拒绝
+    deduped_quotes: int = 0         # 重连后与已有引文重复而被丢弃
+    deduped_edges: int = 0          # 同上，边
+    nodes_relinked: int = 0         # 被改指到新块的节点首现锚点
+    obs_reanchored: int = 0         # 重算了 anchor_chapter 的观察
+    status_kept: int = 0            # 合并两行时保住了 done 状态
+    applied: bool = False           # dry-run 时为 False
+
+    @property
+    def relinked(self) -> int:
+        return self.by_hash + self.by_coord
+
+    @property
+    def resolved(self) -> int:
+        return self.already_ok + self.relinked
+
+    def summary(self) -> str:
+        return (f"锚点重连 {self.book_id}: {self.resolved}/{self.total} 可用"
+                f"（原本就对 {self.already_ok}、指纹 {self.by_hash}、"
+                f"坐标 {self.by_coord}、合并 {self.merged}）；"
+                f"拒绝 歧义 {len(self.ambiguous)} / 找不到 {len(self.unresolved)}"
+                + (f"；节点首现 {self.nodes_relinked} 观察锚 {self.obs_reanchored}"
+                   if (self.nodes_relinked or self.obs_reanchored) else "")
+                + (f"；去重 引文 {self.deduped_quotes} 边 {self.deduped_edges}"
+                   if (self.deduped_quotes or self.deduped_edges) else "")
+                + ("" if self.applied else "（dry-run，未写入）"))
 
 
 # ── GraphDB ───────────────────────────────────────────────────────────────
@@ -365,6 +446,70 @@ class GraphDB(BaseDatabase):
             f"CREATE INDEX IF NOT EXISTS idx_llmlog_run ON {TABLE_LLM_LOGS}(run_id, id);",
             f"CREATE INDEX IF NOT EXISTS idx_llmlog_book ON {TABLE_LLM_LOGS}(book_id, id);",
         ]),
+        (8, "Verbatim evidence: evidence_text on observations + edges", [
+            # 断言要能**指回原文**。以前 observations.evidence 存的是 chunk_id
+            # （锚点），edges 连锚点都没有 —— 于是「这句断言有原文依据吗」这个
+            # 问题在库层面根本问不出来。常量默认值，不踩 migration 陷阱。
+            f"ALTER TABLE {TABLE_OBSERVATIONS} ADD COLUMN evidence_text TEXT DEFAULT '';",
+            f"ALTER TABLE {TABLE_EDGES} ADD COLUMN evidence_text TEXT DEFAULT '';",
+        ]),
+        (9, "Reader notes: 读者笔记（agent 自己的笔记本）", [
+            # 见 docs/reader-notes-design.md。与 books.db 的 annotations 是
+            # 两回事，**不要合并** —— 那张表是用户对正文的批注，而且已经被
+            # recall 的 user-notes / user-highlights 两个通道消费，混表会让
+            # agent 的笔记漏进 <user-notes> 喂回给它自己，绕成一个环。
+            #
+            # node_id 可空：读者笔记不一定挂在实体上（「这里的节奏真好」）。
+            # chapter_index 刻意不落库 —— 查询时 join graph_chunks 现算，
+            # 少一个会随重导过期的东西。
+            f"""CREATE TABLE IF NOT EXISTS {TABLE_NOTES} (
+                id          TEXT PRIMARY KEY,
+                project_id  TEXT NOT NULL,
+                node_id     TEXT,
+                chunk_id    TEXT NOT NULL,
+                quote_text  TEXT NOT NULL DEFAULT '',
+                text        TEXT NOT NULL DEFAULT '',
+                created_at  TEXT DEFAULT (datetime('now'))
+            );""",
+            f"CREATE INDEX IF NOT EXISTS idx_notes_node ON {TABLE_NOTES}(project_id, node_id);",
+            f"CREATE INDEX IF NOT EXISTS idx_notes_chunk ON {TABLE_NOTES}(chunk_id);",
+        ]),
+        (10, "修复 nodes_fts：列名 node_id 在 content 表上不存在，整张 FTS 不可查", [
+            # 见 GRAPH_FTS_DDL 的注释。建表语句在 GRAPH_FTS_DDL 里只有一份，
+            # 这里直接复用（迁移 1 对**新库**建的就是修好的版本，本迁移对它是
+            # 空操作；对**旧库**才是真正的重建）。
+            "DROP TRIGGER IF EXISTS nodes_ai;",
+            "DROP TRIGGER IF EXISTS nodes_ad;",
+            "DROP TRIGGER IF EXISTS nodes_au;",
+            "DROP TABLE IF EXISTS nodes_fts;",
+            *GRAPH_FTS_DDL,
+            # 触发器只对**此后**的增删改生效，存量行要靠 rebuild 补索引。
+            "INSERT INTO nodes_fts(nodes_fts) VALUES('rebuild');",
+        ]),
+        (11, "LLM 调用台账：记前缀缓存命中与推理 token", [
+            # 命中率取决于**前缀是否稳定**，不是端点随机行为 —— 不记这一列，
+            # 「为什么缓存命中率低」永远只能靠猜。
+            f"ALTER TABLE {TABLE_LLM_LOGS} ADD COLUMN tokens_cached INTEGER;",
+            # 推理 token 单列记：输出总量里有多少是思考、多少是正文，
+            # 决定了优化该砍提示词还是该砍推理。
+            f"ALTER TABLE {TABLE_LLM_LOGS} ADD COLUMN reasoning_tokens INTEGER;",
+        ]),
+        (12, "边去重：occurrences 计数列（同一条持久关系不再按块重复落库）", [
+            # 关系**词表化**之后，边表达的是「跨场景成立的关系」，一句话就是
+            # 一条。可写入路径仍按 (src, tgt, kind, chunk_id) 唯一 —— 于是
+            # 「杰罗姆 loves 阿莉莎」在第 13/14/16/17/18/19/20 章各落一条。
+            # 实测窄门 241 条边里 89 条（37%）是同一关系的第 N 份拷贝，
+            # 去重后 152 条，gold 召回一条不少。多出来的那一列记住「被重复
+            # 观察了多少次」—— 角色卡的排序要用它，去掉就只剩「谁先被写」。
+            f"ALTER TABLE {TABLE_EDGES} ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1;",
+        ]),
+        (13, "飞行记录仪：存思维链正文（reasoning_content）", [
+            # 只记 reasoning_tokens 等于只记了「想了多久」，没记「想了什么」。
+            # 实测一次提取调用 62% 的输出是思考，出错的那一步恰恰在思考之外
+            # （抄错一个代词），而要看懂它得靠正文。**推理模型才有这个字段**，
+            # 非推理模型存空串 —— 不假装有。
+            f"ALTER TABLE {TABLE_LLM_LOGS} ADD COLUMN reasoning_content TEXT;",
+        ]),
     ]
 
     def __init__(self, db_path):
@@ -376,6 +521,7 @@ class GraphDB(BaseDatabase):
     def upsert_node(self, book_id: str, name: str, kind: str,
                     description: str | None = None,
                     first_chunk_id: str | None = None,
+                    overwrite_description: bool = False,
                     personality: str | None = None,
                     appearance: str | None = None,
                     motivation: str | None = None,
@@ -386,16 +532,31 @@ class GraphDB(BaseDatabase):
         Resolution order:
         1. If name matches a registered alias → update the canonical node
         2. If name matches an existing canonical_name+kind → update it
+        2b. If name matches an existing canonical_name under **another** kind
+            → reuse it (同名即同实体)
         3. Otherwise → insert new node
+
+        **2b 是「同一实体裂成多节点」的根治**（实测：孔子×4、精神分裂症×3、
+        苏联×2 —— 都是同一个名字配了不同的 kind 串）。提示词会漂，SQL 不会，
+        所以这条去重落在这里而不是提示词里。chapter 节点排除在外：章节标题
+        与实体重名是常事，不能把实体并进章节节点。
+
+        ``description`` **默认只填空、不覆盖**（``overwrite_description=True``
+        才覆盖）。理由：批次提取器写的 `why` 是**本批视角**的一句话（实测有
+        「本块未出场，但…」），逐批覆盖会让身份说明永远停在最后一章的临时
+        判断上；而 ``format_role_kernel`` 把它当角色身份的第一行。先写者赢
+        （骨架趟 → 首个批次），后来的批次只能补空，不能改写。
         """
         conn = self.get_conn()
 
         # Step 1: check aliases — if name is someone's alias, use canonical node
+        # 别名在 (project_id, alias_name) 上唯一，所以**不按 kind 过滤** ——
+        # 带上 kind 只会让「提取器换了个 kind 说法」变成查不到 → 又新建一个节点。
         alias_row = conn.execute(
             f"SELECT a.node_id FROM {TABLE_ALIASES} a "
             f"JOIN {TABLE_NODES} n ON n.id = a.node_id "
-            "WHERE a.project_id=? AND a.alias_name=? AND n.project_id=? AND n.kind=? LIMIT 1",
-            (book_id, name, book_id, kind),
+            "WHERE a.project_id=? AND a.alias_name=? AND n.project_id=? LIMIT 1",
+            (book_id, name, book_id),
         ).fetchone()
         if alias_row:
             existing_id = alias_row["node_id"]
@@ -410,7 +571,10 @@ class GraphDB(BaseDatabase):
                 ("speaking_style", speaking_style),
             ]:
                 if val is not None:
-                    updates.append(f"{col}=?")
+                    if col == "description" and not overwrite_description:
+                        updates.append(f"{col}=COALESCE(NULLIF({col},''),?)")
+                    else:
+                        updates.append(f"{col}=?")
                     params.append(val)
             if updates:
                 params.append(existing_id)
@@ -439,7 +603,10 @@ class GraphDB(BaseDatabase):
                 ("speaking_style", speaking_style),
             ]:
                 if val is not None:
-                    updates.append(f"{col}=?")
+                    if col == "description" and not overwrite_description:
+                        updates.append(f"{col}=COALESCE(NULLIF({col},''),?)")
+                    else:
+                        updates.append(f"{col}=?")
                     params.append(val)
             if updates:
                 params.append(existing["id"])
@@ -448,6 +615,32 @@ class GraphDB(BaseDatabase):
                     params,
                 )
             return existing["id"]
+
+        # Step 2b: 同名、别的 kind —— 还是同一个实体，复用而不是新建。
+        same_name = conn.execute(
+            f"SELECT id FROM {TABLE_NODES} "
+            "WHERE project_id=? AND canonical_name=? AND kind!='chapter' "
+            "ORDER BY (kind=?) DESC, id LIMIT 1",
+            (book_id, name, kind),
+        ).fetchone()
+        if same_name:
+            return same_name["id"]
+
+        # Step 2c: **书名号变体**。《圣经》与 圣经、《如胶似漆》与 如胶似漆
+        # 是同一个实体 —— 实测窄门一本里就同时出现（两个 work 节点）。
+        # 只在 **kind 相同** 时合并：书名号在有些书里是「作品 vs 概念」的
+        # 分界线（《窄门》works / 窄门 concept），跨 kind 合并会把它们压成
+        # 一个。生成两个变体各查一次，不做模糊匹配 —— 模糊匹配是另一类事故。
+        variant = _bracket_variant(name)
+        if variant and variant != name and kind != "chapter":
+            twin = conn.execute(
+                f"SELECT id FROM {TABLE_NODES} "
+                "WHERE project_id=? AND canonical_name=? AND kind=? LIMIT 1",
+                (book_id, variant, kind),
+            ).fetchone()
+            if twin:
+                return twin["id"]
+
         node_id = f"node-{uuid.uuid4().hex[:12]}"
         conn.execute(
             f"INSERT INTO {TABLE_NODES}(id, canonical_name, kind, description, "
@@ -492,24 +685,70 @@ class GraphDB(BaseDatabase):
     def add_edge(self, book_id: str, source_id: str, target_id: str,
                  kind: str, chunk_id: str | None = None,
                  event_type: str = "fact", subject: str | None = None,
-                 tags: list[str] | None = None) -> bool:
+                 tags: list[str] | None = None,
+                 evidence_text: str = "") -> bool:
         """Insert edge. Returns True if inserted, False if duplicate.
 
         event_type: fact / perspective / opinion (default fact).
         subject: whose perspective for non-fact edges (e.g. "LLM提取").
         tags: open folksonomy tags (agent-registered themes).
+        evidence_text: 支撑这条关系的**逐字原文**（不是 chunk_id）。
+
+        **同一条关系只落一行。** 键是 (src, tgt, kind, event_type[, subject])：
+        `event_type` 进键，是因为「他是她哥哥」（fact）和「她觉得他是她哥哥」
+        （perspective）是两句不同的话，不能合并；非事实边再带上 `subject`，
+        因为「杰罗姆认为甲爱乙」与「丙认为甲爱乙」也是两句不同的话。重复
+        写入时只 `occurrences += 1`，并把锚点挪到**更早**的那一块：剧透门
+        要的是「读者最早能在哪里知道这件事」，不是「最晚被提到的那次」。
+
+        旧实现按 (…, chunk_id) 唯一，而持久关系的本质就是**每一批都会
+        再看见它一次** —— 实测窄门 241 条边里 89 条是同一关系的拷贝
+        （「杰罗姆 loves 阿莉莎」7 条、「朱莉叶特→阿莉莎 cares_for」
+        5 条），图就退化成了事件日志。
         """
         conn = self.get_conn()
+        row = conn.execute(
+            f"SELECT e.id, e.occurrences, "
+            f"  c_old.chapter_index AS old_ch, c_new.chapter_index AS new_ch "
+            f"FROM {TABLE_EDGES} e "
+            f"LEFT JOIN {TABLE_GRAPH_CHUNKS} c_old ON c_old.chunk_id = e.chunk_id "
+            f"LEFT JOIN {TABLE_GRAPH_CHUNKS} c_new ON c_new.chunk_id = ? "
+            f"WHERE e.project_id=? AND e.source_id=? AND e.target_id=? "
+            f"  AND e.kind=? AND e.event_type=? "
+            f"  AND (e.event_type='fact' OR COALESCE(e.subject,'')=?)",
+            (chunk_id, book_id, source_id, target_id, kind, event_type,
+             (subject or "") if event_type != "fact" else ""),
+        ).fetchone()
+        if row is not None:
+            old_ch, new_ch = row["old_ch"], row["new_ch"]
+            # 无锚点是最弱的一种 —— 有锚点的这次应当把它顶掉。
+            take = chunk_id is not None and (
+                old_ch is None or (new_ch is not None and new_ch < old_ch))
+            if take:
+                conn.execute(
+                    f"UPDATE {TABLE_EDGES} SET occurrences = occurrences + 1, "
+                    f"  chunk_id = ?, evidence_text = CASE WHEN ? != '' "
+                    f"    THEN ? ELSE evidence_text END WHERE id = ?",
+                    (chunk_id, evidence_text, evidence_text, row["id"]),
+                )
+            else:
+                conn.execute(
+                    f"UPDATE {TABLE_EDGES} SET occurrences = occurrences + 1 "
+                    f"WHERE id = ?", (row["id"],),
+                )
+            return False
         try:
             conn.execute(
                 f"INSERT INTO {TABLE_EDGES}"
-                "(source_id, target_id, kind, chunk_id, event_type, subject, tags, project_id) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+                "(source_id, target_id, kind, chunk_id, event_type, subject, "
+                "tags, evidence_text, project_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
                 (source_id, target_id, kind, chunk_id, event_type, subject,
-                 json.dumps(tags or [], ensure_ascii=False), book_id),
+                 json.dumps(tags or [], ensure_ascii=False), evidence_text, book_id),
             )
             return True
         except sqlite3.IntegrityError:
+            # (…, chunk_id) 唯一约束仍在：同一块里同一关系写两遍。
             return False
 
     def add_alias(self, book_id: str, alias: str, node_id: str) -> bool:
@@ -523,6 +762,68 @@ class GraphDB(BaseDatabase):
             return True
         except sqlite3.IntegrityError:
             return False
+
+    def add_unresolved(self, book_id: str, reference_name: str,
+                       reference_kind: str = "", chunk_id: str = "",
+                       candidates: list[str] | None = None) -> None:
+        """记一条**解析不到节点**的引用。
+
+        边、观察、别名、引文的关联节点都可能指向一个图谱里不存在的名字。
+        以前这四处都是 ``log.debug`` 一句就丢了 —— 那正是「沉默不是成功」：
+        图谱少了一条边，日志里查不出来。表早就建好了（v1 DDL），一直空着。
+        """
+        self.get_conn().execute(
+            f"INSERT INTO {TABLE_UNRESOLVED}"
+            "(reference_name, reference_kind, chunk_id, candidates, project_id) "
+            "VALUES(?,?,?,?,?)",
+            (reference_name, reference_kind, chunk_id,
+             json.dumps(candidates or [], ensure_ascii=False), book_id),
+        )
+
+    def count_unresolved(self, book_id: str) -> int:
+        return self.get_conn().execute(
+            f"SELECT COUNT(*) FROM {TABLE_UNRESOLVED} WHERE project_id=?",
+            (book_id,)).fetchone()[0]
+
+    # ── 读者笔记（见 docs/reader-notes-design.md）──────────────────────────
+
+    def add_note(self, book_id: str, chunk_id: str, quote_text: str,
+                 text: str, node_id: str = "") -> str:
+        """落一条读者笔记。``node_id`` 可空 —— 笔记不一定挂在实体上。"""
+        nid = f"note-{uuid.uuid4().hex[:16]}"
+        self.get_conn().execute(
+            f"INSERT INTO {TABLE_NOTES}"
+            "(id, project_id, node_id, chunk_id, quote_text, text) "
+            "VALUES(?,?,?,?,?,?)",
+            (nid, book_id, node_id or None, chunk_id, quote_text, text),
+        )
+        return nid
+
+    def count_notes(self, book_id: str) -> int:
+        return self.get_conn().execute(
+            f"SELECT COUNT(*) FROM {TABLE_NOTES} WHERE project_id=?",
+            (book_id,)).fetchone()[0]
+
+    def get_notes(self, book_id: str, *, node_id: str | None = None,
+                  chapter_index: int | None = None) -> list[dict]:
+        """读笔记，按章号排序。
+
+        ``chapter_index`` **现算**（join ``graph_chunks``），不落库 ——
+        落库就会随重导过期。披露门的章号下界过滤走 ``chapter_index``。
+        """
+        sql = (f"SELECT n.*, c.chapter_index AS chapter_index "
+               f"FROM {TABLE_NOTES} n "
+               f"LEFT JOIN {TABLE_GRAPH_CHUNKS} c ON c.chunk_id = n.chunk_id "
+               f"WHERE n.project_id=?")
+        args: list[Any] = [book_id]
+        if node_id is not None:
+            sql += " AND n.node_id=?"
+            args.append(node_id)
+        if chapter_index is not None:
+            sql += " AND c.chapter_index<=?"
+            args.append(chapter_index)
+        sql += " ORDER BY c.chapter_index, n.created_at"
+        return [dict(r) for r in self.get_conn().execute(sql, args)]
 
     def add_quote(
         self,
@@ -584,6 +885,7 @@ class GraphDB(BaseDatabase):
         tags: list[str] | None = None,
         source: str = "book",
         trust_score: float | None = None,
+        evidence_text: str = "",
     ) -> bool:
         """Insert an observation event for a node.
 
@@ -598,6 +900,8 @@ class GraphDB(BaseDatabase):
         source: 'book' (Scout/Explorer from原文) or 'dialogue' (从对话推断).
         trust_score: None uses DB default (0.5). Dialogue-sourced observations
         should pass a lower value (e.g. 0.3).
+        evidence_text: 支撑这条观察的**逐字原文**。``evidence`` 是锚点
+        （chunk_id），两个字段各司其职 —— 只有锚点问不出「它是不是编的」。
         """
         conn = self.get_conn()
         obs_id = f"obs-{uuid.uuid4().hex[:12]}"
@@ -607,11 +911,12 @@ class GraphDB(BaseDatabase):
                 f"INSERT INTO {TABLE_OBSERVATIONS}"
                 "(id, project_id, node_id, field, value, event_type, "
                 "subject, anchor_chapter, evidence, tags, source, trust_score, "
-                "updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+                "evidence_text, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now'))",
                 (obs_id, book_id, node_id, field, value, event_type,
                  subject, anchor_chapter, evidence,
-                 json.dumps(tags or [], ensure_ascii=False), source, actual_trust),
+                 json.dumps(tags or [], ensure_ascii=False), source, actual_trust,
+                 evidence_text),
             )
             return True
         except sqlite3.IntegrityError:
@@ -699,7 +1004,8 @@ class GraphDB(BaseDatabase):
     def merge_nodes(self, book_id: str, keep_id: str, remove_id: str) -> dict:
         """Merge remove_id into keep_id atomically.
 
-        Returns {edges_moved, aliases_moved, removed_name, kept_name}.
+        Returns {edges_moved, aliases_moved, obs_moved, notes_moved,
+        removed_name, kept_name}.
         """
         conn = self.get_conn()
         keep_row = conn.execute(
@@ -716,6 +1022,8 @@ class GraphDB(BaseDatabase):
         removed_name = remove_row["canonical_name"]
         edges_moved = 0
         aliases_moved = 0
+        obs_moved = 0
+        notes_moved = 0
 
         try:
             conn.execute("BEGIN")
@@ -740,12 +1048,11 @@ class GraphDB(BaseDatabase):
                         edges_moved += 1
 
             # 2. Add remove's canonical_name as alias of keep
-            conn.execute(
+            cur = conn.execute(
                 f"INSERT OR IGNORE INTO {TABLE_ALIASES} (alias_name, node_id, project_id) VALUES(?,?,?)",
                 (removed_name, keep_id, book_id),
             )
-            if conn.total_changes > 0:
-                aliases_moved += 1
+            aliases_moved += max(cur.rowcount, 0)
 
             # 3. Move all aliases from remove to keep
             alias_rows = conn.execute(
@@ -753,15 +1060,48 @@ class GraphDB(BaseDatabase):
                 (remove_id, book_id),
             ).fetchall()
             for ar in alias_rows:
-                conn.execute(
+                cur = conn.execute(
                     f"UPDATE OR IGNORE {TABLE_ALIASES} SET node_id=? "
                     "WHERE alias_name=? AND project_id=? AND node_id=?",
                     (keep_id, ar["alias_name"], book_id, remove_id),
                 )
-                if conn.total_changes > 0:
-                    aliases_moved += 1
+                aliases_moved += max(cur.rowcount, 0)
 
-            # 4. Delete remove node
+            # 4. Move observations & notes
+            #    以前只搬边和别名 —— 被并掉那个节点上的**观察会指向一个不存在的
+            #    id**，永久失联（观察是角色内核的唯一来源，等于把画像删了）。
+            #    读者笔记同理。
+            for tbl, attr in ((TABLE_OBSERVATIONS, "obs"), (TABLE_NOTES, "notes")):
+                # 用 cursor.rowcount，**不是** conn.total_changes —— 后者是
+                # 「连接打开以来的累计改动数」，拿它当单条语句的结果会得到
+                # 荒谬的数字（实测一本只有 10 条观察的书报出 obs_moved=4971）。
+                cur = conn.execute(
+                    f"UPDATE {tbl} SET node_id=? WHERE node_id=? AND project_id=?",
+                    (keep_id, remove_id, book_id),
+                )
+                if attr == "obs":
+                    obs_moved += cur.rowcount
+                else:
+                    notes_moved += cur.rowcount
+
+            # 5. 首现块取**章号更早**的那个（keep 没有才无条件继承）。
+            #    first_appearance 是导出量，合并后取晚的那个会让实体在索引里
+            #    显得「出现得更迟」，就近档选不到它。
+            cids = conn.execute(
+                f"SELECT id, first_appearance_chunk_id AS c FROM {TABLE_NODES} "
+                "WHERE id IN (?,?) AND project_id=?",
+                (keep_id, remove_id, book_id),
+            ).fetchall()
+            by_id = {r["id"]: r["c"] for r in cids}
+            keep_c, rem_c = by_id.get(keep_id), by_id.get(remove_id)
+            if rem_c and (not keep_c or (
+                    (self._chapter_of_chunk(rem_c) if rem_c else None) is not None
+                    and (self._chapter_of_chunk(keep_c) is None
+                         or self._chapter_of_chunk(rem_c) < self._chapter_of_chunk(keep_c)))):
+                conn.execute(f"UPDATE {TABLE_NODES} SET first_appearance_chunk_id=? "
+                             "WHERE id=?", (rem_c, keep_id))
+
+            # 6. Delete remove node
             conn.execute(f"DELETE FROM {TABLE_NODES} WHERE id=? AND project_id=?", (remove_id, book_id))
 
             # 5. Mark merge_candidates
@@ -776,6 +1116,7 @@ class GraphDB(BaseDatabase):
             raise
 
         return {"edges_moved": edges_moved, "aliases_moved": aliases_moved,
+                "obs_moved": obs_moved, "notes_moved": notes_moved,
                 "removed_name": removed_name, "kept_name": kept_name}
 
     def auto_merge(self, book_id: str, min_confidence: float = 0.9) -> int:
@@ -824,6 +1165,128 @@ class GraphDB(BaseDatabase):
             d["node_id_b"] = self.name_to_node_id(book_id, d["name_b"])
             result.append(d)
         return result
+
+    # ── Anchor relink ─────────────────────────────────────────────────────
+
+    def relink_chunks(self, book_id: str, current: list[dict],
+                      *, dry_run: bool = False) -> RelinkReport:
+        """把该书的图谱锚点重连到**当前**的 ``book_chunks`` 上。
+
+        重导会重新生成 ``book_chunks.id``，而图谱的边/引文/观察都指着旧 id ——
+        实测 9 本书里 8 本交集为 0，97% 的节点因此定位不到章（阅读侧剧透门失效）。
+
+        *current* 每项：``{"chunk_id", "chapter_index", "chunk_index", "content_hash"}``。
+
+        匹配顺序：**内容指纹优先，坐标兜底**。指纹是内容同一性的证据；坐标只在
+        指纹落空时用（正文被 strip 掉一两个字符就会换指纹，坐标仍对得上）。
+
+        拒绝而非猜测：一个旧块对应多个候选 → 记 ``ambiguous`` 不写；找不到 →
+        记 ``unresolved`` 不写。**沉默不是成功** —— 拒绝的每一条都在报告里。
+        """
+        conn = self.get_conn()
+        report = RelinkReport(book_id=book_id)
+        rows = conn.execute(
+            f"SELECT chunk_id, chapter_index, chunk_index, content_hash "
+            f"FROM {TABLE_GRAPH_CHUNKS} WHERE book_id=?", (book_id,)
+        ).fetchall()
+        report.total = len(rows)
+        if not rows:
+            return report
+
+        cur_ids = {c["chunk_id"] for c in current}
+        by_hash: dict[str, list[str]] = {}
+        by_coord: dict[tuple[int, int], str] = {}
+        for c in current:
+            by_hash.setdefault(c["content_hash"], []).append(c["chunk_id"])
+            by_coord[(c["chapter_index"], c["chunk_index"])] = c["chunk_id"]
+
+        occupied = {r["chunk_id"] for r in rows}
+        target: dict[str, str] = {}
+        for r in rows:
+            old = r["chunk_id"]
+            if old in cur_ids:
+                report.already_ok += 1
+                continue
+            cands = by_hash.get(r["content_hash"]) or []
+            if len(cands) == 1:
+                target[old] = cands[0]
+                report.by_hash += 1
+            elif len(cands) > 1:
+                report.ambiguous.append({
+                    "chunk_id": old, "reason": "内容指纹命中多个候选",
+                    "candidates": cands[:5]})
+            elif (r["chapter_index"], r["chunk_index"]) in by_coord:
+                target[old] = by_coord[(r["chapter_index"], r["chunk_index"])]
+                report.by_coord += 1
+            else:
+                report.unresolved.append({
+                    "chunk_id": old, "chapter_index": r["chapter_index"],
+                    "chunk_index": r["chunk_index"], "reason": "指纹与坐标都对不上"})
+
+        # 落到一条已存在的图谱行上 = 内容被合并了 → 合并两行，不丢
+        report.merged = sum(1 for new in target.values() if new in occupied)
+        if dry_run:
+            return report
+
+        coord_of = {c["chunk_id"]: (c["chapter_index"], c["chunk_index"])
+                    for c in current}
+        claimed: set[str] = set()
+        for old, new in target.items():
+            for table, col in ((TABLE_EDGES, "chunk_id"),
+                               (TABLE_QUOTES, "chunk_id"),
+                               (TABLE_OBSERVATIONS, "evidence")):
+                before = conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {col}=?", (old,)
+                ).fetchone()[0]
+                cur = conn.execute(
+                    f"UPDATE OR IGNORE {table} SET {col}=? WHERE {col}=?", (new, old))
+                dropped = before - cur.rowcount
+                if col == "chunk_id" and table == TABLE_QUOTES:
+                    report.deduped_quotes += dropped
+                elif col == "chunk_id":
+                    report.deduped_edges += dropped
+
+            # 节点首现锚点也要跟着走 —— 它同样指着一个旧 id。不重指的话，
+            # 「点节点跳原文」与按章过滤（剧透门）在这批节点上仍是坏的。
+            report.nodes_relinked += conn.execute(
+                f"UPDATE {TABLE_NODES} SET first_appearance_chunk_id=? "
+                "WHERE first_appearance_chunk_id=? AND project_id=?",
+                (new, old, book_id),
+            ).rowcount
+
+            # 观察的 anchor_chapter 是**从旧块算出来的章号**。块换了章号就可能
+            # 变了（重导重切过章），不重算就等于把观察挂在错的章上。
+            if new in coord_of:
+                report.obs_reanchored += conn.execute(
+                    f"UPDATE {TABLE_OBSERVATIONS} SET anchor_chapter=? "
+                    "WHERE evidence=? AND project_id=?",
+                    (coord_of[new][0], new, book_id),
+                ).rowcount
+
+            if new in occupied or new in claimed:
+                # 两行并一行：状态取**更好**的那个（done > failed > pending），
+                # 否则一次重导就会把「已提取」静默降级成「没提取」→ 白跑一遍。
+                old_st = conn.execute(
+                    f"SELECT extract_status FROM {TABLE_GRAPH_CHUNKS} "
+                    "WHERE chunk_id=?", (old,)).fetchone()
+                new_st = conn.execute(
+                    f"SELECT extract_status FROM {TABLE_GRAPH_CHUNKS} "
+                    "WHERE chunk_id=?", (new,)).fetchone()
+                keep = _better_status(old_st[0] if old_st else None,
+                                      new_st[0] if new_st else None)
+                if new_st and keep != new_st[0]:
+                    conn.execute(
+                        f"UPDATE {TABLE_GRAPH_CHUNKS} SET extract_status=? "
+                        "WHERE chunk_id=?", (keep, new))
+                    report.status_kept += 1
+                conn.execute(f"DELETE FROM {TABLE_GRAPH_CHUNKS} WHERE chunk_id=?", (old,))
+            else:
+                conn.execute(f"UPDATE {TABLE_GRAPH_CHUNKS} SET chunk_id=? "
+                             f"WHERE chunk_id=?", (new, old))
+                claimed.add(new)
+        conn.commit()
+        report.applied = True
+        return report
 
     # ── Write: chunk status ───────────────────────────────────────────────
 
@@ -953,9 +1416,11 @@ class GraphDB(BaseDatabase):
         chunk_ids: list[str] | None = None, total_chunks: int = 0,
         model: str = "", attempt: int = 1, max_attempts: int = 1,
         latency_ms: int | None = None, tokens_in: int | None = None,
-        tokens_out: int | None = None, status: str = "ok",
+        tokens_out: int | None = None, tokens_cached: int | None = None,
+        reasoning_tokens: int | None = None, status: str = "ok",
         error_detail: str | None = None,
         prompt: str = "", response: str = "",
+        reasoning_content: str = "",
     ) -> int:
         """Persist one LLM call (full prompt/response) for audit/monitoring.
 
@@ -968,12 +1433,14 @@ class GraphDB(BaseDatabase):
                 f"INSERT INTO {TABLE_LLM_LOGS}"
                 "(run_id, book_id, phase, batch_id, batch_index, chunk_ids, "
                 " total_chunks, model, attempt, max_attempts, latency_ms, "
-                " tokens_in, tokens_out, status, error_detail, prompt, response) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " tokens_in, tokens_out, tokens_cached, reasoning_tokens, "
+                " status, error_detail, prompt, response, reasoning_content) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (run_id, book_id, phase, batch_id, batch_index,
                  json.dumps(chunk_ids, ensure_ascii=False) if chunk_ids else None,
                  total_chunks, model, attempt, max_attempts, latency_ms,
-                 tokens_in, tokens_out, status, error_detail, prompt, response),
+                 tokens_in, tokens_out, tokens_cached, reasoning_tokens,
+                 status, error_detail, prompt, response, reasoning_content),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -1162,6 +1629,94 @@ class GraphDB(BaseDatabase):
         ).fetchone()
         return row["id"] if row else None
 
+    _LOCATE_COLS = ("id, canonical_name, kind, description, first_appearance_chunk_id")
+
+    # 搜索结果的统一排序：**精确名（正名或别名）优先** → 度数 → 名字定序。
+    # 以前这两处**没有 ORDER BY**，LIMIT 取的是任意几行：实测
+    # ``search_all('母亲', limit=2)`` 返回「你母亲 + 八子的母亲」，真正的
+    # 「母亲」（度 78）排第 4 被截掉 —— 而 ``_tool_graph_context`` 正是
+    # ``limit=2``，于是 `graph_context("母亲和地坛有什么关系")` 挑出的入口
+    # 实体是两个不相干的母亲。同一个问题在 ``get_node_detail`` 那边是对的
+    # （它按度数排），**两个入口答案不一致**才是真问题。
+    # 需要两个 ``query`` 参数（正名精确、别名精确各一个）。
+    _SEARCH_ORDER = (
+        " ORDER BY (n.canonical_name = ? OR EXISTS ("
+        f"   SELECT 1 FROM {TABLE_ALIASES} ax "
+        "    WHERE ax.node_id = n.id AND ax.project_id = n.project_id "
+        "      AND ax.alias_name = ?)) DESC, "
+        " (SELECT COUNT(*) FROM edges e "
+        "  WHERE e.source_id = n.id OR e.target_id = n.id) DESC, "
+        " n.canonical_name "
+    )
+
+    def locate_node(self, book_id: str, name: str) -> sqlite3.Row | None:
+        """按**用户给的名字**定位节点：精确别名 → 精确正名 → 子串（度数优先）。
+
+        与 ``name_to_node_id`` 的分工：那个是**写入**路径的解析器，只做精确匹配
+        —— 那里退到子串会把「母亲」并进「你母亲」，是数据损坏。读取路径反过来：
+        用户的输入天生模糊，要尽量找到东西，所以末档退到子串。
+
+        为什么必须有这一档：库里的别名（``graph_aliases``）**写入路径认、读取
+        路径一处都没认**。实测《我与地坛》34 条别名里，``史铁生`` 是叙述者
+        「我」的别名（度 315）、``小公园`` 是地坛、``白鸡脖`` 是 B 校长 ——
+        而 ``graph_node("史铁生")`` 直接返回「未找到实体」。读者用作者名问话，
+        六条工具路径一条都够不着。
+        """
+        name = (name or "").strip()
+        if not name:
+            return None
+        conn = self.get_conn()
+        # 1+2. 精确别名 / 精确正名（复用写入路径的解析器，保证两处顺序一致）
+        nid = self.name_to_node_id(book_id, name)
+        if nid:
+            row = conn.execute(
+                f"SELECT {self._LOCATE_COLS} FROM {TABLE_NODES} "
+                "WHERE id=? AND project_id=?", (nid, book_id),
+            ).fetchone()
+            if row:
+                return row
+        # 3. 子串，度数优先（原有行为，保持不变）
+        return conn.execute(
+            f"SELECT {self._LOCATE_COLS} FROM {TABLE_NODES} "
+            "WHERE project_id = ? AND canonical_name LIKE ? "
+            "ORDER BY (SELECT COUNT(*) FROM edges "
+            "          WHERE source_id = nodes.id OR target_id = nodes.id) DESC "
+            "LIMIT 1",
+            (book_id, f"%{name}%"),
+        ).fetchone()
+
+    def known_names(self, book_id: str) -> set[str]:
+        """库里**已经能解析到节点**的所有名字（canonical + 别名）。
+
+        体检时用来分辨两种「被引用却没声明」：一种是真悬空（要回炉），
+        一种是提取器引用了旧实体（完全正常，提示词就是这么教的）。
+        """
+        conn = self.get_conn()
+        names = {r["canonical_name"] for r in conn.execute(
+            f"SELECT canonical_name FROM {TABLE_NODES} "
+            "WHERE project_id=? AND kind!='chapter'", (book_id,))}
+        names |= {r["alias_name"] for r in conn.execute(
+            f"SELECT alias_name FROM {TABLE_ALIASES} WHERE project_id=?",
+            (book_id,))}
+        names.discard(None)
+        return names
+
+    def node_kind(self, book_id: str, name: str) -> str | None:
+        """这个名字现在在图谱里是什么 kind（按 ``upsert_node`` 的解析顺序）。
+
+        用来发现 **kind 漂移**：提取器这批说「孔子」是 ``person``，上一批说
+        是 ``character`` —— 节点是同一个（SQL 层已按同名复用），但说法在漂。
+        漂移本身要报出来，否则词表悄悄发散没人知道。
+        """
+        node_id = self.name_to_node_id(book_id, name)
+        if not node_id:
+            return None
+        row = self.get_conn().execute(
+            f"SELECT kind FROM {TABLE_NODES} WHERE id=? AND project_id=?",
+            (node_id, book_id),
+        ).fetchone()
+        return row["kind"] if row else None
+
     def get_node(self, book_id: str, node_id: str) -> dict | None:
         """Full node detail + direct edges (trail)."""
         conn = self.get_conn()
@@ -1225,16 +1780,26 @@ class GraphDB(BaseDatabase):
                 f"JOIN {TABLE_NODES} n ON n.rowid=fts.rowid "
                 f"LEFT JOIN {TABLE_GRAPH_CHUNKS} gc "
                 f"  ON gc.chunk_id=n.first_appearance_chunk_id "
-                "WHERE n.project_id=? "
-                "  AND (nodes_fts MATCH ? OR n.canonical_name LIKE ?) "
+                "WHERE n.project_id=? AND n.kind!='chapter' "
+                "  AND (nodes_fts MATCH ? OR n.canonical_name LIKE ? "
+                f"       OR EXISTS (SELECT 1 FROM {TABLE_ALIASES} a "
+                "                  WHERE a.node_id = n.id "
+                "                    AND a.project_id = n.project_id "
+                "                    AND a.alias_name LIKE ?)) "
             )
-            params: list[Any] = [book_id, f"{query}*", f"%{query}%"]
+            params: list[Any] = [book_id, f"{query}*", f"%{query}%", f"%{query}%"]
             if kind:
                 sql += " AND n.kind=?"
                 params.append(kind)
             if chapter_to is not None:
-                sql += " AND (gc.chapter_index IS NULL OR gc.chapter_index <= ?)"
+                # 无章号 = 定位不到时间线 = 无法证明它在读者进度内。
+                # 与 get_node_detail / get_observations / search_observations
+                # 同一条规矩（fail-closed）。实测代价极小：排除章节节点后
+                # 全库只有 6/4190（0.1%）节点首现块解析不到。
+                sql += " AND gc.chapter_index IS NOT NULL AND gc.chapter_index <= ?"
                 params.append(chapter_to)
+            sql += self._SEARCH_ORDER
+            params.extend([query, query])
             sql += " LIMIT ?"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
@@ -1246,17 +1811,23 @@ class GraphDB(BaseDatabase):
                 f"FROM {TABLE_NODES} n "
                 f"LEFT JOIN {TABLE_GRAPH_CHUNKS} gc "
                 f"  ON gc.chunk_id=n.first_appearance_chunk_id "
-                "WHERE n.project_id=? "
-                "  AND n.canonical_name LIKE ? "
+                "WHERE n.project_id=? AND n.kind!='chapter' "
+                "  AND (n.canonical_name LIKE ? "
+                f"      OR EXISTS (SELECT 1 FROM {TABLE_ALIASES} a "
+                "                 WHERE a.node_id = n.id "
+                "                   AND a.project_id = n.project_id "
+                "                   AND a.alias_name LIKE ?)) "
             )
-            params = [book_id, f"%{query}%"]
+            params = [book_id, f"%{query}%", f"%{query}%"]
             if kind:
                 sql += " AND n.kind=?"
                 params.append(kind)
             if chapter_to is not None:
-                sql += " AND (gc.chapter_index IS NULL OR gc.chapter_index <= ?)"
+                sql += " AND gc.chapter_index IS NOT NULL AND gc.chapter_index <= ?"
                 params.append(chapter_to)
-            sql += " ORDER BY n.canonical_name LIMIT ?"
+            sql += self._SEARCH_ORDER
+            params.extend([query, query])
+            sql += " LIMIT ?"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
         return [{
@@ -1291,16 +1862,19 @@ class GraphDB(BaseDatabase):
                 f"JOIN {TABLE_NODES} n ON n.rowid = fts.rowid "
                 f"LEFT JOIN {TABLE_GRAPH_CHUNKS} gc "
                 "  ON gc.chunk_id = n.first_appearance_chunk_id "
-                "WHERE n.project_id = ? "
-                "  AND (nodes_fts MATCH ? OR n.canonical_name LIKE ?) "
+                "WHERE n.project_id = ? AND n.kind!='chapter' "
+                "  AND (nodes_fts MATCH ? OR n.canonical_name LIKE ? "
+                f"       OR EXISTS (SELECT 1 FROM {TABLE_ALIASES} a "
+                "                  WHERE a.node_id = n.id "
+                "                    AND a.project_id = n.project_id "
+                "                    AND a.alias_name LIKE ?)) "
             )
-            params: list[Any] = [book_id, f"{query}*", f"%{query}%"]
+            params: list[Any] = [book_id, f"{query}*", f"%{query}%", f"%{query}%"]
             if max_chapter is not None:
-                sql += (
-                    " AND (gc.chapter_index IS NULL "
-                    "      OR gc.chapter_index <= ?)"
-                )
+                sql += " AND gc.chapter_index IS NOT NULL AND gc.chapter_index <= ?"
                 params.append(max_chapter)
+            sql += self._SEARCH_ORDER
+            params.extend([query, query])
             sql += " LIMIT ?"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
@@ -1311,17 +1885,20 @@ class GraphDB(BaseDatabase):
                 f"FROM {TABLE_NODES} n "
                 f"LEFT JOIN {TABLE_GRAPH_CHUNKS} gc "
                 "  ON gc.chunk_id = n.first_appearance_chunk_id "
-                "WHERE n.project_id = ? "
-                "  AND n.canonical_name LIKE ? "
+                "WHERE n.project_id = ? AND n.kind!='chapter' "
+                "  AND (n.canonical_name LIKE ? "
+                f"      OR EXISTS (SELECT 1 FROM {TABLE_ALIASES} a "
+                "                 WHERE a.node_id = n.id "
+                "                   AND a.project_id = n.project_id "
+                "                   AND a.alias_name LIKE ?)) "
             )
-            params = [book_id, f"%{query}%"]
+            params = [book_id, f"%{query}%", f"%{query}%"]
             if max_chapter is not None:
-                sql += (
-                    " AND (gc.chapter_index IS NULL "
-                    "      OR gc.chapter_index <= ?)"
-                )
+                sql += " AND gc.chapter_index IS NOT NULL AND gc.chapter_index <= ?"
                 params.append(max_chapter)
-            sql += " ORDER BY n.canonical_name LIMIT ?"
+            sql += self._SEARCH_ORDER
+            params.extend([query, query])
+            sql += " LIMIT ?"
             params.append(limit)
             rows = conn.execute(sql, params).fetchall()
 
@@ -1633,7 +2210,8 @@ class GraphDB(BaseDatabase):
     def get_node_index_two_tier(self, book_id: str,
                                 chapter_indices: set[int] | None = None,
                                 compact_cap: int = 300,
-                                detailed_cap: int = 24) -> dict:
+                                detailed_cap: int = 24,
+                                scope_chunk_ids: set[str] | None = None) -> dict:
         """Two-tier node index for Explorer task messages.
 
         Tier 1 "compact": ALL non-chapter entities as [canonical_name, kind],
@@ -1644,19 +2222,46 @@ class GraphDB(BaseDatabase):
         whose first appearance is within ±2 chapters of this batch pinned to
         the front.
 
+        就近那一档**只钉 character，这是量出来的，不是随手写的**。曾改成
+        「钉所有 kind」（理由是《我二十一岁那年》的 ``7号病室``/``4号病房``
+        拿不到名额），实测**更差**：尺子是「那 24 个名额里有几个是**该章正文
+        真的出现、且确实带别名**的实体」——原版 46、改后 39。原因是硬分档让
+        就近的非人物把名额占满，``我``（8 章）、``地坛``（3 章）这些**有别名
+        的枢纽**被挤出去；它们原本靠第二关键字（全局度数）进榜。也试过「就近
+        度数×2 / ×4」的加成式（43 / 47），相对原版没有像样的增益，不值得为
+        一个实体引入魔法系数。
+
+        *scope_chunk_ids* 限定「只看这个叙事域里出现过的实体」（见
+        ``bookgraph/scope.py``）。集类书里各篇自成一体，把别的篇的实体摆到
+        提取器面前就是邀请它跨篇连线。**单域（长篇）时传 None**，行为与
+        改动前逐字一致。
+
         Returns {"compact": [...], "detailed": [...]}.
         """
         conn = self.get_conn()
+
+        # 域过滤片段。*scope_chunk_ids* 为 None = 不按域过滤（单域/长篇的
+        # 老路径）；给了但为空 = 这个域里一个实体都没有，直接返回空索引 ——
+        # 不能当成「不过滤」，那会让空域悄悄看见全书。
+        if scope_chunk_ids is not None and not scope_chunk_ids:
+            return {"compact": [], "detailed": []}
+        scope_ph, scope_params = "", []
+        if scope_chunk_ids is not None and len(scope_chunk_ids) <= 500:
+            scope_params = sorted(scope_chunk_ids)
+            scope_ph = (" AND first_appearance_chunk_id IN ("
+                        + ",".join("?" * len(scope_params)) + ")")
+        scope_ph_n = scope_ph.replace("first_appearance_chunk_id",
+                                      "n.first_appearance_chunk_id")
 
         # ── Tier 1: compact full list (name + kind only) ──────────────────
         compact = [
             {"canonical_name": r["canonical_name"], "kind": r["kind"]}
             for r in conn.execute(
                 f"SELECT canonical_name, kind FROM {TABLE_NODES} "
-                "WHERE project_id=? AND kind!='chapter' "
-                "ORDER BY (kind='character') DESC, kind, canonical_name "
+                "WHERE project_id=? AND kind!='chapter'" + scope_ph +
+                " ORDER BY (kind='character') DESC, kind, canonical_name "
                 "LIMIT ?",
-                (book_id, compact_cap),
+                [book_id] + scope_params + [compact_cap],
             ).fetchall()
         ]
 
@@ -1672,7 +2277,7 @@ class GraphDB(BaseDatabase):
         nearby_params = nearby_chapters if nearby_chapters else [-1]
 
         detailed_rows = conn.execute(
-            f"SELECT n.id, n.canonical_name, n.kind, "
+            f"SELECT n.id, n.canonical_name, n.kind, n.description, "
             f"(SELECT COUNT(*) FROM {TABLE_EDGES} e "
             f" WHERE (e.source_id = n.id OR e.target_id = n.id) "
             f" AND e.project_id = n.project_id) "
@@ -1683,11 +2288,11 @@ class GraphDB(BaseDatabase):
             f" AND gc.book_id = ? AND gc.chapter_index IN ({nearby_placeholder})))"
             " AS nearby "
             f"FROM {TABLE_NODES} n "
-            "WHERE n.project_id=? AND n.kind!='chapter' "
-            "ORDER BY (n.kind='character' AND nearby) DESC, relevance DESC, "
+            "WHERE n.project_id=? AND n.kind!='chapter'" + scope_ph_n +
+            " ORDER BY (n.kind='character' AND nearby) DESC, relevance DESC, "
             "n.kind, n.canonical_name "
             "LIMIT ?",
-            [book_id] + nearby_params + [book_id, detailed_cap],
+            [book_id] + nearby_params + [book_id] + scope_params + [detailed_cap],
         ).fetchall()
 
         # Batch-load aliases for the detailed set
@@ -1704,7 +2309,11 @@ class GraphDB(BaseDatabase):
 
         detailed = [
             {"canonical_name": r["canonical_name"], "kind": r["kind"],
-             "aliases": alias_map.get(r["id"], [])}
+             "aliases": alias_map.get(r["id"], []),
+             # 身份说明：一句话「它在这本书里做了什么」。索引里只有名字时，
+             # 模型判断不了「冯母」是不是「冯世杰的母亲」—— 那不是提取器的
+             # 错，是环境没告诉它。
+             "description": (r["description"] or "").strip()}
             for r in detailed_rows
         ]
 
@@ -1766,17 +2375,20 @@ class GraphDB(BaseDatabase):
                 if cid:
                     all_chunk_ids.add(cid)
 
-        # Resolve chunk_id -> chapter_index in one batch
-        chunk_to_chapter: dict[str, int] = {}
+        # Resolve chunk_id -> (chapter_index, chunk_index) in one batch.
+        # chunk_index 也带上：前端节点「跳转原文」要落到段落，只给章号会
+        # 停在章首（与 reader 的 (chapter, chunk) 语义坐标一致）。
+        chunk_coord: dict[str, tuple[int, int]] = {}
         if all_chunk_ids:
             cid_list = list(all_chunk_ids)
             cid_placeholders = ",".join("?" * len(cid_list))
             chunk_rows = conn.execute(
-                f"SELECT chunk_id, chapter_index FROM {TABLE_GRAPH_CHUNKS} "
+                f"SELECT chunk_id, chapter_index, chunk_index FROM {TABLE_GRAPH_CHUNKS} "
                 f"WHERE chunk_id IN ({cid_placeholders})",
                 cid_list,
             ).fetchall()
-            chunk_to_chapter = {r["chunk_id"]: r["chapter_index"] for r in chunk_rows}
+            chunk_coord = {r["chunk_id"]: (r["chapter_index"], r["chunk_index"])
+                           for r in chunk_rows}
 
         # Batch-load aliases for all fetched nodes
         aliases_by_node: dict[str, list[str]] = {}
@@ -1790,11 +2402,13 @@ class GraphDB(BaseDatabase):
                 if nid in node_ids:
                     aliases_by_node.setdefault(nid, []).append(ar["alias_name"])
 
-        # Annotate nodes with chapter + aliases
+        # Annotate nodes with chapter/chunk (first appearance) + aliases
         nodes = []
         for n in nodes_raw:
             cid = n.pop("first_appearance_chunk_id", None)
-            n["chapter"] = chunk_to_chapter.get(cid) if cid else None
+            coord = chunk_coord.get(cid) if cid else None
+            n["chapter"] = coord[0] if coord else None
+            n["chunk"] = coord[1] if coord else None
             n["aliases"] = aliases_by_node.get(n["id"], [])
             nodes.append(n)
 
@@ -1803,9 +2417,10 @@ class GraphDB(BaseDatabase):
         for er in edge_rows_raw:
             cid = er.get("chunk_id")
             pair = tuple(sorted([er["source_id"], er["target_id"]]))
+            coord = chunk_coord.get(cid) if cid else None
             edge_groups.setdefault(pair, []).append({
                 "kind": er["kind"],
-                "chapter": chunk_to_chapter.get(cid) if cid else None,
+                "chapter": coord[0] if coord else None,
             })
 
         edges: list[dict] = []
@@ -1835,10 +2450,14 @@ class GraphDB(BaseDatabase):
     ) -> tuple[list[dict], int]:
         """Fetch observations for a node, split by max_chapter.
 
-        Returns (seen_observations, future_count). Each observation dict
-        has: field, value, event_type, subject, chapter, evidence, tags.
-        Seen observations are sorted by (field, chapter). Future items
-        contribute only a count (spoiler-gated).
+        Returns ``(seen, future_count, unanchored_count)``. Each
+        observation dict has: field, value, event_type, subject, chapter,
+        evidence, tags. Seen observations are sorted by (field, chapter).
+
+        ``future`` = 章号在进度之后；``unanchored`` = **章号为 NULL**
+        （老提取器不要求锚点，实测《地下室手记》19/19 条如此）。两者都
+        不展示，但**分开计数** —— 前者是「还不能说」，后者是「说不清」，
+        混在一起报会让人以为是剧透门在正常工作。
         """
         conn = self.get_conn()
         rows = conn.execute(
@@ -1850,24 +2469,31 @@ class GraphDB(BaseDatabase):
         ).fetchall()
         seen: list[dict] = []
         future_count = 0
+        unanchored = 0
         for r in rows:
+            ch = r["anchor_chapter"]
             entry = {
                 "field": r["field"],
                 "value": r["value"],
                 "event_type": r["event_type"],
                 "subject": r["subject"],
-                "chapter": r["anchor_chapter"],
+                "chapter": ch,
                 "evidence": r["evidence"],
                 "tags": json.loads(r["tags"] or "[]"),
                 "trust_score": r["trust_score"],
                 "updated_at": r["updated_at"],
                 "source": r["source"] or "book",
             }
-            if max_chapter is None or r["anchor_chapter"] is None or r["anchor_chapter"] <= max_chapter:
+            if max_chapter is None or (ch is not None and ch <= max_chapter):
                 seen.append(entry)
+            elif ch is None:
+                # 无锚点 = 定位不到时间线 = **无法证明**它在读者进度之内。
+                # 旧行为是当「已见」放行（fail-open），剧透门对这类观察等于没有。
+                # 现在只计数不展示 —— 不是丢弃，是「说不清就先不说」。
+                unanchored += 1
             else:
                 future_count += 1
-        return seen, future_count
+        return seen, future_count, unanchored
 
     def search_observations(
         self,
@@ -1918,11 +2544,13 @@ class GraphDB(BaseDatabase):
                 (book_id, like_pattern, limit * 3),
             ).fetchall()
 
-        # Filter by max_chapter (spoiler gating) and collect
+        # Filter by max_chapter (spoiler gating) and collect。
+        # ``chapter is None`` 也**滤掉** —— 与 get_node_detail / get_observations
+        # 同一条规矩：定位不到时间线就无法证明安全。旧行为是放行（fail-open）。
         results: list[dict] = []
         for r in rows:
             chapter = r["anchor_chapter"]
-            if max_chapter is not None and chapter is not None and chapter > max_chapter:
+            if max_chapter is not None and (chapter is None or chapter > max_chapter):
                 continue
             results.append({
                 "field": r["field"],
@@ -1945,10 +2573,10 @@ class GraphDB(BaseDatabase):
     ) -> dict:
         """Fetch a single node's full detail for LLM consumption.
 
-        Locates the node by substring match on ``canonical_name`` (LIKE),
-        preferring the one with the most edges. Returns a flat dict
-        ready for ``formatter.format_node`` - a flat view, not a
-        visualization-oriented subgraph with neighbor grouping.
+        Locates the node via ``locate_node`` (exact alias → exact
+        canonical name → substring, most-connected first). Returns a
+        flat dict ready for ``formatter.format_node`` - a flat view,
+        not a visualization-oriented subgraph with neighbor grouping.
 
         Division of labor:
           - This method: fetches ALL edges/quotes (unfiltered), then
@@ -1965,18 +2593,8 @@ class GraphDB(BaseDatabase):
         """
         conn = self.get_conn()
 
-        # ── 1. Locate the node (prefer most-connected match) ────────────
-        row = conn.execute(
-            f"SELECT id, canonical_name, kind, description, "
-            f"first_appearance_chunk_id "
-            f"FROM {TABLE_NODES} "
-            "WHERE project_id = ? AND canonical_name LIKE ? "
-            "ORDER BY "
-            "  (SELECT COUNT(*) FROM edges "
-            "   WHERE source_id = nodes.id OR target_id = nodes.id) DESC "
-            "LIMIT 1",
-            (book_id, f"%{name}%"),
-        ).fetchone()
+        # ── 1. Locate：精确别名 → 精确正名 → 子串（度数优先）─────────────
+        row = self.locate_node(book_id, name)
 
         if row is None:
             return {"error": f"未找到实体: {name}"}
@@ -1992,7 +2610,9 @@ class GraphDB(BaseDatabase):
         # ── 2. All edges (unfiltered) → split seen vs. future ───────────
         edge_rows = conn.execute(
             f"SELECT e.kind, e.chunk_id, e.event_type, e.subject, "
+            f"  e.occurrences AS occ, "
             f"  CASE WHEN e.source_id = ? THEN 'out' ELSE 'in' END AS direction, "
+            f"  n_other.id AS other_id, "
             f"  n_other.canonical_name AS other_name, "
             f"  n_other.kind AS other_kind "
             f"FROM {TABLE_EDGES} e "
@@ -2003,24 +2623,69 @@ class GraphDB(BaseDatabase):
             (node_id, node_id, node_id, node_id, book_id),
         ).fetchall()
 
-        relations: list[dict] = []
-        future_rel_count = 0
+        # **同一条关系会被多个批次各写一遍**。写入侧现在按
+        # (src, tgt, kind, event_type) 只留一行（`add_edge` 记 occurrences），
+        # 这里是**旧库**的兜底：迁移 12 之前的行仍是每块一条，且
+        # `event_type` 不同的同一条关系仍会分成两行（fact 与 perspective
+        # 是两句不同的话）。所以仍按 (方向, 对方, 关系词) 合并 ——
+        # 详情页要的是「他和谁是什么关系」，不是「这句话被说了几次」。
+        merged: dict[tuple, dict] = {}
+        unanchored_rel = 0
         timeline: set[int] = set()
         for r in edge_rows:
             ch = self._chapter_of_chunk(r["chunk_id"])
             if ch is not None:
                 timeline.add(ch)
-            entry = {
-                "kind": r["kind"],
-                "direction": r["direction"],
-                "other_name": r["other_name"],
-                "other_kind": r["other_kind"],
-                "chapter": ch,
-                "event_type": r["event_type"] or "fact",
-                "subject": r["subject"],
-            }
-            if max_chapter is None or ch is None or ch <= max_chapter:
+            key = (r["direction"], r["other_id"], r["kind"])
+            cur = merged.get(key)
+            if cur is None:
+                merged[key] = {
+                    "kind": r["kind"],
+                    "direction": r["direction"],
+                    "other_id": r["other_id"],
+                    "other_name": r["other_name"],
+                    "other_kind": r["other_kind"],
+                    "chapter": ch,
+                    "event_type": r["event_type"] or "fact",
+                    "subject": r["subject"],
+                    "occurrences": r["occ"] or 1,
+                }
+            else:
+                cur["occurrences"] += r["occ"] or 1
+                if ch is not None and (cur["chapter"] is None or ch < cur["chapter"]):
+                    cur["chapter"] = ch
+
+        # 对方节点的度数 —— 角色卡的排序要用它（「和阿贝尔的关系」比和
+        # 一个只出现一次的路人更值得占一个名额）。
+        other_ids = sorted({v["other_id"] for v in merged.values()
+                            if v.get("other_id")})
+        degree: dict[str, int] = {}
+        # SQLite 的绑定参数上限是 999（一条查询里 IN 出现两次），超了就跳过
+        # 度数这一项 —— 排序会退化到「次数 + 章号」，但不会把详情页打挂。
+        if other_ids and len(other_ids) <= 400:
+            marks = ",".join("?" * len(other_ids))
+            for d in conn.execute(
+                f"SELECT other_id, COUNT(*) AS c FROM ("
+                f"  SELECT source_id AS other_id FROM {TABLE_EDGES} "
+                f"  WHERE project_id=? AND source_id IN ({marks}) "
+                f"  UNION ALL "
+                f"  SELECT target_id AS other_id FROM {TABLE_EDGES} "
+                f"  WHERE project_id=? AND target_id IN ({marks})"
+                f") GROUP BY other_id",
+                [book_id, *other_ids, book_id, *other_ids],
+            ).fetchall():
+                degree[d["other_id"]] = d["c"]
+
+        relations: list[dict] = []
+        future_rel_count = 0
+        for entry in merged.values():
+            ch = entry["chapter"]
+            entry["other_degree"] = degree.get(entry.get("other_id"), 0)
+            entry.pop("other_id", None)
+            if max_chapter is None or (ch is not None and ch <= max_chapter):
                 relations.append(entry)
+            elif ch is None:
+                unanchored_rel += 1      # 见 get_observations 的说明
             else:
                 future_rel_count += 1
 
@@ -2033,6 +2698,7 @@ class GraphDB(BaseDatabase):
         # ── 3. Quotes (character only) → split seen vs. future ──────────
         quotes: list[dict] = []
         future_q_count = 0
+        unanchored_q = 0
         if row["kind"] == "character":
             search_terms = [row["canonical_name"]] + aliases
             term_clauses = " OR ".join(["character_name LIKE ?"] * len(search_terms))
@@ -2051,15 +2717,17 @@ class GraphDB(BaseDatabase):
                     "context": qr["scene_context"] or "",
                     "chapter": ch,
                 }
-                if max_chapter is None or ch is None or ch <= max_chapter:
+                if max_chapter is None or (ch is not None and ch <= max_chapter):
                     quotes.append(entry)
+                elif ch is None:
+                    unanchored_q += 1    # 见 get_observations 的说明
                 else:
                     future_q_count += 1
 
             quotes.sort(key=lambda e: (e["chapter"] is None, e["chapter"] or 0))
 
         # ── 4. Observations (event model) -> split seen vs. future ──────
-        observations, future_obs_count = self.get_observations(
+        observations, future_obs_count, unanchored_obs = self.get_observations(
             book_id, node_id, max_chapter,
         )
 
@@ -2077,6 +2745,12 @@ class GraphDB(BaseDatabase):
             "future_observations_count": future_obs_count,
             "future_relations_count": future_rel_count,
             "future_quotes_count": future_q_count,
+            # 章号为 NULL 的条目（老提取器不要求锚点）。与 future_* 分开报 ——
+            # 前者是「还不能说」，后者是「说不清」，混在一起会让人以为
+            # 剧透门在正常工作。
+            "unanchored_observations_count": unanchored_obs,
+            "unanchored_relations_count": unanchored_rel,
+            "unanchored_quotes_count": unanchored_q,
         }
 
     def find_path(
@@ -2106,14 +2780,9 @@ class GraphDB(BaseDatabase):
         conn = self.get_conn()
 
         def _locate(name: str) -> tuple[str, str] | None:
-            row = conn.execute(
-                f"SELECT id, canonical_name FROM {TABLE_NODES} "
-                "WHERE project_id = ? AND canonical_name LIKE ? "
-                "ORDER BY (SELECT COUNT(*) FROM edges "
-                "          WHERE source_id = nodes.id OR target_id = nodes.id) DESC "
-                "LIMIT 1",
-                (book_id, f"%{name}%"),
-            ).fetchone()
+            # 与 get_node_detail 共用同一个解析器 —— 别名/精确/子串三档，
+            # 否则 graph_trace("史铁生", "地坛") 会因为别名不认而直接报未找到。
+            row = self.locate_node(book_id, name)
             return (row["id"], row["canonical_name"]) if row else None
 
         src = _locate(from_name)

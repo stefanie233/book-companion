@@ -18,6 +18,7 @@ import logging
 import sys
 import warnings
 from pathlib import Path
+from typing import Any
 
 # Silence jieba's pkg_resources deprecation warning (third-party, out of our control)
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated", category=UserWarning)
@@ -251,7 +252,8 @@ async def _generate_title_async(
 
     client = runtime.api_client
     try:
-        title = await client.complete(_TITLE_GEN_SYSTEM_PROMPT, first_text)
+        title = await client.complete(
+            _TITLE_GEN_SYSTEM_PROMPT, first_text, scenario="chat.title")
         if title and len(title) > 200:
             title = title[:200]
         if title:
@@ -348,6 +350,36 @@ async def _select_session_interactive(
         return None
 
 
+def _port_occupied(port: int) -> str:
+    """端口被占时返回一句说明，干净则返回空串。
+
+    Windows 的 SO_REUSEADDR 语义是「允许抢绑」：两个本应用进程能同时
+    LISTENING 同一端口，后起的既不报错也收不到流量，请求全落在旧进程
+    上（2026-10-27 实测：写作页删除一直 405，旧实例还占着 8766）。
+    所以绑定前先问一句，别静默共享。
+    """
+    import json
+    import socket
+    from urllib.request import urlopen
+
+    try:
+        with urlopen(f"http://127.0.0.1:{port}/api/health", timeout=1) as resp:
+            info = json.loads(resp.read().decode("utf-8"))
+        return (f"端口 {port} 上已有一个 Book Companion 实例在跑"
+                f"（pid {info.get('pid')}，启动于 {info.get('started', '?')}）。")
+    except Exception:
+        pass
+    probe = socket.socket()
+    probe.settimeout(0.5)
+    try:
+        probe.connect(("127.0.0.1", port))
+        return f"端口 {port} 已被其他程序占用。"
+    except OSError:
+        return ""
+    finally:
+        probe.close()
+
+
 def main() -> None:
     """Main REPL entry point — delegates to async main."""
     asyncio.run(main_async())
@@ -359,6 +391,16 @@ async def main_async() -> None:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     config = load_config(Path.cwd())
+
+    # ── 端口占用闸 ────────────────────────────────────────────────
+    # 必须在解析 .env / 预热模型之前：另一个实例还在跑时，本次启动没有意义，
+    # 早退能省掉十几秒白启动，也避免用户以为「重启过了」。
+    _busy = await asyncio.to_thread(_port_occupied, 8766)
+    if _busy:
+        print(f"\n  [启动中止] {_busy}")
+        print("  两个实例共享同一端口时，请求会落到旧进程上（Windows SO_REUSEADDR）。")
+        print("  先结束那个进程再启动：taskkill /PID <pid> /F")
+        raise SystemExit(1)
 
     # Console provider bindings (data/config/providers.json) override .env —
     # apply BEFORE anything reads config fields, consumers hot-switch via the
