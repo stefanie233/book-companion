@@ -77,7 +77,7 @@ def test_registry_surface() -> None:
     check("未知 action 返回错误而不是抛异常",
           _call(registry, "writing_git", action="nope").get("ok"), False)
 
-    # 写作模式不再携带平台全量工具：35 个 schema 里只有 12 个用得上。
+    # 写作模式不再携带平台全量工具：只留写作现场的十几个 schema。
     base = ToolRegistry()
     base.register(ToolSpec(
         name="library_list", description="", parameters={},
@@ -221,7 +221,7 @@ def test_branch_diff_and_conflict() -> None:
 
     diff = _call(registry, "writing_git", action="diff",
                  from_ref="main...岔路A")
-    check("三点差异：一章", (diff.get("counts") or {}).get("changed"), 1)
+    check("三点差异：一章", (diff.get("chapter_counts") or {}).get("changed"), 1)
     _preview = (diff.get("previews") or [{}])[0]
     check("三点差异：带目标侧正文预览",
           "岔路版" in (_preview.get("head") or ""), True)
@@ -270,7 +270,7 @@ def test_cherry_pick_revert_restore_via_tools() -> None:
     check("摘取：重复被拦住", again.get("ok"), False)
 
     _call(registry, "writing_replace_text", chapter_index=2,
-          anchor_quote="老周没有抬头", replacement="要撤销的戊")
+          anchor_quote="配角没有抬头", replacement="要撤销的戊")
     _call(registry, "writing_git_change", action="commit", message="要撤销")
     head = _call(registry, "writing_git", action="log", limit=1)["commits"][0]
     reverted = _call(registry, "writing_git_change", action="revert",
@@ -330,7 +330,7 @@ def test_discard_stash_tag_via_tools() -> None:
     name = stashes[0]["name"]
 
     _call(registry, "writing_replace_text", chapter_index=2,
-          anchor_quote="老周没有抬头", replacement="暂存之后改的")
+          anchor_quote="配角没有抬头", replacement="暂存之后改的")
     _call(registry, "writing_git_change", action="commit", message="暂存后又改")
     popped = _call(registry, "writing_git_change", action="stash_pop",
                    name=stashes[0]["label"])
@@ -400,7 +400,7 @@ def test_partial_commit_via_tools() -> None:
     check("部分提交：成功", out.get("ok"), True)
     check("部分提交：返回剩余状态", bool(out.get("status")), True)
     check("部分提交：只剩一章没提交",
-          (out.get("status") or {}).get("counts", {}).get("changed"), 1)
+          (out.get("status") or {}).get("chapter_counts", {}).get("changed"), 1)
     still = _call(registry, "writing_git", action="status")
     changed = (still.get("changes") or {}).get("changed") or [{}]
     check("部分提交：留下的是作者那一章",
@@ -501,7 +501,7 @@ def test_phase_plan_and_action_state() -> None:
     _call(registry, "writing_git_change", action="branch_create",
           work_id=wid, name="快进路", switch=True)
     _call(registry, "writing_replace_text", chapter_index=2,
-          anchor_quote="老周没有抬头", replacement="快进戊")
+          anchor_quote="配角没有抬头", replacement="快进戊")
     _call(registry, "writing_git_change", action="commit",
           work_id=wid, message="快进路改第二章")
     _call(registry, "writing_git_change", action="branch_switch",
@@ -517,7 +517,7 @@ def test_phase_plan_and_action_state() -> None:
     check("现场：带版本现场块", "的版本现场" in prompt, True)
     check("现场：带分支与 HEAD", "- 分支 " in prompt and "HEAD " in prompt,
           True)
-    check("现场：带最近提交", "- 最近提交：" in prompt, True)
+    check("现场：带最近存档", "- 最近存档：" in prompt, True)
 
 
 def test_work_pin_and_delete() -> None:

@@ -3,7 +3,7 @@
 Phase 1: Extract knowledge from current session → append to MEMORY.md / USER.md
 Phase 2: Consolidate and reorganize full memory files when thresholds exceeded
 
-Design: :doc:`书伴-记忆机制设计方案` §4
+Design: :doc:`留白-记忆机制设计方案` §4
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ def build_conversation_text(messages: list[dict]) -> str:
                 continue
             except json.JSONDecodeError:
                 pass
-        label = {"user": "用户", "assistant": "书伴", "tool": "工具"}.get(role, role)
+        label = {"user": "用户", "assistant": "留白", "tool": "工具"}.get(role, role)
         lines.append(f"{label}: {content}")
     return "\n\n".join(lines)
 

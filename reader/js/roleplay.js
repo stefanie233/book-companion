@@ -1,4 +1,4 @@
-/* Book Companion — role-play setup (graph-driven). */
+/* Liubai — role-play setup (graph-driven). */
 
 import { S } from './state.js';
 import { escapeHtml, escapeHtmlAttr } from './utils.js';

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -36,6 +37,8 @@ from config import Config                                             # noqa: E4
 from content import ContentBlock, ConversationMessage                  # noqa: E402
 from services.session_service import SessionService                    # noqa: E402
 from storage.db_session import SessionDB                               # noqa: E402
+from storage.writing_db import WritingDB                               # noqa: E402
+from tools import ToolRegistry                                         # noqa: E402
 
 FAILED = 0
 
@@ -56,6 +59,13 @@ class NoBookDB:
         raise AssertionError(f"writing mode touched books db: {name}")
 
 
+class QuietBookDB:
+    """只够 ``resolve_graph_db_path`` 用；写作工具本身不查书库。"""
+
+    def get_import_log_by_book(self, book_id):
+        return None
+
+
 class FakeBookDB:
     """阅读模式的最小书库，只够装配 reading-context / current-passage。"""
 
@@ -72,7 +82,8 @@ class FakeBookDB:
         return 3
 
     def get_chunk(self, book_id, chapter, chunk):
-        return SimpleNamespace(content="正文片段。", id="ck-1")
+        return SimpleNamespace(
+            content=f"正文片段第{chunk + 1}块。", id=f"ck-{chunk + 1}")
 
     def get_import_log_by_book(self, book_id):
         return None
@@ -120,6 +131,12 @@ async def main() -> int:
     cfg = TestConfig(project_dir=ROOT)
 
     # ── 写作模式：阅读现场一概不注入 ────────────────────────────────
+    # 先建一本作品：空项目会话的 system prompt 不能出现它的书名（目录只
+    # 报数量，清单要模型自己调 writing_status）。
+    from storage.writing_db import WritingDB
+    wdb = WritingDB(cfg.writing_db_path)
+    wdb.initialize()
+    wdb.create_work("某城来信")
     fake = FakeClient()
     app = api_server.create_app(NoBookDB(), config=cfg)
     app["api_client"] = fake
@@ -140,7 +157,8 @@ async def main() -> int:
     check("写作模式：只调用了一次 LLM", len(fake.calls) == 1, str(fake.calls))
     call = fake.calls[0]
     content = _last_user(call)
-    check("写作模式：user message 只有用户原话", content == "测试", repr(content))
+    check("写作模式：user message 只有用户原话 + 输入时间",
+          content.startswith("测试\n\n（输入时间："), repr(content))
     for tag in ("<reading-context>", "<current-passage",
                 "<persona-observation>", "<relevant-memories>",
                 "<user-selection", "<home-context>"):
@@ -149,6 +167,159 @@ async def main() -> int:
           "执笔者" in call["system_prompt"], call["system_prompt"][:200])
     check("写作模式：system prompt 带写作现场",
           "当前写作现场" in call["system_prompt"], call["system_prompt"][:200])
+    check("空项目：不注入已有作品书名",
+          "某城来信" not in call["system_prompt"],
+          call["system_prompt"][-400:])
+    check("空项目：给 writing_status 指路",
+          "writing_status" in call["system_prompt"], call["system_prompt"][-400:])
+
+    # ── 写作页的引用：正文圈选要带，阅读页残留的书中选区别带 ──────────
+    # 上面那条「selection_source=book」验的就是残留要丢；这里验另一种方向：
+    # 作者在正文编辑器里圈出一段（source=writing），或引用上一轮回复
+    # （source=chat），这两种是写作现场的一部分，必须带进 user message。
+    quote_fake = FakeClient()
+    app_quote = api_server.create_app(NoBookDB(), config=cfg)
+    app_quote["api_client"] = quote_fake
+    await _post(app_quote, {
+        "message": "这段改冷一点",
+        "mode": "writing",
+        "selection": "他把烟按熄在铁皮上。",
+        "selection_source": "writing",
+        "writing_work_id": "",
+        "writing_chapter_index": 0,
+        "stream": "v1",
+    })
+    quoted = _last_user(quote_fake.calls[0])
+    check("写作引用：注入 user-selection", "<user-selection" in quoted,
+          quoted[:300])
+    check("写作引用：source 标成写作正文",
+          'source="写作正文"' in quoted, quoted[:300])
+    check("写作引用：原文逐字带进来", "他把烟按熄在铁皮上。" in quoted,
+          quoted[:300])
+    check("写作引用：不是阅读上下文", "<reading-context>" not in quoted,
+          quoted[:300])
+
+    chat_fake = FakeClient()
+    app_chatq = api_server.create_app(NoBookDB(), config=cfg)
+    app_chatq["api_client"] = chat_fake
+    await _post(app_chatq, {
+        "message": "这句什么意思",
+        "mode": "writing",
+        "selection": "先不写正文，等你确认",
+        "selection_source": "chat",
+        "writing_work_id": "",
+        "writing_chapter_index": 0,
+        "stream": "v1",
+    })
+    chat_quoted = _last_user(chat_fake.calls[0])
+    check("写作引用：引用回复也保留",
+          'source="对话引用"' in chat_quoted, chat_quoted[:300])
+
+    # ── 写作：机械验收把「说了没做」逼回去 ──────────────────────────
+    # 2026-10-29 的会话里，模型说完「建出来并写成正文」就停了，正文 0 字。
+    # 终止判据不能只有「这一轮没调工具」。
+    wdb = WritingDB(cfg.writing_db_path)
+    work_id = wdb.create_work("验收测试", genre="悬疑")
+    wdb.add_chapter(work_id, 1, title="第一章")
+
+    class PromiseClient:
+        """第一轮只说不做，第二轮才老实汇报。"""
+
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+
+        async def stream(self, system_prompt, messages, tools, _x):
+            self.calls.append(list(messages))
+            if len(self.calls) == 1:
+                yield ("我把第一章建出来并写成正文。", [], None)
+            else:
+                yield ("还没写，先确认设定。", [], None)
+
+    promise = PromiseClient()
+    app4 = api_server.create_app(NoBookDB(), config=cfg)
+    app4["api_client"] = promise
+    await _post(app4, {
+        "message": "写第一章",
+        "mode": "writing",
+        "writing_work_id": work_id,
+        "writing_chapter_index": 1,
+        "stream": "v1",
+    })
+    check("机械验收：承诺未兑现时补一轮",
+          len(promise.calls) == 2, str(len(promise.calls)))
+    if len(promise.calls) == 2:
+        note = promise.calls[1][-1]
+        check("机械验收：回灌的是验收提示",
+              note.get("role") == "user"
+              and "机械验收" in (note.get("content") or ""),
+              repr(note)[:200])
+        check("机械验收：指向没做的那一步",
+              "writing_draft_chapter" in (note.get("content") or ""),
+              repr(note)[:200])
+
+    # ── 撞轮次上限：要显式说，不要伪装成正常收尾 ────────────────────
+    class LoopClient:
+        """每轮都调一次工具，永远不自称做完。"""
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def stream(self, system_prompt, messages, tools, _x):
+            self.calls += 1
+            yield ("再查一次。",
+                   [{"id": f"call-{self.calls}", "name": "writing_status",
+                     "arguments": "{}"}], None)
+
+    loop = LoopClient()
+    app5 = api_server.create_app(QuietBookDB(), config=cfg)
+    app5["api_client"] = loop
+    # 没有 runtime 就没有工具注册表，写作工具会全是 Tool not found。
+    app5["runtime"] = SimpleNamespace(tool_registry=ToolRegistry())
+    _headers, body5 = await _post(app5, {
+        "message": "一直查",
+        "mode": "writing",
+        "stream": "v2",
+        "writing_work_id": work_id,
+        "writing_chapter_index": 1,
+    })
+    check("撞上限：跑满 40 轮", loop.calls == 40, str(loop.calls))
+    check("撞上限：发 round_limit 事件",
+          '"type": "round_limit"' in body5, body5[-300:])
+
+    # ── 现场过期：建了章之后，下一轮的 system prompt 必须重拍 ──────
+    fresh_work = wdb.create_work("刷新测试")
+
+    class RefreshClient:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def stream(self, system_prompt, messages, tools, _x):
+            self.prompts.append(system_prompt)
+            if len(self.prompts) == 1:
+                yield ("建一章。",
+                       [{"id": "c1", "name": "writing_create_chapter",
+                         "arguments": json.dumps(
+                             {"title": "新章", "purpose": "推进"})}], None)
+            else:
+                yield ("建好了。", [], None)
+
+    refresh = RefreshClient()
+    app6 = api_server.create_app(QuietBookDB(), config=cfg)
+    app6["api_client"] = refresh
+    app6["runtime"] = SimpleNamespace(tool_registry=ToolRegistry())
+    await _post(app6, {
+        "message": "建一章",
+        "mode": "writing",
+        "stream": "v2",
+        "writing_work_id": fresh_work,
+    })
+    check("现场刷新：跑了两轮", len(refresh.prompts) == 2,
+          str(len(refresh.prompts)))
+    if len(refresh.prompts) == 2:
+        check("现场刷新：首轮还没有章节",
+              "还没有章节" in refresh.prompts[0], refresh.prompts[0][-300:])
+        check("现场刷新：次轮看到新章",
+              "新章" in refresh.prompts[1], refresh.prompts[1][-300:])
 
     # ── 会话不跨模式：带着阅读会话 id 发写作请求，必须新建会话 ──────
     sdb = SessionDB(tmp / "data" / "sessions.db")
@@ -207,6 +378,36 @@ async def main() -> int:
           "<reading-context>" in content2, content2[:300])
     check("阅读模式：仍有 <current-passage>",
           "<current-passage " in content2, content2[:300])
+
+    # ── 视窗文字优先：跨块时逐段标注块边界 ──────────────────────────
+    # 视窗横跨第 2、3 块，单块正文盖不住；注入必须以 viewport 为准并标出
+    # 每一段属于哪一块（而不是退回 position 指定的那一块）。
+    fake_vp = FakeClient()
+    app_vp = api_server.create_app(FakeBookDB(), config=cfg)
+    app_vp["api_client"] = fake_vp
+    await _post(app_vp, {
+        "message": "这一段在讲什么",
+        "mode": "immersive",
+        "book_id": "bid-test",
+        "position": {"chapter": 0, "chunk": 1},
+        "reading_chapter": 0,
+        "reading_viewport": {
+            "text": "正文片段第2块。 正文片段第3块。",
+            "sections": [{"sectionIndex": 0, "visiblePx": 700,
+                          "text": "正文片段第2块。 正文片段第3块。"}],
+        },
+        "stream": "v1",
+    })
+    vp_content = _last_user(fake_vp.calls[0])
+    check("视窗注入：来源是 viewport",
+          'source="viewport"' in vp_content, vp_content[:800])
+    check("视窗注入：标注跨 2 块",
+          "共跨 2 块" in vp_content, vp_content[:800])
+    check("视窗注入：逐块标出块号",
+          "第 2/3 块" in vp_content and "第 3/3 块" in vp_content,
+          vp_content[:800])
+    check("视窗注入：不再只给 position 那一块",
+          "正文片段第1块" not in vp_content, vp_content[:800])
 
     # ── 主页 / 阅读页：页面身份决定提示词与会话线 ──────────────────
     # 主页请求即便带着阅读页残留的 book_id / 选区 / 进度，也必须按主页

@@ -266,6 +266,9 @@ def _register_author_tools(registry: ToolRegistry, api_client, config) -> None:
                 adb.close()
             if not out.get("found"):
                 out["queried"] = want
+                # 没有档案不是故障：带上主题键，让模型用 self_explain
+                # 解释「还没采集 / 还没读到」，而不是凭印象编作者生平。
+                out["self_topic"] = "author-layer"
             return json.dumps(out, ensure_ascii=False)
         except Exception as exc:                         # noqa: BLE001
             return json.dumps({"error": f"作者层查询失败：{exc}"},

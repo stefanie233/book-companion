@@ -1,4 +1,4 @@
-# Book Companion（书伴）
+# Liubai（留白）
 
 基于 AI 的本地阅读陪伴助手：CLI 内核 + Web 阅读界面。导入你的 EPUB，和一位**记得你读过什么、聊过什么**的书友一起读书——所有数据都留在你自己的机器上。
 
@@ -25,6 +25,7 @@
 
 - Windows 10/11（一键脚本）；其他平台可手动运行（依赖均为跨平台库）
 - [Python 3.12+](https://www.python.org/downloads/)
+- 桌面版另需 `pywebview` / `pythonnet`（可选，见「桌面版」一节）
 
 ### 一键安装（Windows）
 
@@ -55,6 +56,22 @@ start.bat        :: 启动 Agent + API 服务，等待就绪后自动打开浏�
 或直接 `python main.py`，然后访问 **<http://127.0.0.1:8766>**。
 
 首次启动推荐**留着 API Key 不填**——服务起来后在网页引导里填写即可。
+
+### 桌面版（可选）
+
+仓库附带 PyInstaller 打包脚本，可生成原生窗口桌面版（应用名 **留白 / Liubai**，只含 Web 界面，不含 CLI）：
+
+```powershell
+pip install pywebview pythonnet      # 原生窗口依赖；Windows 使用 WebView2
+pip install pyinstaller
+powershell -ExecutionPolicy Bypass -File packaging\build.ps1
+```
+
+加 `-Windowed` 去掉控制台窗口，加 `-Installer` 输出安装包（需要 Inno Setup 6）。
+完整参数、安装包与便携模式说明见 [packaging/README.md](packaging/README.md)。
+
+桌面版首次启动会把可写数据放在 `%LOCALAPPDATA%\LiuBai`（可用环境变量 `BC_HOME` 覆盖；
+在 exe 同级放 `portable.flag` 可切换为便携模式）。源码运行时仍使用仓库根目录，两者互不影响。
 
 ## ⚙️ 配置
 

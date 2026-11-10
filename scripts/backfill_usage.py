@@ -19,10 +19,18 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from usage_log import get_store
 
 
-def backfill(jsonl_path: Path, dry_run: bool) -> None:
-    attempted = inserted = skipped = malformed = 0
-    store = None if dry_run else get_store()
+def _inputs(path: Path) -> list[Path]:
+    """连轮转份一起读：``bookgraph.jsonl.3 → .2 → .1 → 活文件``。
 
+    决策 147 之后活跃文件按 10MB 轮转；只读活文件会让回填静默漏掉
+    已轮转出去的调用（``INSERT OR IGNORE`` 不会报错，只是少行）。
+    """
+    rotated = sorted(path.parent.glob(path.name + ".*"), reverse=True)
+    return [p for p in rotated + [path] if p.is_file()]
+
+
+def _backfill_file(jsonl_path: Path, store, dry_run: bool) -> tuple[int, int, int, int]:
+    attempted = inserted = skipped = malformed = 0
     with open(jsonl_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -58,7 +66,18 @@ def backfill(jsonl_path: Path, dry_run: bool) -> None:
                 inserted += 1
             else:
                 skipped += 1
+    return attempted, inserted, skipped, malformed
 
+
+def backfill(jsonl_path: Path, dry_run: bool) -> None:
+    store = None if dry_run else get_store()
+    total = [0, 0, 0, 0]
+    for src in _inputs(jsonl_path):
+        a, i, s, m = _backfill_file(src, store, dry_run)
+        total = [x + y for x, y in zip(total, (a, i, s, m))]
+        print(f"  {src.name}: attempted={a} inserted={i} skipped={s} malformed={m}")
+
+    attempted, inserted, skipped, malformed = total
     label = "would insert" if dry_run else "inserted"
     print(f"attempted={attempted} {label}={inserted} skipped={skipped} malformed={malformed}")
 

@@ -1,32 +1,23 @@
-/* Book Companion — reader: book selection, chunk loading, navigation. */
+/* Liubai — reader: book selection, chunk loading, navigation. */
 
 import { S } from './state.js';
-import { escapeHtml } from './utils.js';
+import { bookProgress, escapeHtml, paintProgress } from './utils.js';
 import { addChat } from './chat.js';
 import { loadSessionList } from './sessions.js';
-import { loadSettings } from './theme.js';
 import * as EpubReader from './epub-reader.js';
 
 let _currentBookTitle = '';  // cached for context bar updates in loadChunk
 
-// ── Wheel-to-page (damped) ───────────────────────────────────────
-// 滚到边界时界面停住,继续滚累积 deltaY,达到阈值才翻页。
-// 阈值 = N 格(1 格 ≈ 100px deltaY),N 来自主题设置"翻页阻尼"。
+// ── Wheel-to-page ────────────────────────────────────────────────
+// 滚到边界时界面停住,继续滚累积 deltaY,够一格就翻页。
 // 用 wheel 而非 scroll:到底后 scrollTop 不再变化,scroll 事件无法累积,
 // 短内容 / 边界后都翻不动。wheel 事件在边界后仍持续触发,可累积。
 
 let _wheelAccum = 0;          // 边界处累积的 deltaY(向下为正)
 let _lastWheelTime = 0;       // 上次 wheel 事件时间(判断手势连续性)
 let _pageTurnDir = 0;         // 翻页后的连翻方向: +1=向下, -1=向上, 0=无
-const _WHEEL_TICK_PX = 100;   // 1 格 ≈ 100px(Chrome/Windows 鼠标滚轮默认)
+const _PAGE_TURN_PX = 100;    // 1 格 ≈ 100px(Chrome/Windows 鼠标滚轮默认)
 const _GESTURE_GAP_MS = 200;  // 两次 wheel 间隔超过此值视为手势停顿
-
-function _getPageTurnThreshold() {
-  try {
-    var ticks = parseInt(loadSettings().pageTurnThreshold) || 2;
-    return ticks * _WHEEL_TICK_PX;
-  } catch (_) { return 2 * _WHEEL_TICK_PX; }
-}
 
 // 连续手势连翻,停顿恢复:
 // 翻页后进入连翻状态(_pageTurnDir 记录方向),只要滚轮手势没停
@@ -55,7 +46,7 @@ function _onBookPageWheel(e) {
 
   if (canTurn) {
     _wheelAccum += Math.abs(e.deltaY);
-    if (_wheelAccum >= _getPageTurnThreshold()) {
+    if (_wheelAccum >= _PAGE_TURN_PX) {
       _wheelAccum = 0;
       _pageTurnDir = dir;  // 记录连翻方向
       if (dir > 0) nextChunk(); else prevChunk();
@@ -83,6 +74,14 @@ function _installScrollPagination() {
 
 let _selectSeq = 0;   // selectBook 防重入：并发切书时旧响应直接作废
 
+/** 全书百分比示数（title 里给精确段序）。右上角与沉浸阅读底栏共用。
+ *  chapter/chunk 用 DB 语义坐标，chunk 模式与 native 模式同一套。 */
+export function renderBookProgress(chapter, chunk) {
+  const p = bookProgress(chapter, chunk, S.bookChunkOffsets, S.bookChunkTotal);
+  paintProgress(document.getElementById('chunkPos'), p);
+  paintProgress(document.getElementById('focusProgress'), p);
+}
+
 export async function selectBook() {
   const sel = document.getElementById('bookSelect');
   if (!sel.value) return;
@@ -92,6 +91,12 @@ export async function selectBook() {
   // otherwise make bookChanged always false (stale session leaks across books).
   const bookChanged = !S._lastLoadedBook || S._lastLoadedBook !== sel.value;
   S.currentBook = sel.value;
+  // 阅读现场换书（下拉、书架打开、笔记跳转都会走到这里）：按书取数的
+  // 浮窗/界面据此立刻刷新。不能只听 #bookSelect 的 change——程序化切书
+  // 不会派发 DOM change。
+  window.dispatchEvent(new CustomEvent('bc:book-changed', {
+    detail: { bookId: sel.value },
+  }));
   if (bookChanged) {
     // 切书瞬间先清掉上一本的示数。positionMeta 只在新书定位/同步命中后
     // 重写，首开无阅读进度的书不会命中 —— 旧的章节名会一直挂在
@@ -99,7 +104,10 @@ export async function selectBook() {
     const metaEl = document.getElementById('positionMeta');
     if (metaEl) metaEl.textContent = '';
     const posEl = document.getElementById('chunkPos');
-    if (posEl) posEl.textContent = '0 / 0';
+    if (posEl) { posEl.textContent = ''; posEl.removeAttribute('title'); }
+    // 进度前缀和属于上一本书，新书 context 回来前一律作废
+    S.bookChunkOffsets = null;
+    S.bookChunkTotal = 0;
     // 位置/选区是「上一本书」的坐标，绝不能跟着新书发出去
     S.visibleChapters = [];
     S.selectionSection = null;
@@ -109,8 +117,13 @@ export async function selectBook() {
     S.selectionAnchorText = '';
     S.lastSelection = '';
     S.lastRange = null;
-    const selTag = document.getElementById('selectionTag');
-    if (selTag) selTag.classList.remove('visible');
+    // 走同一个出口：引用条、常驻高亮（CSS Custom Highlight）一起撤。
+    if (typeof window.clearSelectionRef === 'function') {
+      window.clearSelectionRef();
+    } else {
+      const selTag = document.getElementById('selectionTag');
+      if (selTag) selTag.classList.remove('visible');
+    }
   }
   try {
     const resp = await fetch(S.API + '/api/books/' + S.currentBook + '/context');
@@ -120,6 +133,17 @@ export async function selectBook() {
     if (seq !== _selectSeq) return;
 
     const all = [...ctx.structure.front_matter, ...ctx.structure.body, ...ctx.structure.back_matter];
+    // 全书进度前缀和。structure 按 front/body/back 分组返回，组间拼接
+    // 不等于 spine 顺序，必须按 chapter_index 重排后再累计。
+    const ordered = all.slice().sort((a, b) => a.chapter_index - b.chapter_index);
+    const chunkOffsets = {};
+    let chunkAcc = 0;
+    for (const c of ordered) {
+      chunkOffsets[c.chapter_index] = chunkAcc;
+      chunkAcc += c.chunks || 0;
+    }
+    S.bookChunkOffsets = chunkOffsets;
+    S.bookChunkTotal = chunkAcc;
     const chSel = document.getElementById('chapterSelect');
     chSel.innerHTML = all.map(c =>
       `<option value="${c.chapter_index}">${c.type==='body'?'':'['+c.type+']'} ${(c.title||'Ch.'+c.chapter_index).slice(0,30)} (${c.chunks}段)</option>`
@@ -139,7 +163,7 @@ export async function selectBook() {
         S.currentChapter = ctx.reading_progress.chapter;
         S.currentChunk = ctx.reading_progress.chunk;
         chSel.value = S.currentChapter;
-        document.getElementById('chunkPos').textContent = (S.currentChunk + 1) + ' / ...';
+        renderBookProgress(S.currentChapter, S.currentChunk);
         loadChunk();
       } else {
         selectChapter();
@@ -192,7 +216,7 @@ async function prefetchGraphForBook(bookId) {
 export function selectChapter() {
   S.currentChapter = parseInt(document.getElementById('chapterSelect').value) || 0;
   S.currentChunk = 0;
-  document.getElementById('chunkPos').textContent = '1 / ...';
+  renderBookProgress(S.currentChapter, 0);
   if (S.renderMode === 'native') {
     EpubReader.jumpToChapter(S.currentChapter);
     return;
@@ -206,6 +230,10 @@ export async function loadChunk() {
   const pageInner = document.getElementById('bookPageInner');
   const page = document.getElementById('bookPage');
   const seq = ++_chunkSeq;
+  // 换页 = 上一段选区连同它的高亮一起作废（引用条跟着撤）。
+  if (typeof window.clearBookSelection === 'function') {
+    window.clearBookSelection();
+  }
   pageInner.innerHTML = '加载中...';
   try {
     const resp = await fetch(
@@ -223,7 +251,7 @@ export async function loadChunk() {
     S.prevAnchor = data.prev_anchor;
     S.nextAnchor = data.next_anchor;
     S.currentChunk = data.chunk_index;
-    document.getElementById('chunkPos').textContent = (S.currentChunk + 1) + ' / ' + S.totalChunks;
+    renderBookProgress(S.currentChapter, S.currentChunk);
     updateMeta(data);
     // Update context bar with current chapter name
     if (window.updateContextBar && _currentBookTitle) {
@@ -250,7 +278,7 @@ export function prevChunk() {
       document.getElementById('chapterSelect').value = S.currentChapter;
     }
     S.currentChunk = S.prevAnchor.chunk;
-    document.getElementById('chunkPos').textContent = (S.currentChunk + 1) + ' / ...';
+    renderBookProgress(S.currentChapter, S.currentChunk);
     loadChunk();
   }
 }
@@ -264,7 +292,7 @@ export function nextChunk() {
       document.getElementById('chapterSelect').value = S.currentChapter;
     }
     S.currentChunk = S.nextAnchor.chunk;
-    document.getElementById('chunkPos').textContent = (S.currentChunk + 1) + ' / ...';
+    renderBookProgress(S.currentChapter, S.currentChunk);
     loadChunk();
   }
 }

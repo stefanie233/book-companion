@@ -113,12 +113,15 @@ async def _no_wikidata(session, name, **kw):
     return []
 
 
-async def _drive(base: str, adb: AuthorsDB) -> dict:
+async def _drive(base: str, adb: AuthorsDB, tmp: str) -> dict:
     from config import Config
     cfg = Config()
     cfg.api_base = base
     cfg.api_key = "fake"
     cfg.model = "fake-model"
+    # 临时 project_dir：否则 web_deepseek.resolve() 会翻到仓库里真实的
+    # data/config/providers.json，把替身搜索/抓页顶掉。
+    cfg.project_dir = Path(tmp)
 
     # 模型绑定会把假端点顶掉：extract_page 内部走
     # ``config_for(cfg, "authorgraph.enrich")``，而 Config.project_dir 默认
@@ -164,7 +167,7 @@ def _assert(out: dict, tmp: str) -> int:
     check("e2e：编造引文没有落库",
           any("编出来的事" in (x["statement"] or "") for x in rows), False)
     check("e2e：重跑跳过已抓页面",
-          asyncio.run(_drive(_BASE[0], adb)).get("fetched"), 0)
+          asyncio.run(_drive(_BASE[0], adb, tmp)).get("fetched"), 0)
     check("e2e：重跑不新增", adb.stats("au-e2e")["records"], 1)
     adb.close()
 
@@ -200,6 +203,10 @@ def main() -> int:
         _post(f"{base}/_mock/scenario", _rules())
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            # 真实 enrich 管线会调 usage_log；不指到临时库就会把 fake-model
+            # 写进生产 data/sessions.db（决策 147）。
+            from usage_log import init_for_tests
+            init_for_tests(Path(tmp) / "sessions.db")
             adb = AuthorsDB(Path(tmp) / "authors.db")
             adb.upsert_author(NAME)
             adb.get_conn().execute(
@@ -207,7 +214,7 @@ def main() -> int:
                 " WHERE canonical_name=?", (NAME,))
             adb.get_conn().commit()
             try:
-                out = asyncio.run(_drive(base, adb))
+                out = asyncio.run(_drive(base, adb, tmp))
             finally:
                 adb.close()
             return _assert(out, tmp)

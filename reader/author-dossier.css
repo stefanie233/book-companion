@@ -222,6 +222,88 @@
 .ado-src.is-web { color: #3f6f78; border-color: rgba(79, 127, 138, .4); }
 .ado-src.is-model { color: var(--accent); border-color: rgba(180, 90, 45, .4); }
 
+/* ── 细节：观察与钩子 ───────────────────────────────────────────────── */
+.ado-detail-group { margin: 14px 0 18px; }
+.ado-detail-topic {
+  font-size: 11px; letter-spacing: .14em; color: var(--text-muted);
+  margin: 0 0 8px 2px;
+}
+.ado-detail-note {
+  font-size: 11.5px; color: var(--text-muted); align-self: center;
+}
+.ado-obs, .ado-hook { cursor: default; }
+.ado-obs:hover, .ado-hook:hover { background: var(--bg-surface); }
+.ado-obs-quote {
+  margin: 2px 0 2px; padding: 4px 0 4px 10px;
+  border-left: 2px solid var(--border);
+  font-size: 13px; line-height: 1.6; color: var(--text-secondary);
+}
+.ado-hook { border-left: 2px solid rgba(180, 90, 45, .45); }
+.ado-hook .ado-dim-statement { font-size: 13px; }
+
+/* ── 细节：攻略与采集任务 ──────────────────────────────────────────── */
+.ado-jobbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 2px 0 10px;
+}
+.ado-job-btn {
+  appearance: none; cursor: pointer;
+  padding: 4px 12px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--bg-surface);
+  color: var(--text-secondary); font-size: 12.5px;
+  transition: var(--transition-interact);
+}
+.ado-job-btn:hover:not(:disabled) {
+  color: var(--text-primary); border-color: var(--text-muted);
+}
+.ado-job-btn:disabled { opacity: .45; cursor: default; }
+.ado-job-force {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; color: var(--text-muted);
+}
+.ado-job-msg { font-size: 12px; color: var(--text-muted); margin-left: auto; }
+.ado-job-msg.is-warn { color: var(--accent); }
+.ado-joblog {
+  margin: 0 0 12px; padding: 8px 10px;
+  max-height: 180px; overflow: auto;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px; line-height: 1.5; color: var(--text-secondary);
+  white-space: pre-wrap; word-break: break-all;
+}
+.ado-plans { margin: 4px 0 6px; }
+.ado-plan-note { font-size: 12.5px; color: var(--text-muted); }
+.ado-plan {
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 9px 12px; margin-bottom: 7px;
+  border: 1px solid var(--border); border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+.ado-plan.is-black { opacity: .55; }
+.ado-plan-top {
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+}
+.ado-plan-book { font-size: 13.5px; color: var(--text-primary); }
+.ado-plan-scope {
+  font-size: 11px; letter-spacing: .08em; color: var(--text-muted);
+}
+.ado-plan-hyp {
+  font-size: 13px; line-height: 1.55; color: var(--text-secondary);
+}
+.ado-plan-actions { display: flex; gap: 6px; margin-top: 2px; }
+.ado-plan-list-btn {
+  appearance: none; cursor: pointer;
+  padding: 1px 9px; border-radius: 999px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text-muted); font-size: 11px;
+}
+.ado-plan-list-btn:hover { color: var(--text-primary); }
+.ado-plan-list-btn.is-on {
+  color: var(--text-primary); border-color: var(--text-muted);
+  background: var(--bg-raised);
+}
+
 .ado-undated { margin-top: 20px; }
 .ado-undated-list { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
 .ado-undated-item {

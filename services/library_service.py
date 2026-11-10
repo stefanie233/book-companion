@@ -74,7 +74,57 @@ def extract_and_save_cover(db: BookDB, book_id: str) -> str | None:
         cover_filename = f"{book_id}_cover.{ext}"
         cover_path = bookbank / cover_filename
         cover_path.write_bytes(image_bytes)
+        # 书架/笔记泳道只显示 92–130px 宽的封面，原图往往 1500px+（最大
+        # 800KB），每次刷新都要下载并解码成全尺寸再缩小 —— 快速下滑时
+        # 正是这里跟不上。顺手生成一份缩略图（失败不影响原图）。
+        make_cover_thumb(cover_path)
         return cover_filename
+    except Exception:
+        return None
+
+
+# 书架卡片最宽 130px，3x DPR 约 390px；400px 宽足够，再多只是浪费解码。
+COVER_THUMB_WIDTH = 400
+
+
+def cover_thumb_path(cover_path: Path) -> Path:
+    """缩略图与原图同目录，命名 ``<id>_cover_thumb.<ext>``。"""
+    return cover_path.with_name(
+        f"{cover_path.stem}_thumb{cover_path.suffix.lower()}"
+    )
+
+
+def make_cover_thumb(cover_path: Path, force: bool = False) -> Path | None:
+    """由原封面生成书架用缩略图；Pillow 不可用或失败时返回 None。
+
+    只处理位图（svg 是矢量，原样使用更清晰）。
+    """
+    if cover_path.suffix.lower() not in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+        return None
+    thumb = cover_thumb_path(cover_path)
+    try:
+        if thumb.exists() and not force:
+            # 原图比缩略图新 = 重导过这本书，旧缩略图作废
+            if thumb.stat().st_mtime >= cover_path.stat().st_mtime:
+                return thumb
+        from PIL import Image  # 可选依赖：缺失时退回原图
+
+        with Image.open(cover_path) as im:
+            im.load()
+            if im.width <= COVER_THUMB_WIDTH:
+                # 已经够小，没必要再编码一次 —— 直接把原图当缩略图用。
+                return None
+            ratio = COVER_THUMB_WIDTH / im.width
+            new_size = (COVER_THUMB_WIDTH, max(1, round(im.height * ratio)))
+            if im.mode not in ("RGB", "L"):
+                im = im.convert("RGB")
+            resized = im.resize(new_size, Image.LANCZOS)
+            if thumb.suffix.lower() == ".png":
+                resized.save(thumb, "PNG", optimize=True)
+            else:
+                # 统一落到 jpg 容器里编码；扩展名保持原样只为让调用方好认。
+                resized.save(thumb, "JPEG", quality=82, optimize=True, progressive=True)
+        return thumb
     except Exception:
         return None
 
@@ -498,31 +548,17 @@ def import_book(db: BookDB, path: str, category_id: str | None = None) -> tuple[
         db.insert_chunks(chunk_rows)
 
         # ── Write import_log (lifecycle event) ──────────────────────────
-        copyright_card = _build_copyright_card(
-            metadata, chapters_raw, source.name,
-        )
         stable_book_id, confidence, import_count = _match_stable_identity_sync(
             db, metadata["title"], metadata.get("author", ""), source.name,
         )
-        now_ms = _now_ms()
-        db.insert_import_log(ImportLogRow(
-            id=_new_id(),
-            stable_book_id=stable_book_id,
-            book_id=book_id,
-            event_type="import",
-            in_library=1,
-            copyright_card=copyright_card,
-            title=metadata["title"],
-            author=metadata.get("author", ""),
-            publisher=metadata.get("publisher"),
-            publish_year=metadata.get("publish_year"),
-            isbn=metadata.get("isbn"),
-            first_chapter=metadata.get("first_chapter_title"),
-            first_paragraph=metadata.get("first_paragraph"),
+        record_import_event(
+            db, book_row,
             source_filename=source.name,
+            metadata=metadata,
+            chapters_raw=chapters_raw,
+            stable_book_id=stable_book_id,
             import_count=import_count,
-            time_created=now_ms,
-        ))
+        )
 
         # ── Recover orphaned annotations from previous import ─────────
         if confidence != "no_match":
@@ -1615,16 +1651,91 @@ def search_sentences(
     return sentences[:limit]
 
 
+_SENT_END = re.compile(r'([。！？.!?\n])')
+
+
+def _iter_sentence_hits(
+    db: BookDB, book_id: str, query: str, chapter_index: int | None = None,
+):
+    """Yield sentence-level hits for *query*, in reading order.
+
+    This is the single source of truth for both the chapter overview counts
+    and the paginated sentence list — the number next to a chapter must be
+    the number of results that chapter actually yields (sentences), not the
+    number of chunks that happen to contain the query.
+    """
+    raw_results = db.search_books(
+        query, limit=9999, book_id=book_id, chapter_index=chapter_index,
+    )
+    # FTS returns relevance order; the search panel is a reading-order
+    # browser, so re-sort to (chapter, chunk) before splitting.
+    raw_results.sort(key=lambda r: (
+        r.get("chapter_index", 0), r.get("chunk_index", 0),
+    ))
+
+    query_lower = query.lower()
+    for r in raw_results:
+        chunk_index = r.get("chunk_index", 0)
+        ch_idx = r.get("chapter_index", chapter_index or 0)
+        chapter_title = r.get("chapter_title") or ""
+
+        chunk = db.get_chunk(book_id, ch_idx, chunk_index)
+        if not chunk:
+            continue
+        text = chunk.content
+
+        # Split into atomic sentences
+        parts = _SENT_END.split(text)
+        buf = ""
+        for part in parts:
+            buf += part
+            if _SENT_END.match(part) and buf.strip():
+                sent = buf.strip()
+                if query_lower in sent.lower() and len(sent) >= len(query):
+                    yield {
+                        "sentence": sent,
+                        "chapter_index": ch_idx,
+                        "chunk_index": chunk_index,
+                        "chapter_title": chapter_title,
+                        "match_start": sent.lower().find(query_lower),
+                        "match_end": sent.lower().find(query_lower) + len(query),
+                    }
+                buf = ""
+        # Trailing text without ending delimiter
+        if buf.strip() and query_lower in buf.lower():
+            yield {
+                "sentence": buf.strip(),
+                "chapter_index": ch_idx,
+                "chunk_index": chunk_index,
+                "chapter_title": chapter_title,
+                "match_start": buf.lower().find(query_lower),
+                "match_end": buf.lower().find(query_lower) + len(query),
+            }
+
+
 def search_chapter_overview(
     db: BookDB, book_id: str, query: str,
 ) -> list[dict]:
     """Return per-chapter hit counts for *query* within *book_id*.
 
-    Each dict has: chapter_index, chapter_title, hit_count.
-    Sorted by chapter_index ascending.  Uses LIKE search so it works for
-    all query lengths including single CJK characters.
+    ``hit_count`` counts the sentence results the chapter panel will show
+    (same splitter as :func:`search_chapter_sentences`), not chunks.
+    Sorted by chapter_index ascending.
     """
-    return db.count_hits_by_chapter(query, book_id)
+    counts: dict[int, int] = {}
+    titles: dict[int, str] = {}
+    for hit in _iter_sentence_hits(db, book_id, query):
+        idx = hit["chapter_index"]
+        counts[idx] = counts.get(idx, 0) + 1
+        titles.setdefault(idx, hit.get("chapter_title") or "")
+    return [
+        {
+            "chapter_index": idx,
+            "chapter_title": titles.get(idx, ""),
+            "hit_count": counts[idx],
+        }
+        for idx in sorted(counts)
+    ]
 
 
 def search_chapter_sentences(
@@ -1643,56 +1754,7 @@ def search_chapter_sentences(
         - total: total matching sentences
         - has_more: whether more pages exist
     """
-    import re
-
-    SENT_END = re.compile(r'([。！？.!?\n])')
-
-    # Fetch all matching chunks (no LIMIT — need full count for pagination)
-    raw_results = db.search_books(
-        query, limit=9999, book_id=book_id, chapter_index=chapter_index,
-    )
-
-    all_sentences: list[dict] = []
-    query_lower = query.lower()
-
-    for r in raw_results:
-        chunk_index = r.get("chunk_index", 0)
-        ch_idx = r.get("chapter_index", chapter_index or 0)
-        chapter_title = r.get("chapter_title") or ""
-
-        chunk = db.get_chunk(book_id, ch_idx, chunk_index)
-        if not chunk:
-            continue
-        text = chunk.content
-
-        # Split into atomic sentences
-        parts = SENT_END.split(text)
-        buf = ""
-        for part in parts:
-            buf += part
-            if SENT_END.match(part) and buf.strip():
-                sent = buf.strip()
-                if query_lower in sent.lower() and len(sent) >= len(query):
-                    all_sentences.append({
-                        "sentence": sent,
-                        "chapter_index": ch_idx,
-                        "chunk_index": chunk_index,
-                        "chapter_title": chapter_title,
-                        "match_start": sent.lower().find(query_lower),
-                        "match_end": sent.lower().find(query_lower) + len(query),
-                    })
-                buf = ""
-        # Trailing text without ending delimiter
-        if buf.strip() and query_lower in buf.lower():
-            all_sentences.append({
-                "sentence": buf.strip(),
-                "chapter_index": ch_idx,
-                "chunk_index": chunk_index,
-                "chapter_title": chapter_title,
-                "match_start": buf.lower().find(query_lower),
-                "match_end": buf.lower().find(query_lower) + len(query),
-            })
-
+    all_sentences = list(_iter_sentence_hits(db, book_id, query, chapter_index))
     total = len(all_sentences)
     page = all_sentences[offset:offset + limit]
 
@@ -1910,27 +1972,31 @@ def delete_book(db: BookDB, book_id: str) -> dict:
     }
 
     # ── Write delete event to import_log BEFORE deleting book ──────────
+    # 总是写：书可能来自不走 import_log 的旧路径（结构化切分/历史库），
+    # 没有活动行时用书本身的信息与空 stable id 记一笔，日志才不会漏动作。
     import_log = db.get_import_log_by_book(book_id)
+    source_filename = import_log.source_filename if import_log else (
+        Path(book.source_path).name if book.source_path else ""
+    )
+    db.insert_import_log(ImportLogRow(
+        id=_new_id(),
+        stable_book_id=import_log.stable_book_id if import_log else "",
+        book_id=book_id,
+        event_type="delete",
+        in_library=0,
+        copyright_card=import_log.copyright_card if import_log else "{}",
+        title=book.title,
+        author=book.author,
+        publisher=import_log.publisher if import_log else None,
+        publish_year=import_log.publish_year if import_log else None,
+        isbn=import_log.isbn if import_log else None,
+        first_chapter=import_log.first_chapter if import_log else None,
+        first_paragraph=import_log.first_paragraph if import_log else None,
+        source_filename=source_filename,
+        import_count=import_log.import_count if import_log else 1,
+        time_created=_now_ms(),
+    ))
     if import_log:
-        now_ms = _now_ms()
-        db.insert_import_log(ImportLogRow(
-            id=_new_id(),
-            stable_book_id=import_log.stable_book_id,
-            book_id=book_id,
-            event_type="delete",
-            in_library=0,
-            copyright_card=import_log.copyright_card,
-            title=import_log.title,
-            author=import_log.author,
-            publisher=import_log.publisher,
-            publish_year=import_log.publish_year,
-            isbn=import_log.isbn,
-            first_chapter=import_log.first_chapter,
-            first_paragraph=import_log.first_paragraph,
-            source_filename=import_log.source_filename,
-            import_count=import_log.import_count,
-            time_created=now_ms,
-        ))
         orphaned = db.orphan_annotations_for_book(book_id)
         summary["annotations_orphaned"] = orphaned
 
@@ -2346,6 +2412,21 @@ def _find_chunk_for_offset(
     return None
 
 
+def _first_chapter_paragraph(
+    chapters_raw: list[tuple[str, list[str] | str]],
+) -> tuple[str, str]:
+    """Return (first meaningful chapter title, first ~120 chars).
+
+    Skips pages shorter than 50 chars (covers, separators) so the card /
+    lifecycle log points at actual body text when possible.
+    """
+    for label, paras in chapters_raw:
+        text = paras if isinstance(paras, str) else "\n".join(paras)
+        if len(text.strip()) >= 50:
+            return (label or "", text.strip()[:120])
+    return ("", "")
+
+
 def _build_copyright_card(
     metadata: dict[str, str],
     chapters_raw: list[tuple[str, list[str] | str]],
@@ -2359,19 +2440,7 @@ def _build_copyright_card(
     """
     import json
 
-    # First chapter info
-    first_chapter_title = ""
-    first_paragraph = ""
-    for label, paras in chapters_raw:
-        if isinstance(paras, str):
-            text = paras
-        else:
-            text = "\n".join(paras)
-        if len(text.strip()) >= 50:
-            first_chapter_title = label or ""
-            # Truncate to ~100 chars for the card
-            first_paragraph = text.strip()[:120]
-            break
+    first_chapter_title, first_paragraph = _first_chapter_paragraph(chapters_raw)
 
     return json.dumps({
         "title": metadata.get("title", ""),
@@ -2430,6 +2499,71 @@ def _match_stable_identity_sync(
 
     # No match — generate new stable identity
     return (_make_stable_id(), "no_match", 1)
+
+
+def record_import_event(
+    db: BookDB,
+    book: BookRow,
+    *,
+    source_filename: str = "",
+    metadata: dict[str, str] | None = None,
+    chapters_raw: list[tuple[str, list[str] | str]] | None = None,
+    stable_book_id: str | None = None,
+    import_count: int | None = None,
+) -> ImportLogRow:
+    """Append an ``import`` event to ``import_log``.
+
+    Both import paths (``import_book`` and ``import_epub_with_split``) call
+    this so the lifecycle log covers every way a book can enter the library.
+    A re-import over the same ``book_id`` reuses the active stable identity
+    instead of asking the matcher again — the content hash is the same book,
+    and a filename heuristic must not fork a new identity that orphans
+    annotations.
+    """
+    existing = db.get_import_log_by_book(book.id)
+
+    if stable_book_id:
+        sid = stable_book_id
+        count = import_count if import_count is not None else (
+            existing.import_count + 1 if existing else 1)
+    elif existing:
+        sid = existing.stable_book_id
+        count = import_count if import_count is not None else existing.import_count + 1
+    else:
+        sid, _confidence, matched_count = _match_stable_identity_sync(
+            db, book.title, book.author, source_filename,
+        )
+        count = import_count if import_count is not None else matched_count
+
+    card_meta = dict(metadata or {})
+    card_meta.setdefault("title", book.title)
+    card_meta.setdefault("author", book.author)
+    filename = source_filename or (
+        Path(book.source_path).name if book.source_path else ""
+    )
+    chapters = chapters_raw or []
+    first_chapter, first_paragraph = _first_chapter_paragraph(chapters)
+
+    row = ImportLogRow(
+        id=_new_id(),
+        stable_book_id=sid,
+        book_id=book.id,
+        event_type="import",
+        in_library=1,
+        copyright_card=_build_copyright_card(card_meta, chapters, filename),
+        title=book.title,
+        author=book.author,
+        publisher=card_meta.get("publisher"),
+        publish_year=card_meta.get("publish_year") or card_meta.get("date"),
+        isbn=card_meta.get("isbn") or card_meta.get("identifier"),
+        first_chapter=first_chapter or None,
+        first_paragraph=first_paragraph or None,
+        source_filename=filename,
+        import_count=count,
+        time_created=_now_ms(),
+    )
+    db.insert_import_log(row)
+    return row
 
 
 # ── Annotation offset computation ───────────────────────────────────────────

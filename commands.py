@@ -653,7 +653,10 @@ def build_dispatch_table(app_context: dict[str, Any]) -> dict[str, CommandHandle
         lines.append("")
 
         for msg in session.messages:
-            role_label = {"user": "## 👤 读者", "assistant": "## 📖 书伴"}.get(msg.role, f"## {msg.role}")
+            role_label = {
+                "user": "## 👤 读者",
+                "assistant": f"## 📖 {config.agent_name or '留白'}",
+            }.get(msg.role, f"## {msg.role}")
             lines.append(role_label)
             lines.append("")
             for block in msg.blocks:

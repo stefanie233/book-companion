@@ -12,6 +12,7 @@ from typing import Any
 
 from storage.db_base import BaseDatabase, _now_ms, _new_id
 from storage.models import (
+    ANNOTATION_EVENT_INDEXES,
     ANNOTATION_INDEXES,
     ANNOTATION_V14_ALTERS,
     ANNOTATION_V16_ALTERS,
@@ -20,6 +21,7 @@ from storage.models import (
     CHUNK_SIG_ALTERS,
     CHUNK_SUMMARY_ALTERS,
     CREATE_ANNOTATIONS,
+    CREATE_ANNOTATION_EVENTS,
     CREATE_BOOK_CHUNKS,
     CREATE_BOOK_FTS,
     CREATE_BOOK_FTS_TRIGGERS,
@@ -35,6 +37,7 @@ from storage.models import (
     ALTER_CHAPTERS_SPINE_INDEX,
     ALTER_CHAPTERS_TYPE,
     TABLE_ANNOTATIONS,
+    TABLE_ANNOTATION_EVENTS,
     TABLE_BOOK_CATEGORIES,
     TABLE_BOOK_CHAPTERS,
     TABLE_BOOK_CHUNKS,
@@ -45,6 +48,7 @@ from storage.models import (
     TABLE_CHAPTER_OVERRIDES,
     TABLE_IMPORT_LOG,
     TABLE_READING_SESSIONS,
+    AnnotationEventRow,
     AnnotationRow,
     BookCategoryRow,
     BookChapterRow,
@@ -134,6 +138,8 @@ _BOOK_MIGRATIONS: list[tuple[int, str, str | list[str]]] = [
         ALTER_CHAPTERS_IN_TOC,
     ]),
     (24, "Chunk summaries: bookgraph 产出的每块一句话", list(CHUNK_SUMMARY_ALTERS)),
+    (25, "Annotation event journal: append-only create/update/delete log",
+     [CREATE_ANNOTATION_EVENTS, *ANNOTATION_EVENT_INDEXES]),
 ]
 
 
@@ -299,6 +305,20 @@ class BookDB(BaseDatabase):
         cur = conn.execute(
             f"SELECT chapter_index, chapter_type FROM {TABLE_BOOK_CHAPTERS} "
             "WHERE book_id=?;", (book_id,)
+        )
+        return {r[0]: r[1] for r in cur.fetchall()}
+
+    def get_chapter_titles(self, book_id: str) -> dict[int, str]:
+        """{chapter_index: title}，笔记页分组只缺这一个字段。
+
+        与 get_chapters 分开：那边要读整行 + 叠加人工覆盖层，笔记列表一次
+        可能要跨十几本书，没必要为一行标题把整章记录都搬出来。
+        """
+        conn = self.get_conn()
+        cur = conn.execute(
+            f"SELECT chapter_index, title FROM {TABLE_BOOK_CHAPTERS} "
+            "WHERE book_id=?;",
+            (book_id,),
         )
         return {r[0]: r[1] for r in cur.fetchall()}
 
@@ -754,13 +774,22 @@ class BookDB(BaseDatabase):
 
     def record_position(self, session_id: str, chapter_index: int,
                         chunk_index: int, cfi: str = "") -> None:
-        """Append a position record to the session.
+        """Append a position record to the session (in-place for the same chunk).
 
         *cfi* is the epub.js CFI of the viewport top — the render layer's
         own semantic coordinate. It is the authoritative restore anchor
         (``display(cfi)`` is deterministic), so the reader no longer has
         to replay the fingerprint anchor chain when reopening a book.
-        Legacy records written before this field simply omit the key.
+        The CFI carries a character offset inside the text node (决策 143):
+        stopping mid-paragraph and reopening lands on the same line, not
+        the paragraph start.
+
+        Within one chunk the CFI keeps changing (line-level anchor) while
+        ``(chapter, chunk)`` does not. Those updates **replace** the last
+        record instead of appending, so ``positions_json`` only grows when
+        the reader actually crosses a chunk boundary — scrolling never
+        bloats the history. An empty *cfi* (chunk-view page turn) never
+        overwrites a fine anchor already stored.
         """
         import json as _json
         conn = self.get_conn()
@@ -773,6 +802,21 @@ class BookDB(BaseDatabase):
         if not row:
             return
         positions = _json.loads(row[0])
+        if positions:
+            last = positions[-1]
+            if (last.get("chapter") == chapter_index
+                    and last.get("chunk") == chunk_index):
+                if cfi and last.get("cfi") != cfi:
+                    last["cfi"] = cfi
+                    last["ts"] = _now_ms()
+                    conn.execute(
+                        f"UPDATE {TABLE_READING_SESSIONS} "
+                        "SET positions_json=? WHERE id=?;",
+                        (_json.dumps(positions, ensure_ascii=False),
+                         session_id),
+                    )
+                    conn.commit()
+                return
         record = {
             "chapter": chapter_index,
             "chunk": chunk_index,
@@ -1142,6 +1186,58 @@ class BookDB(BaseDatabase):
         row = cur.fetchone()
         return self._row_to_import_log(row) if row else None
 
+    def list_import_log_events(
+        self,
+        *,
+        event_type: str | None = None,
+        book_id: str | None = None,
+        stable_book_id: str | None = None,
+        in_library: int | None = None,
+        q: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[ImportLogRow], int]:
+        """Page through book lifecycle events, newest first.
+
+        The log is append-only: each import/re-import and each delete writes
+        one row, so the same ``stable_book_id`` / ``book_id`` can appear many
+        times.  ``in_library`` describes the event's resulting state (1 after
+        import, 0 after delete), not the book's state today.
+
+        Returns ``(rows, total)`` — *total* is the match count before paging.
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        if event_type:
+            where.append("event_type = ?")
+            params.append(event_type)
+        if book_id:
+            where.append("book_id = ?")
+            params.append(book_id)
+        if stable_book_id:
+            where.append("stable_book_id = ?")
+            params.append(stable_book_id)
+        if in_library is not None:
+            where.append("in_library = ?")
+            params.append(int(in_library))
+        if q:
+            where.append("(title LIKE ? OR author LIKE ? OR source_filename LIKE ?)")
+            like = f"%{q}%"
+            params.extend((like, like, like))
+
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        conn = self.get_conn()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM {TABLE_IMPORT_LOG}{where_sql};",
+            params,
+        ).fetchone()[0]
+        cur = conn.execute(
+            f"SELECT * FROM {TABLE_IMPORT_LOG}{where_sql} "
+            f"ORDER BY time_created DESC, rowid DESC LIMIT ? OFFSET ?;",
+            (*params, max(int(limit), 0), max(int(offset), 0)),
+        )
+        return [self._row_to_import_log(r) for r in cur.fetchall()], int(total)
+
     @staticmethod
     def _row_to_import_log(row: sqlite3.Row) -> ImportLogRow:
         return ImportLogRow(
@@ -1191,6 +1287,16 @@ class BookDB(BaseDatabase):
         conn.commit()
         return row.id
 
+    def get_annotation(self, annotation_id: str) -> AnnotationRow | None:
+        """Fetch one annotation by id (event journal needs the before-state)."""
+        conn = self.get_conn()
+        cur = conn.execute(
+            f"SELECT * FROM {TABLE_ANNOTATIONS} WHERE id = ?;",
+            (annotation_id,),
+        )
+        row = cur.fetchone()
+        return self._row_to_annotation(row) if row else None
+
     def get_annotations_by_stable_book(
         self, stable_book_id: str, *, limit: int = 200,
     ) -> list[AnnotationRow]:
@@ -1218,16 +1324,117 @@ class BookDB(BaseDatabase):
 
     def get_annotations_by_type(
         self, annotation_type: str = "note", *, limit: int = 50, offset: int = 0,
+        stable_book_id: str | None = None,
     ) -> list[AnnotationRow]:
+        """按类型取标注。默认跨书（笔记页「全部书籍」）；给了 stable_book_id
+        就只取那一本——阅读页浮窗「本章批注」必须带上，否则会串出别的书。"""
+        conn = self.get_conn()
+        sql = (
+            f"SELECT * FROM {TABLE_ANNOTATIONS} "
+            f"WHERE (type = ? OR type = 'both') "
+        )
+        params: list = [annotation_type]
+        if stable_book_id:
+            sql += "AND stable_book_id = ? "
+            params.append(stable_book_id)
+        sql += "ORDER BY time_updated DESC LIMIT ? OFFSET ?;"
+        params.extend([limit, offset])
+        cur = conn.execute(sql, params)
+        return [self._row_to_annotation(r) for r in cur.fetchall()]
+
+    # 笔记页的排序键 → SQL。只认这张表里的常量，不要拼接外部字符串。
+    _ANNOTATION_SORTS = {
+        "time-desc": "a.time_updated DESC",
+        "time-asc": "a.time_updated ASC",
+        "length-desc": "LENGTH(a.selected_text) DESC",
+        "length-asc": "LENGTH(a.selected_text) ASC",
+    }
+
+    # 书名要用「stable_book_id 最近一次导入」那本：一本书重导过几次，
+    # import_log 会有多行，直接 join 会把同一条批注复制成 N 行。
+    _BOOK_TITLE_SQL = (
+        "(SELECT b.title FROM import_log il JOIN books b ON b.id = il.book_id "
+        "WHERE il.stable_book_id = a.stable_book_id "
+        "ORDER BY il.time_created DESC LIMIT 1)"
+    )
+
+    def query_annotations(
+        self,
+        annotation_type: str = "note",
+        *,
+        stable_book_id: str | None = None,
+        color: str | None = None,
+        query: str | None = None,
+        sort: str = "time-desc",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[AnnotationRow], int]:
+        """笔记页的服务端查询：过滤 + 排序 + 分页 + 总数。
+
+        取代「前端拉 500 条再自己 filter」——那种做法一过 500 条就静默截断，
+        用户永远看不到更早的笔记。返回 (当页行, 满足条件的总行数)。
+        """
+        where = "(a.type = ? OR a.type = 'both')"
+        params: list = [annotation_type]
+        if stable_book_id:
+            where += " AND a.stable_book_id = ?"
+            params.append(stable_book_id)
+        if color:
+            where += " AND a.color = ?"
+            params.append(color)
+        if query:
+            # LIKE 转义：用户输入的 % _ 应当按字面匹配，而不是通配符
+            esc = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pat = f"%{esc}%"
+            where += (
+                " AND (a.selected_text LIKE ? ESCAPE '\\'"
+                " OR a.note_text LIKE ? ESCAPE '\\')"
+            )
+            params.extend([pat, pat])
+
+        conn = self.get_conn()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM {TABLE_ANNOTATIONS} a WHERE {where};",
+            params,
+        ).fetchone()[0]
+
+        if sort in ("chapter", "chapter-asc", "chapter-desc"):
+            # 章节排序：书保持 A→Z，章与块按方向翻。旧的 "chapter" 等同升序。
+            chapter_dir = "DESC" if sort == "chapter-desc" else "ASC"
+            order = (
+                f"{self._BOOK_TITLE_SQL} COLLATE NOCASE ASC, "
+                f"a.chapter_index {chapter_dir}, a.chunk_index {chapter_dir}, a.id"
+            )
+        elif sort in ("book-asc", "book-desc"):
+            direction = "ASC" if sort == "book-asc" else "DESC"
+            order = (
+                f"{self._BOOK_TITLE_SQL} COLLATE NOCASE {direction}, "
+                "a.chapter_index ASC, a.chunk_index ASC, a.id"
+            )
+        else:
+            order = self._ANNOTATION_SORTS.get(sort, "a.time_updated DESC") + ", a.id"
+
+        # 排序键相同的行用 id 兜底，否则翻页会出现重复/漏行
+        sql = (
+            f"SELECT a.* FROM {TABLE_ANNOTATIONS} a WHERE {where} "
+            f"ORDER BY {order} LIMIT ? OFFSET ?;"
+        )
+        cur = conn.execute(sql, [*params, limit, offset])
+        return [self._row_to_annotation(r) for r in cur.fetchall()], int(total)
+
+    def count_annotations_by_book(self, annotation_type: str = "note") -> dict[str, int]:
+        """{stable_book_id: 条数}，笔记页左栏泳道的计数用。
+
+        只要一列 group by，不必把批注行搬出来；孤儿（stable_book_id 为空）不进
+        任何一本的泳道，但仍算在「全部书籍」的总数里（由调用方相加）。
+        """
         conn = self.get_conn()
         cur = conn.execute(
-            f"SELECT * FROM {TABLE_ANNOTATIONS} "
-            f"WHERE type = ? OR type = 'both' "
-            f"ORDER BY time_updated DESC "
-            f"LIMIT ? OFFSET ?;",
-            (annotation_type, limit, offset),
+            f"SELECT stable_book_id, COUNT(*) FROM {TABLE_ANNOTATIONS} "
+            "WHERE (type = ? OR type = 'both') GROUP BY stable_book_id;",
+            (annotation_type,),
         )
-        return [self._row_to_annotation(r) for r in cur.fetchall()]
+        return {row[0]: int(row[1]) for row in cur.fetchall() if row[0]}
 
     def search_annotations(
         self,
@@ -1303,6 +1510,101 @@ class BookDB(BaseDatabase):
         )
         conn.commit()
         return cur.rowcount > 0
+
+    # ── Annotation event journal ─────────────────────────────────────────
+
+    def insert_annotation_event(self, row: AnnotationEventRow) -> str:
+        conn = self.get_conn()
+        conn.execute(
+            f"INSERT INTO {TABLE_ANNOTATION_EVENTS} "
+            "(id, annotation_id, stable_book_id, book_id, book_title, "
+            "event_type, annotation_type, style, selected_text, note_text, "
+            "changed_fields, chapter_index, chunk_index, time_created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+            (row.id, row.annotation_id, row.stable_book_id, row.book_id,
+             row.book_title, row.event_type, row.annotation_type, row.style,
+             row.selected_text, row.note_text, row.changed_fields,
+             row.chapter_index, row.chunk_index, row.time_created),
+        )
+        conn.commit()
+        return row.id
+
+    def list_annotation_events(
+        self,
+        *,
+        event_type: str | None = None,
+        annotation_type: str | None = None,
+        stable_book_id: str | None = None,
+        book_id: str | None = None,
+        q: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[AnnotationEventRow], int]:
+        """Page through the note/highlight journal, newest first.
+
+        The journal is append-only: ``create`` / ``update`` / ``delete``
+        share one stream.  Update rows keep the *new* snapshot; delete rows
+        keep the final snapshot so a removed note can still be identified.
+        Returns ``(rows, total)`` — *total* is the match count before paging.
+        """
+        where: list[str] = []
+        params: list[Any] = []
+        if event_type:
+            where.append("event_type = ?")
+            params.append(event_type)
+        if annotation_type:
+            # ``both`` 是旧批注的形态：查收藏或笔记都应把它算进去，
+            # 与 query_annotations 的 (type = ? OR type = 'both') 同语义。
+            if annotation_type in ("highlight", "note"):
+                where.append("(annotation_type = ? OR annotation_type = 'both')")
+                params.append(annotation_type)
+            else:
+                where.append("annotation_type = ?")
+                params.append(annotation_type)
+        if stable_book_id:
+            where.append("stable_book_id = ?")
+            params.append(stable_book_id)
+        if book_id:
+            where.append("book_id = ?")
+            params.append(book_id)
+        if q:
+            where.append(
+                "(selected_text LIKE ? OR note_text LIKE ? OR book_title LIKE ?)"
+            )
+            like = f"%{q}%"
+            params.extend((like, like, like))
+
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        conn = self.get_conn()
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM {TABLE_ANNOTATION_EVENTS}{where_sql};",
+            params,
+        ).fetchone()[0]
+        cur = conn.execute(
+            f"SELECT * FROM {TABLE_ANNOTATION_EVENTS}{where_sql} "
+            f"ORDER BY time_created DESC, rowid DESC LIMIT ? OFFSET ?;",
+            (*params, max(int(limit), 0), max(int(offset), 0)),
+        )
+        return [self._row_to_annotation_event(r) for r in cur.fetchall()], int(total)
+
+    @staticmethod
+    def _row_to_annotation_event(row: sqlite3.Row) -> AnnotationEventRow:
+        return AnnotationEventRow(
+            id=row["id"],
+            annotation_id=row["annotation_id"],
+            stable_book_id=row["stable_book_id"],
+            book_id=row["book_id"],
+            book_title=row["book_title"],
+            event_type=row["event_type"],
+            annotation_type=row["annotation_type"],
+            style=row["style"],
+            selected_text=row["selected_text"],
+            note_text=row["note_text"],
+            changed_fields=row["changed_fields"],
+            chapter_index=row["chapter_index"],
+            chunk_index=row["chunk_index"],
+            time_created=row["time_created"],
+        )
 
     def relink_annotation(
         self, annotation_id: str,

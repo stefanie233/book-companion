@@ -22,6 +22,7 @@ import usage_log
 from .types import (
     CONTEXT_CREATING_TOOLS,
     SUBAGENT_DEFAULT_MAX_ITERATIONS,
+    SUBAGENT_INCLUDE_TOOLS,
     SUBAGENT_MAX_ITERATIONS,
     SUBAGENT_PROMOTE_DEFERRED,
     SUBAGENT_SYSTEM_PROMPT,
@@ -122,6 +123,9 @@ class SubAgentRunner:
             toolsets=toolsets,
             exclude_tools=CONTEXT_CREATING_TOOLS,
             exclude_exposure=[ToolExposure.DIRECT_MODEL_ONLY, ToolExposure.HIDDEN],
+            # 写作工具全在一个 toolset 下，只靠 toolset 过滤会把改稿/结算
+            # 一起交给研究员；这里再按名称收一刀。
+            include_tools=SUBAGENT_INCLUDE_TOOLS.get(resolved_type),
         )
         # 主 agent 隐藏、子代理白名单内可见。**必须换一个 ToolSpec**：
         # get_registry_for_toolsets 登记的是同一个对象，就地改 exposure

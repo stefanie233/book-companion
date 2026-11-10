@@ -26,12 +26,12 @@ from storage.authors_db import name_key
 
 log = logging.getLogger("authorgraph")
 
-SECTIONS = ("identity", "timeline", "works", "voice", "relations",
-            "themes", "sources")
+SECTIONS = ("identity", "timeline", "details", "works", "voice",
+            "relations", "themes", "sources")
 
 #: 档案页的区块顺序（前端 tab 默认按这个顺序）。
-SECTION_ORDER = ("timeline", "works", "voice", "relations", "themes",
-                 "sources")
+SECTION_ORDER = ("timeline", "details", "works", "voice", "relations",
+                 "themes", "sources")
 
 _POSITION_ZH = {
     "narrator": "作者本人就是叙述者，非虚构",
@@ -761,6 +761,70 @@ def _conflicts_block(evidence: list[dict[str, Any]],
 
 # ── 主投影 ────────────────────────────────────────────────────────────────
 
+def _details_block(adb: Any, author_id: str, *, stable: str,
+                   books_db: Any, gated: bool,
+                   max_chapter: int | None) -> dict[str, Any]:
+    """观察与钩子 —— 纹理层。**按章施门，fail-closed。**"""
+    obs = adb.observations_for(author_id, status="accepted", limit=1000)
+    hooks = adb.hooks_for(author_id, status="open", limit=500)
+    if stable:
+        obs = [o for o in obs if (o.get("stable_book_id") or "") == stable]
+        hooks = [h for h in hooks
+                 if (h.get("stable_book_id") or "") == stable]
+
+    def _visible(ch: Any) -> bool:
+        # 指定了阅读进度就只放已读章节；没有章号的一律不放（证明不了安全）。
+        if max_chapter is None:
+            return not gated
+        if ch is None:
+            return False
+        return int(ch) <= int(max_chapter)
+
+    total_obs = len(obs)
+    obs = [o for o in obs if _visible(o.get("chapter_index"))]
+    hooks = [h for h in hooks if _visible(h.get("chapter_index"))]
+    titles: dict[str, str] = {}
+    for b in adb.books_of(author_id):
+        sb = b.get("stable_book_id") or ""
+        if sb:
+            titles[sb] = _book_title(books_db, b.get("book_id") or "")
+    items = [{
+        "observation_id": o.get("observation_id"),
+        "topic": o.get("topic") or "other",
+        "statement": o.get("statement") or "",
+        "quote": o.get("quote") or "",
+        "basis": o.get("basis") or "",
+        "basis_quote": o.get("basis_quote") or "",
+        "speaker": o.get("speaker") or "",
+        "use": o.get("use") or "dossier",
+        "confidence": o.get("confidence") or "low",
+        "stable_book_id": o.get("stable_book_id") or "",
+        "book_title": titles.get(o.get("stable_book_id") or "", ""),
+        "chapter_index": o.get("chapter_index"),
+        "chunk_id": o.get("chunk_id") or "",
+    } for o in obs]
+    hook_items = [{
+        "hook_id": h.get("hook_id"),
+        "topic": h.get("topic") or "other",
+        "quote": h.get("quote") or "",
+        "known": h.get("known") or "",
+        "missing": h.get("missing") or "",
+        "why": h.get("why") or "",
+        "suggested_action": h.get("suggested_action") or "web_search",
+        "stable_book_id": h.get("stable_book_id") or "",
+        "book_title": titles.get(h.get("stable_book_id") or "", ""),
+        "chapter_index": h.get("chapter_index"),
+    } for h in hooks]
+    note = ""
+    if gated and max_chapter is None:
+        note = "阅读进度不明，纹理与钩子暂不展示。"
+    elif total_obs > len(items):
+        note = f"{total_obs - len(items)} 条观察在未读章节，已挡住。"
+    return {"items": items, "hooks": hook_items,
+            "counts": {"observations": len(items), "hooks": len(hook_items)},
+            "note": note}
+
+
 def build_dossier(adb: Any, *, author_id: str, book_id: str = "",
                   max_chapter: int | None = None, books_db: Any = None,
                   sections: Iterable[str] | str | None = None,
@@ -886,6 +950,9 @@ def build_dossier(adb: Any, *, author_id: str, book_id: str = "",
 
     themes = claims_theme
     reception = claims_reception
+    details = _details_block(
+        adb, author_id, stable=stable if mapped else "", books_db=books_db,
+        gated=gated, max_chapter=max_chapter)
     out: dict[str, Any] = {
         "found": True,
         "author": _identity_block(adb, author),
@@ -909,6 +976,8 @@ def build_dossier(adb: Any, *, author_id: str, book_id: str = "",
     if "timeline" in want:
         out["timeline"] = _timeline_block(
             rec_items, gate, stats.get("records", 0), gated)
+    if "details" in want:
+        out["details"] = details
     if "works" in want:
         out["works"] = works["items"]
         out["works_meta"] = {"counts": works["counts"],

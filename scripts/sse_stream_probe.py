@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""SSE streaming probe for the Book Companion chat endpoint.
+"""SSE streaming probe for the Liubai chat endpoint.
 
 Why this exists
 ---------------

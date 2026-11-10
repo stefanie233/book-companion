@@ -13,6 +13,7 @@ pipeline, so everything is swallowed.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from pathlib import Path
@@ -57,10 +58,24 @@ def init_for_tests(path: Path) -> None:
 
 def get_store() -> SessionDB:
     """Lazy shared SessionDB — resolved relative to the project root so
-    both CLI (main.py) and api_server shapes land on data/sessions.db."""
+    both CLI (main.py) and api_server shapes land on data/sessions.db.
+
+    Tests override with ``init_for_tests`` or the env var
+    ``BOOK_COMPANION_USAGE_DB`` — the latter lets ``check_all`` isolate a
+    whole module-test batch with one switch (决策 147). The path here is
+    deliberately **not** derived from Config.project_dir: usage attribution
+    is a process-global singleton, and a test that forgets to fake it must
+    not pollute the real analytics.
+    """
     global _store
     if _store is None:
-        _store = SessionDB(Path(__file__).parent / "data" / "sessions.db")
+        override = os.environ.get("BOOK_COMPANION_USAGE_DB", "").strip()
+        if override:
+            path = Path(override)
+        else:
+            from runtime_paths import data_path
+            path = data_path("sessions.db")
+        _store = SessionDB(path)
         _store.initialize()
     return _store
 

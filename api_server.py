@@ -1,4 +1,4 @@
-"""Book Companion HTTP layer — composition root + facade.
+"""Liubai HTTP layer — composition root + facade.
 
 This file owns three things and nothing else:
 
@@ -51,6 +51,12 @@ from api.routes.voice import (
 )
 from api.routes.authors import (
     handle_author_dossier,
+    handle_author_job,
+    handle_author_job_cancel,
+    handle_author_job_start,
+    handle_author_jobs,
+    handle_author_plan_list,
+    handle_author_plans,
     handle_author_sources,
     handle_author_voice,
     handle_authors_list,
@@ -81,6 +87,23 @@ from api.routes.sessions import (handle_session_archive, handle_session_branches
 from api.routes.sync import (handle_sync)
 from api.routes.books import (handle_book_file, handle_chunk, handle_context, handle_cover, handle_delete_book, handle_import_book, handle_list_books, handle_scan_folder, handle_search_book, handle_search_chapter, handle_search_overview, handle_set_book_order, handle_update_book, handle_upload_book)
 from api.routes.annotations import (handle_clear_override, handle_create_annotation, handle_delete_annotation, handle_list_annotations, handle_list_chapter_types, handle_set_override, handle_update_annotation)
+from api.routes.agent import (
+    handle_agent_avatar_delete,
+    handle_agent_avatar_get,
+    handle_agent_avatar_post,
+    handle_agent_get,
+    handle_agent_name_put,
+    handle_agent_soul_put,
+    handle_agent_soul_reset,
+)
+from api.routes.user import (
+    handle_user_avatar_delete,
+    handle_user_avatar_get,
+    handle_user_avatar_post,
+    handle_user_gender_put,
+    handle_user_get,
+    handle_user_name_put,
+)
 from api.routes.console import (
     handle_console_config,
     handle_context_usage,
@@ -100,13 +123,35 @@ from api.routes.writing import (
     handle_writing_content,
     handle_writing_context,
     handle_writing_contract,
+    handle_writing_contracts,
+    handle_writing_docs,
+    handle_writing_doc_create,
+    handle_writing_doc_delete,
+    handle_writing_doc_file,
+    handle_writing_doc_rename,
     handle_writing_create_chapter,
     handle_writing_create_work,
     handle_writing_delete_work,
     handle_writing_feedback,
     handle_writing_feedback_status,
+    handle_writing_file_timeline,
     handle_writing_get_review,
     handle_writing_map,
+    handle_writing_material_audit,
+    handle_writing_material_create,
+    handle_writing_material_delete,
+    handle_writing_material_empty,
+    handle_writing_material_file,
+    handle_writing_material_intake,
+    handle_writing_material_move,
+    handle_writing_material_purge,
+    handle_writing_material_recycled,
+    handle_writing_material_rename,
+    handle_writing_material_restore,
+    handle_writing_material_save,
+    handle_writing_material_search,
+    handle_writing_material_uses,
+    handle_writing_materials,
     handle_writing_propose_revision,
     handle_writing_reject_revision,
     handle_writing_rename_chapter,
@@ -191,7 +236,8 @@ def _setup_api_file_logging() -> None:
     console window — the 2026-09-18 reply-loss incident left no trace
     because every warning went to stdout while the server ran headless.
     """
-    log_path = Path.cwd() / "data" / "logs" / "api.log"
+    from log_lifecycle import log_dir
+    log_path = log_dir() / "api.log"
     lg = logging.getLogger("api")
     if any(
         isinstance(h, RotatingFileHandler)
@@ -214,6 +260,26 @@ def _setup_api_file_logging() -> None:
     lg.addHandler(stream_h)
 
 
+def _prune_log_rotations() -> None:
+    """启动时清掉超过 30 天的轮转份（决策 147）。
+
+    只动 ``name.<n>`` / ``bookgraph-<ts>.jsonl`` 这类本模块认可的历史份，
+    活文件与一次性产物不在此列（后者交给 scripts/log_maintenance.py）。
+    """
+    try:
+        from log_lifecycle import prune_rotated
+        prune_rotated(days=30)
+    except Exception:
+        pass
+
+
+async def _close_author_jobs(app: web.Application) -> None:
+    """停机时收掉作者采集子进程（懒创建，没有就跳过）。"""
+    runner = app.get("author_jobs")
+    if runner is not None:
+        await runner.shutdown()
+
+
 def create_app(db, runtime=None, session_service=None, config=None,
                context_recorder=None) -> web.Application:
     """Build the aiohttp Application with all routes.
@@ -226,7 +292,9 @@ def create_app(db, runtime=None, session_service=None, config=None,
         context_recorder: ContextRecorder (optional, for debugging).
     """
     app = web.Application(middlewares=[cors_middleware, nocache_middleware])
+    app.on_cleanup.append(_close_author_jobs)
     _setup_api_file_logging()
+    _prune_log_rotations()
 
     # Inject dependencies
     app["db"] = db
@@ -295,6 +363,50 @@ def create_app(db, runtime=None, session_service=None, config=None,
                        handle_writing_style_get)
     app.router.add_put("/api/writing/works/{work_id}/style",
                        handle_writing_style_set)
+    app.router.add_get("/api/writing/works/{work_id}/contracts",
+                       handle_writing_contracts)
+    # 全局素材库（不属于任何作品；空项目左栏默认显示）
+    app.router.add_get("/api/writing/materials", handle_writing_materials)
+    app.router.add_get("/api/writing/materials/file",
+                       handle_writing_material_file)
+    app.router.add_get("/api/writing/materials/search",
+                       handle_writing_material_search)
+    app.router.add_get("/api/writing/materials/uses",
+                       handle_writing_material_uses)
+    app.router.add_post("/api/writing/materials/file",
+                        handle_writing_material_create)
+    app.router.add_post("/api/writing/materials/save",
+                        handle_writing_material_save)
+    app.router.add_post("/api/writing/materials/intake",
+                        handle_writing_material_intake)
+    app.router.add_post("/api/writing/materials/rename",
+                        handle_writing_material_rename)
+    app.router.add_post("/api/writing/materials/move",
+                        handle_writing_material_move)
+    app.router.add_delete("/api/writing/materials/file",
+                          handle_writing_material_delete)
+    # 清空文件夹：批量删除里面的卡，逐张进回收站（文件夹与子分类保留）
+    app.router.add_post("/api/writing/materials/empty",
+                        handle_writing_material_empty)
+    # 维护：回收站回看/恢复/显式清理 + 只读盘点
+    app.router.add_get("/api/writing/materials/recycled",
+                       handle_writing_material_recycled)
+    app.router.add_post("/api/writing/materials/restore",
+                        handle_writing_material_restore)
+    app.router.add_post("/api/writing/materials/purge",
+                        handle_writing_material_purge)
+    app.router.add_get("/api/writing/materials/audit",
+                       handle_writing_material_audit)
+    app.router.add_get("/api/writing/works/{work_id}/docs",
+                       handle_writing_docs)
+    app.router.add_get("/api/writing/works/{work_id}/docs/file",
+                       handle_writing_doc_file)
+    app.router.add_post("/api/writing/works/{work_id}/docs/file",
+                        handle_writing_doc_create)
+    app.router.add_post("/api/writing/works/{work_id}/docs/rename",
+                        handle_writing_doc_rename)
+    app.router.add_delete("/api/writing/works/{work_id}/docs/file",
+                          handle_writing_doc_delete)
     app.router.add_get("/api/writing/works/{work_id}/references",
                        handle_writing_references_get)
     app.router.add_put("/api/writing/works/{work_id}/references",
@@ -350,6 +462,8 @@ def create_app(db, runtime=None, session_service=None, config=None,
                        handle_writing_vcs_status)
     app.router.add_get("/api/writing/works/{work_id}/vcs/log",
                        handle_writing_vcs_log)
+    app.router.add_get("/api/writing/works/{work_id}/vcs/timeline",
+                       handle_writing_file_timeline)
     app.router.add_get("/api/writing/works/{work_id}/vcs/diff",
                        handle_writing_vcs_diff)
     app.router.add_post("/api/writing/works/{work_id}/vcs/commit",
@@ -416,6 +530,17 @@ def create_app(db, runtime=None, session_service=None, config=None,
     app.router.add_get("/api/authors/{author_id}/voice", handle_author_voice)
     app.router.add_get("/api/authors/{author_id}/sources",
                        handle_author_sources)
+    app.router.add_get("/api/authors/{author_id}/plans",
+                       handle_author_plans)
+    app.router.add_patch("/api/authors/{author_id}/plans/{plan_id}",
+                         handle_author_plan_list)
+    app.router.add_post("/api/authors/{author_id}/jobs",
+                        handle_author_job_start)
+    app.router.add_get("/api/authors/{author_id}/jobs",
+                       handle_author_jobs)
+    app.router.add_get("/api/authors/jobs/{job_id}", handle_author_job)
+    app.router.add_post("/api/authors/jobs/{job_id}/cancel",
+                        handle_author_job_cancel)
     app.router.add_get("/api/authors/{book_id}", handle_book_authors)
     app.router.add_get("/api/authors/{book_id}/{author_id}/timeline",
                        handle_author_timeline)
@@ -443,6 +568,23 @@ def create_app(db, runtime=None, session_service=None, config=None,
     app.router.add_get("/api/sessions/{session_id}/children", handle_session_children)
     app.router.add_get("/api/sessions/{session_id}/branches", handle_session_branches)
     app.router.add_get("/api/sessions/{session_id}/latest", handle_session_latest)
+
+    # ── Agent identity (name + SOUL.md) ───────────────────────────────
+    app.router.add_get("/api/agent", handle_agent_get)
+    app.router.add_get("/api/agent/avatar", handle_agent_avatar_get)
+    app.router.add_post("/api/agent/avatar", handle_agent_avatar_post)
+    app.router.add_delete("/api/agent/avatar", handle_agent_avatar_delete)
+    app.router.add_put("/api/agent/name", handle_agent_name_put)
+    app.router.add_put("/api/agent/soul", handle_agent_soul_put)
+    app.router.add_post("/api/agent/soul/reset", handle_agent_soul_reset)
+
+    # ── User profile (自己的称呼 + 头像) ──────────────────────────────
+    app.router.add_get("/api/user", handle_user_get)
+    app.router.add_get("/api/user/avatar", handle_user_avatar_get)
+    app.router.add_post("/api/user/avatar", handle_user_avatar_post)
+    app.router.add_delete("/api/user/avatar", handle_user_avatar_delete)
+    app.router.add_put("/api/user/name", handle_user_name_put)
+    app.router.add_put("/api/user/gender", handle_user_gender_put)
 
     # ── Console (provider/slot management) ───────────────────────────
     app.router.add_get("/api/console/config", handle_console_config)
@@ -591,13 +733,12 @@ if __name__ == "__main__":
     import sys
     from pathlib import Path as P
     sys.path.insert(0, str(P(__file__).parent))
+    from runtime_paths import data_path, ensure_user_layout
     from storage.db import BookDB
 
-    # Use the book-domain database (data/books.db)
-    data_dir = P(__file__).parent / "data"
-    data_dir.mkdir(exist_ok=True)
-    db_path = data_dir / "books.db"
-    db = BookDB(db_path)
+    # 用户根（安装版 = %LOCALAPPDATA%\LiuBai），首次运行播种默认文件。
+    ensure_user_layout()
+    db = BookDB(data_path("books.db"))
     db.initialize()
 
     # Initialize session service for chat persistence (best-effort)
@@ -606,7 +747,7 @@ if __name__ == "__main__":
         from config import load_config
         from storage.db_session import SessionDB
         from services.session_service import SessionService
-        config = load_config(P(__file__).parent)
+        config = load_config()
         session_db = SessionDB(config.sessions_db_path)
         session_db.initialize()
         session_service = SessionService(session_db, config)
@@ -614,7 +755,7 @@ if __name__ == "__main__":
         print(f"Warning: session service unavailable ({exc}). Chat history will not persist.")
         session_service = None
 
-    print(f"Book Companion API starting on http://127.0.0.1:8766")
+    print(f"Liubai API starting on http://127.0.0.1:8766")
     print(f"Endpoints:")
     print(f"  POST /api/sync              — page-turn position update")
     print(f"  GET  /api/books/<id>/context — book reading map")
@@ -625,7 +766,7 @@ if __name__ == "__main__":
     # Context flight recorder (best-effort, packaged in flight_recorder/)
     try:
         from flight_recorder import create_recorder
-        context_recorder = create_recorder(P(__file__).parent)
+        context_recorder = create_recorder(load_config().project_dir)
         if context_recorder is None:
             print('  Context recorder: unavailable')
     except Exception as exc:

@@ -15,6 +15,9 @@ async def handle_sessions_list(request: web.Request) -> web.Response:
         search         — optional title keyword filter
         project_id     — filter by book
         character_name — filter by role-play character
+        mode           — only sessions of this mode (writing page)
+        exclude_mode   — drop sessions of this mode (all other pages)
+        work_id        — filter by writing work
     """
     session_service = request.app.get("session_service")
     if not session_service:
@@ -24,11 +27,15 @@ async def handle_sessions_list(request: web.Request) -> web.Response:
     search = request.query.get("search") or None
     project_id = request.query.get("project_id") or None
     character_name = request.query.get("character_name") or None
+    mode = request.query.get("mode") or None
+    exclude_mode = request.query.get("exclude_mode") or None
+    work_id = request.query.get("work_id") or None
     root_only = request.query.get("root_only", "").lower() in ("1", "true", "yes")
 
     sessions = session_service.list(
         limit=limit, search=search, project_id=project_id,
         character_name=character_name, root_only=root_only,
+        mode=mode, exclude_mode=exclude_mode, work_id=work_id,
     )
 
     # Build book-title lookup map for labeling sessions
@@ -41,18 +48,37 @@ async def handle_sessions_list(request: web.Request) -> web.Response:
     except Exception:
         pass
 
+    # 写作会话按作品收录：标题从 writing.db 取，前端不用再拉一次作品表。
+    work_titles: dict[str, str] = {}
+    if any(s.mode == "writing" and s.work_id for s in sessions):
+        try:
+            cfg = request.app.get("config")
+            svc = request.app.get("writing_service")
+            works = svc.list_works() if svc is not None else None
+            if works is None and cfg is not None:
+                from storage.writing_db import WritingDB
+                works = WritingDB(cfg.writing_db_path).list_works()
+            for w in works or []:
+                work_titles[str(w.get("id") or "")] = str(w.get("title") or "")
+        except Exception:
+            pass
+
     # Batch query children counts (for tree expand indicators)
     children_counts = session_service.count_children_batch([s.id for s in sessions])
 
     items = []
     for s in sessions:
         pid = s.project_id or ""
+        wid = s.work_id or ""
         items.append({
             "id": s.id,
             "project_id": pid,
             "book_title": book_titles.get(pid, "") if pid else "",
+            "work_id": wid,
+            "work_title": work_titles.get(wid, "") if wid else "",
             "title": s.title or "(无标题)",
             "mode": s.mode,
+            "writing_mode": getattr(s, "writing_mode", "standard"),
             "message_count": s.message_count,
             "time_created": s.time_created,
             "time_updated": s.time_updated,
@@ -82,6 +108,15 @@ async def handle_session_load(request: web.Request) -> web.Response:
     if not session:
         return web.json_response({"error": "failed to load messages"}, status=500)
 
+    # 写作页的回合时间线要回放：一轮里「思考 → 说了什么 → 调了什么工具」的
+    # 先后顺序在合并成一条 assistant 消息时会丢，所以额外存一份 steps。
+    # 其他页面保持原样（工具调用仍是给模型的历史证据，前端不渲染）。
+    is_writing = getattr(info, "mode", "") == "writing"
+    _display = _ok_of = _summary_of = None
+    if is_writing:
+        from api.routes.chat import _tool_display, _tool_ok, _tool_summary
+        _display, _ok_of, _summary_of = _tool_display, _tool_ok, _tool_summary
+
     messages: list[dict] = []
     # 一轮 ReAct 会落多条 assistant（每个工具轮一条）。流式展示时它们是
     # 同一个气泡；重载也必须合并成一个，否则气泡数、fork 索引都会和实时
@@ -95,17 +130,38 @@ async def handle_session_load(request: web.Request) -> web.Response:
         pending["thinking"] = pending["thinking"] or None
         pending["thinkings"] = pending["thinkings"] or None
         pending["parts"] = pending["parts"] or None
+        if is_writing:
+            pending["steps"] = pending["steps"] or None
+        else:
+            pending.pop("steps", None)
         messages.append(pending)
         pending = None
 
     for m in session.messages:
         # 工具调用/结果是给模型的历史证据，不是聊天记录：前端不渲染。
         # 它们的正文在 tool_output 里、content 为空，渲染出来是一个空气泡。
+        # 写作页例外：时间线要回放，结果按 tool_use_id 挂回对应的那一步。
         if m.role == "tool":
+            if is_writing and pending is not None and pending.get("steps"):
+                for b in m.blocks:
+                    if b.type != "tool_result":
+                        continue
+                    # 工具结果在 ContentBlock.tool_output（part 的 data 里是
+                    # tool_output 字段），不是在 text 里。
+                    raw = b.tool_output or b.text or ""
+                    if not raw:
+                        continue
+                    for step in pending["steps"]:
+                        if (step.get("type") == "tool"
+                                and step.get("id") == (b.tool_use_id or "")):
+                            step["output"] = raw[:1200]
+                            step["summary"] = _summary_of(raw)
+                            step["ok"] = _ok_of(raw)
             continue
         parts: list[dict] = []
         content = ""
         thinking = ""
+        steps: list[dict] = []
         # One entry per thinking block. A ReAct turn persists one block per
         # LLM call, in call order; the frontend used to receive only the
         # concatenation and merged them into a single collapsed row, so a
@@ -114,9 +170,13 @@ async def handle_session_load(request: web.Request) -> web.Response:
         for b in m.blocks:
             if b.type == "text" and b.text:
                 content += b.text
+                if is_writing:
+                    steps.append({"type": "text", "text": b.text})
             if b.type == "thinking" and b.thinking:
                 thinking += b.thinking
                 thinkings.append(b.thinking)
+                if is_writing:
+                    steps.append({"type": "think", "text": b.thinking})
             if b.type in ("voice_input", "voice_output") and b.text:
                 try:
                     parts.append({"type": b.type, "data": json.loads(b.text)})
@@ -130,11 +190,25 @@ async def handle_session_load(request: web.Request) -> web.Response:
                         parts.append({"type": "voice_output", "data": tr})
                 except (json.JSONDecodeError, TypeError):
                     pass
+            elif b.type == "tool_use" and b.tool_name and is_writing:
+                disp = _display(b.tool_name, b.tool_input or "{}")
+                steps.append({
+                    "type": "tool",
+                    "id": b.tool_use_id or "",
+                    "name": b.tool_name,
+                    "label": disp["label"],
+                    "kind": disp["kind"],
+                    "output": "",
+                    "summary": "",
+                    "ok": True,
+                })
         interrupted = any(b.type == "interrupt" for b in m.blocks)
         # 纯 tool_use 的 assistant 轮（没有正文/推理）也不进可见记录：
-        # 它只是「我要调工具」的协议壳，正文在下一轮回复里。
+        # 它只是「我要调工具」的协议壳，正文在下一轮回复里。写作页例外：
+        # 时间线里这一轮本身就是一步。
         if (m.role == "assistant" and not content and not thinking
-                and not parts and not interrupted):
+                and not parts and not interrupted
+                and not (is_writing and steps)):
             continue
         if m.role == "assistant":
             if pending is None:
@@ -146,12 +220,15 @@ async def handle_session_load(request: web.Request) -> web.Response:
                     "thinking": "",
                     "thinkings": [],
                     "parts": [],
+                    "steps": [],
                     "time_created": m.time_created or 0,
                 }
             pending["content"] += content
             pending["thinking"] += thinking
             pending["thinkings"].extend(thinkings)
             pending["parts"].extend(parts)
+            if is_writing:
+                pending["steps"].extend(steps)
             pending["interrupted"] = pending["interrupted"] or interrupted
             continue
         _flush_pending()
@@ -176,6 +253,9 @@ async def handle_session_load(request: web.Request) -> web.Response:
         "project_id": info.project_id,
         "title": info.title or "(无标题)",
         "mode": info.mode,
+        "work_id": info.work_id or "",
+        "writing_mode": getattr(info, "writing_mode", "standard"),
+        "auto_mode_switch": int(getattr(info, "auto_mode_switch", 0) or 0),
         "character_name": info.character_name,
         "role_kind": info.role_kind or "character",
         "role_ref": info.role_ref or "",
@@ -227,8 +307,10 @@ async def handle_session_search(request: web.Request) -> web.Response:
     """Full-text search across session message content.
 
     Query params:
-        q     — search query (required)
-        limit — max results (default 10, max 50)
+        q            — search query (required)
+        limit        — max results (default 10, max 50)
+        mode         — only sessions of this mode (writing page)
+        exclude_mode — drop sessions of this mode (all other pages)
     """
     session_service = request.app.get("session_service")
     if not session_service:
@@ -238,8 +320,11 @@ async def handle_session_search(request: web.Request) -> web.Response:
     if not q:
         return web.json_response({"error": "query required"}, status=400)
     limit = min(max(int(request.query.get("limit", "10")), 1), 50)
+    mode = request.query.get("mode") or None
+    exclude_mode = request.query.get("exclude_mode") or None
 
-    results = session_service.search_content(q, limit=limit)
+    results = session_service.search_content(
+        q, limit=limit, mode=mode, exclude_mode=exclude_mode)
     return web.json_response({"results": results, "query": q})
 
 

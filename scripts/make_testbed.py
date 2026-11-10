@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Book Companion — 测试靶场生成器。
+"""Liubai — 测试靶场生成器。
 
 把整个项目复制到独立目录（代码与真实项目完全相同），换一个端口，
 数据只读共享（bookbank junction）+ 独立 DB 快照，不污染真实库。
@@ -375,7 +375,7 @@ def apply_port_fixes(dst: Path, port: int) -> list[str]:
         ("main.py", 'web.TCPSite(api_runner, "127.0.0.1", 8766, reuse_address=True)',
          "main.py 服务端口"),
         ("api_server.py", "port: int = 8766,", "api_server 默认端口"),
-        ("api_server.py", "Book Companion API starting on http://127.0.0.1:8766",
+        ("api_server.py", "Liubai API starting on http://127.0.0.1:8766",
          "api_server 启动日志"),
         ("start.bat", "127.0.0.1:8766", "start.bat 健康检查/URL"),
     ]
@@ -414,7 +414,7 @@ def write_run_script(dst: Path, port: int) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="生成 Book Companion 测试靶场 / 管理迁移演练基线")
+        description="生成 Liubai 测试靶场 / 管理迁移演练基线")
     ap.add_argument("--dest", help="靶场目录（生成 / --wipe 时必填）")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT,
                     help=f"靶场端口（默认 {DEFAULT_PORT}）")

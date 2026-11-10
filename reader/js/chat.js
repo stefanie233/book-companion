@@ -1,16 +1,94 @@
-/* Book Companion — chat: bubble UI, SSE v2, typewriter, think collapse. */
+/* Liubai — chat: bubble UI, SSE v2, typewriter, think collapse. */
 
 import { S } from './state.js';
 import { updateUsage } from './context-usage.js';
+import { captureViewportText } from './epub-reader.js';
 
 // ── Utilities ──────────────────────────────────────────────────────
 
-/** Auto-scroll to bottom only if user is near the bottom (within 150px).
- *  Prevents fighting the user when they scroll up to read history. */
+/** 聊天区是否跟随最新输出。
+ *
+ * 不能每帧量距离来决定：「离底部 150px 以内就回底」在流式输出时会把
+ * 每一下滚轮都吃掉 —— 内容每帧都在长高，往上滚一格只有约 100px，
+ * 永远落在保护圈里，下一帧就被拉回底部（实测上滚 100px 在 400ms 内
+ * 归零，整段输出期间一格也滚不上去）。改成记用户意图：往上滚就停跟随，
+ * 自己滚回底部才恢复。 */
+const CHAT_STICK_SLACK = 8;
+let _stickChat = true;
+let _followTop = -1;          // 最近一次程序性跟随写下的 scrollTop
+
+function _chatAtBottom(log) {
+  return log.scrollHeight - log.scrollTop - log.clientHeight <= CHAT_STICK_SLACK;
+}
+
+/** 程序性回到底部。记下写到的位置，好让随之而来的 scroll 事件分得清
+ *  是「我们自己滚的」还是「用户拖滚动条」（用户很少恰好停在这一格）。 */
+function _writeChatBottom(log) {
+  _stickChat = true;
+  log.scrollTop = log.scrollHeight;
+  _followTop = log.scrollTop;
+}
+
+/** 跟随输出；用户往上读历史时不拽回底部。 */
 function autoScrollToBottom(log) {
-  if (!log) return;
-  const dist = log.scrollHeight - log.scrollTop - log.clientHeight;
-  if (dist < 150) log.scrollTop = log.scrollHeight;
+  if (!log || !_stickChat) return;
+  _writeChatBottom(log);
+}
+
+/** 新消息 / 换会话：无条件回到底部并恢复跟随。 */
+export function stickChatToBottom(log) {
+  log = log || document.getElementById('chatLog');
+  if (log) _writeChatBottom(log);
+}
+
+function _bindChatScrollTracking() {
+  const log = document.getElementById('chatLog');
+  if (!log || log.dataset.stickBound) return;
+  log.dataset.stickBound = '1';
+  // 往上滚 = 想读历史（滚轮是最常见的一条路）
+  log.addEventListener('wheel', function (e) {
+    if (e.deltaY < 0) _stickChat = false;
+    else if (_chatAtBottom(log)) _stickChat = true;
+  }, { passive: true });
+  log.addEventListener('touchmove', function () {
+    if (!_chatAtBottom(log)) _stickChat = false;
+  }, { passive: true });
+  log.addEventListener('keydown', function (e) {
+    if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') {
+      _stickChat = false;
+    }
+  });
+  // 拖滚动条不产生 wheel：位置既不在底部、也不是我们刚写的那一格，
+  // 那就是用户在滚 —— 停止跟随；滚回底部再恢复。
+  log.addEventListener('scroll', function () {
+    if (_chatAtBottom(log)) { _stickChat = true; return; }
+    if (Math.abs(log.scrollTop - _followTop) > 4) _stickChat = false;
+  }, { passive: true });
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', _bindChatScrollTracking);
+} else {
+  _bindChatScrollTracking();
+}
+
+// 写作页专属：agent 输出里的 .md 路径做成可点链接。这里只认语法，点击时再
+// 解析真实位置（工作区文档 → 素材卡 → 章节），不依赖渲染瞬间的 S.docs 新鲜度。
+const WRITE_FILE_LINK_RE = /(`?)((?:\.\/)?(?:工作区\/)?(?:[A-Za-z0-9_\-一-鿿《》「」·（）]+[\/]){0,6}[A-Za-z0-9_\-一-鿿《》「」·（）]+\.md)(`?)/g;
+// 路径前面只允许空白或标点；贴着汉字/字母写的「见设定/…」不当作文件链接。
+const LINK_BOUNDARY = ' \t\r\n*（(【["\'“‘：:，,、；;>';
+
+function linkWriteFilePaths(html, links) {
+  return html.replace(WRITE_FILE_LINK_RE,
+    (match, tickOpen, path, _tickClose, offset, whole) => {
+      const prev = offset > 0 ? whole[offset - 1] : '';
+      if (prev && !LINK_BOUNDARY.includes(prev)) return match;
+      const inner = (tickOpen ? '<code>' : '') + path
+        + (tickOpen ? '</code>' : '');
+      links.push(`<a class="write-file-link" data-write-path="${path}">`
+        + inner + '</a>');
+      return '\u0000FL' + (links.length - 1) + '\u0000';
+    });
 }
 
 export function renderMarkdown(text) {
@@ -25,6 +103,12 @@ export function renderMarkdown(text) {
     codeBlocks.push('<pre><code>' + code.replace(/\n$/, '') + '</code></pre>');
     return '\u0000CB' + (codeBlocks.length - 1) + '\u0000';
   });
+
+  // 只在写作页挂文件链接；代码块已换成占位符，里面的路径不会被误伤。
+  const fileLinks = [];
+  if (typeof window !== 'undefined' && window._currentTab === 'write') {
+    html = linkWriteFilePaths(html, fileLinks);
+  }
 
   html = html.replace(/^### (.+)$/gm, '<h4>$1</h4>');
   html = html.replace(/^## (.+)$/gm, '<h3>$1</h3>');
@@ -60,6 +144,10 @@ export function renderMarkdown(text) {
   // block-level and invalid inside <p>.
   html = html.replace(/<p>(<pre>)/g, '$1');
   html = html.replace(/(<\/pre>)<\/p>/g, '$1');
+
+  // 文件链接最后放回：占位符躲过了段落/加粗等规则，插入的 <a> 不再被改写。
+  html = html.replace(/\u0000FL(\d+)\u0000/g,
+    (_match, i) => fileLinks[+i] || '');
 
   return html;
 }
@@ -144,6 +232,113 @@ function createAvatar(characterName, bookId) {
   return div;
 }
 
+/* 用户上传的 agent 头像：只在普通对话里出现，占「思考过程」上方一行。
+   扮演模式已有角色头像（.msg-avatar），两者不叠。 */
+function createAgentTurnAvatar() {
+  const wrap = document.createElement('div');
+  wrap.className = 'agent-turn-avatar';
+  const img = document.createElement('img');
+  img.alt = '';
+  img.src = S.API + S.agentAvatarUrl;
+  wrap.appendChild(img);
+  return wrap;
+}
+
+function wantsAgentAvatar(role) {
+  // Role-play is home-page-only and already renders the character avatar in
+  // the bubble; a stale S.currentMode left from role-play must not hide the
+  // agent avatar on the writing tab.
+  const inRoleplay = S.currentMode === 'roleplay' && window._currentTab === 'home';
+  return role === 'agent' && !!S.agentAvatarUrl && !inRoleplay;
+}
+
+/* 用户自己的头像：放在用户消息行内（不是 agent 那种独立一行）。
+   .msg.user 是 row-reverse，所以第一个子节点会落在最右侧。 */
+function createUserTurnAvatar() {
+  const wrap = document.createElement('div');
+  wrap.className = 'user-turn-avatar';
+  const img = document.createElement('img');
+  img.alt = '';
+  const url = S.userAvatarUrl || '';
+  img.src = /^(https?:|data:|blob:)/.test(url) ? url : S.API + url;
+  wrap.appendChild(img);
+  if (S.userName) wrap.title = S.userName;
+  return wrap;
+}
+
+/** 头像资料可能在历史消息之后才到；这里补画/更新/移除已渲染的用户行。 */
+export function syncUserAvatars(url) {
+  const log = document.getElementById('chatLog');
+  if (!log) return;
+  if (url) S.userAvatarUrl = url;
+  const src = url
+    ? (/^(https?:|data:|blob:)/.test(url) ? url : S.API + url)
+    : '';
+  log.querySelectorAll('#chatLog > .msg.user').forEach(msg => {
+    // 分叉编辑行是输入框，不是一条已发送的消息。
+    if (msg.classList.contains('inline-editor-msg')) return;
+    const existing = msg.querySelector('.user-turn-avatar');
+    if (!url) {
+      if (existing) existing.remove();
+      return;
+    }
+    if (existing) {
+      const img = existing.querySelector('img');
+      if (img) img.src = src;
+      if (S.userName) existing.title = S.userName;
+      return;
+    }
+    const avatar = createUserTurnAvatar();
+    msg.insertBefore(avatar, msg.firstElementChild || null);
+  });
+}
+
+/** Bring the avatar on/off switch to turns already rendered.
+ *
+ * Session restore and /api/agent are two independent fetches; a restored
+ * history can paint before the avatar URL is known. Rather than delaying the
+ * conversation on the profile request, theme.js broadcasts and this walks
+ * each agent turn — above its think rows / writing trace — inserting or
+ * removing the avatar as needed.
+ */
+export function syncAgentAvatars(url) {
+  const log = document.getElementById('chatLog');
+  if (!log) return;
+  if (url) S.agentAvatarUrl = url;
+  const src = url ? S.API + url : '';
+  log.querySelectorAll('.agent-turn-avatar').forEach(el => {
+    if (!url) { el.remove(); return; }
+    const img = el.querySelector('img');
+    if (img) img.src = src;
+  });
+  if (!url) return;
+  log.querySelectorAll('.msg.agent').forEach(msg => {
+    // Role-play bubbles carry the character avatar inside .msg-avatar.
+    if (msg.querySelector('.msg-avatar')) return;
+    let first = msg;
+    let prev = first.previousElementSibling;
+    // addChat may have dropped this turn's timestamp *after* the think rows.
+    // Skip it, then walk the turn, then lift the timestamp back above.
+    const stamp = (prev && prev.classList && prev.classList.contains('timestamp-sep'))
+      ? prev : null;
+    if (stamp) prev = prev.previousElementSibling;
+    while (prev && prev.classList && (
+      prev.classList.contains('think-row')
+      || prev.classList.contains('turn-head')
+      || prev.classList.contains('turn-trace'))) {
+      first = prev;
+      prev = prev.previousElementSibling;
+    }
+    if (prev && prev.classList.contains('agent-turn-avatar')) {
+      const img = prev.querySelector('img');
+      if (img) img.src = src;
+      return;
+    }
+    if (stamp) log.insertBefore(stamp, first);
+    log.insertBefore(createAgentTurnAvatar(), first);
+  });
+}
+
 /**
  * Render an expandable thinking row.
  *
@@ -169,11 +364,11 @@ export function createThinkRow(thinkText, durationSec, live) {
   function setMeta(sec, isLive) {
     toggle.classList.toggle('live', !!isLive);
     if (isLive) {
-      toggle.textContent = '\u{1F914} 思考中…';
+      toggle.textContent = '思考中…';
     } else if (sec !== undefined && sec !== null) {
-      toggle.textContent = `\u{1F914} 思考过程 (${sec}s)`;
+      toggle.textContent = `思考过程 (${sec}s)`;
     } else {
-      toggle.textContent = '\u{1F914} 思考过程';
+      toggle.textContent = '思考过程';
     }
   }
   setMeta(durationSec, live);
@@ -224,6 +419,429 @@ export function createThinkRow(thinkText, durationSec, live) {
   return row;
 }
 
+/* ── 写作进度 ──────────────────────────────────────────────────────
+ * 写一整章要好几分钟，期间没有任何可见反馈。正文本身不进聊天窗（不贴
+ * 整章是既有纪律），所以只挂一行「到哪一步 · 多少字」；工具一结束就撤。
+ */
+function setWriteProgress(agentDiv, state, event) {
+  const stage = event.stage || '';
+  const chars = Number(event.chars) || 0;
+  const label = stage === 'settling' ? '✍ 正在结算账本'
+    : stage === 'revising' ? '✍ 正在修订'
+      : stage === 'retrying' ? '✍ 输出被截断，加大预算重写'
+        : stage === 'assembled' ? '✍ 正在装配上下文'
+          : '✍ 正在写正文';
+
+  // 时间线模式：进度就写在那条工具的右侧状态里，不再单起一行。
+  if (state && state._turnTrace) {
+    const rec = _runningToolRow(state, event);
+    if (rec) {
+      // 工具行左边已经写着「写正文：第3章」，这里只补阶段与字数。
+      const brief = stage === 'settling' ? '结算中'
+        : stage === 'revising' ? '修订中'
+          : stage === 'retrying' ? '重写中'
+            : stage === 'assembled' ? '装配中' : '起草中';
+      rec.status.textContent = chars
+        ? `${brief} · ${chars.toLocaleString()} 字` : brief;
+      return;
+    }
+  }
+
+  let row = state._writeProgress;
+  if (!row || !row.parentNode) {
+    row = document.createElement('div');
+    row.className = 'write-progress';
+    agentDiv.parentNode.insertBefore(row, agentDiv);
+    state._writeProgress = row;
+  }
+  row.textContent = chars ? `${label} · ${chars.toLocaleString()} 字` : label;
+}
+
+function clearWriteProgress(state) {
+  const row = state._writeProgress;
+  if (row && row.parentNode) row.parentNode.removeChild(row);
+  state._writeProgress = null;
+}
+
+/* ── 回合时间线（写作页）─────────────────────────────────────────────
+ * 一轮写作是几十次 ReAct：读设定、查资料、写正文、结算。聊天窗里只吐最终
+ * 正文时，中间那段「活着吗」的空白长得让人以为卡死。这里把它摊成一条可
+ * 折叠的时间线：
+ *
+ *   L0  `.turn-head`   已完成 · 27分1秒        ← 默认只留这一行
+ *   L1  `.turn-trace`  思考行 / 旁白 / 工具行   ← 点开才看
+ *   L2  `.tool-step-body`                       ← 工具行再点开看输出
+ *
+ * 只给写作页开（state._turnTrace 只在 writingCtx 下建），其他页面维持原样。
+ * 结束时不自动收：作者手动动过就说明正在看。
+ */
+
+const TOOL_ICONS = {
+  read: 'file-text', write: 'pencil-line', search: 'search', run: 'wrench',
+};
+
+function _fmtDuration(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h) return `${h}小时${m}分`;
+  if (m) return `${m}分${s}秒`;
+  return `${s}秒`;
+}
+
+/** 单个工具的耗时：秒级以下也给一位小数，别让快工具全是「0秒」。 */
+function _fmtToolDuration(ms) {
+  const sec = ms / 1000;
+  if (sec < 10) return `${sec.toFixed(1)}秒`;
+  if (sec < 60) return `${Math.round(sec)}秒`;
+  return _fmtDuration(ms);
+}
+
+/* 展开/收起的高度动画。这几块的高度是内容撑出来的（工具行多少不定），
+ * CSS 没法 transition 到 auto；用 WAAPI 把当次 scrollHeight 定格成 px 再
+ * 过渡，动画结束把高度还给内容本身（不写内联样式）。
+ *   commit(open) —— 真正改状态（hidden 或 .open 类），动画只负责视觉。
+ * 快速连点时先取消上一段：取消不触发 onfinish，所以不会出现「关到一半
+ * 被强制隐藏」的鬼影。 */
+const _REVEAL_ANIM = { duration: 190, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' };
+
+function _reducedMotion() {
+  return !!(window.matchMedia
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+}
+
+function animateReveal(el, open, commit) {
+  if (!el || typeof el.animate !== 'function' || _reducedMotion()) {
+    commit(open);
+    return;
+  }
+  const prev = el._revealAnim;
+  if (prev) {
+    el._revealAnim = null;
+    prev.onfinish = null;
+    prev.cancel();
+  }
+  if (open) {
+    commit(true);
+    const h = el.scrollHeight;
+    if (!h) return;
+    el._revealAnim = el.animate(
+      [{ height: '0px', opacity: 0 }, { height: `${h}px`, opacity: 1 }],
+      _REVEAL_ANIM);
+    return;
+  }
+  const h = el.offsetHeight;
+  if (!h) { commit(false); return; }
+  const anim = el.animate(
+    [{ height: `${h}px`, opacity: 1 }, { height: '0px', opacity: 0 }],
+    _REVEAL_ANIM);
+  el._revealAnim = anim;
+  anim.onfinish = () => {
+    el._revealAnim = null;
+    commit(false);
+  };
+}
+
+/** L0：`已完成 · 27分1秒  ⌄` 那一行。 */
+function makeTurnHead(labelText) {
+  const head = document.createElement('div');
+  head.className = 'turn-head';
+  const btn = document.createElement('button');
+  btn.className = 'turn-head-btn';
+  btn.type = 'button';
+  btn.setAttribute('aria-expanded', 'true');
+  const label = document.createElement('span');
+  label.className = 'turn-head-label';
+  label.textContent = labelText || '';
+  const chevron = document.createElement('i');
+  chevron.setAttribute('data-lucide', 'chevron-down');
+  chevron.className = 'turn-head-chevron';
+  btn.appendChild(label);
+  btn.appendChild(chevron);
+  head.appendChild(btn);
+  return { head, btn, label };
+}
+
+/** L1 的一条工具行（连 L2 的输出块一起建好，内容后填）。 */
+function makeToolRow(labelText, kind, titleText) {
+  const row = document.createElement('div');
+  row.className = 'tool-step running';
+
+  const head = document.createElement('button');
+  head.className = 'tool-step-head';
+  head.type = 'button';
+  const icon = document.createElement('i');
+  icon.setAttribute('data-lucide', TOOL_ICONS[kind] || 'wrench');
+  const label = document.createElement('span');
+  label.className = 'tool-step-label';
+  // 标签由后端白名单生成（动作 + 对象），这里只当文本用，绝不 insertHTML。
+  label.textContent = labelText || '工具';
+  label.title = titleText || labelText || '';
+  const status = document.createElement('span');
+  status.className = 'tool-step-status';
+  head.appendChild(icon);
+  head.appendChild(label);
+  head.appendChild(status);
+
+  const body = document.createElement('div');
+  body.className = 'tool-step-body';
+  // L2：先给一行人话摘要，原始 JSON 收在 <details> 里——展开工具行不该先
+  // 看到一串花括号。
+  const summary = document.createElement('div');
+  summary.className = 'tool-step-summary';
+  const raw = document.createElement('details');
+  raw.className = 'tool-step-raw';
+  const rawToggle = document.createElement('summary');
+  rawToggle.textContent = '原始输出';
+  const pre = document.createElement('pre');
+  pre.className = 'tool-step-output';
+  raw.appendChild(rawToggle);
+  raw.appendChild(pre);
+  body.appendChild(summary);
+  body.appendChild(raw);
+
+  row.appendChild(head);
+  row.appendChild(body);
+  return { row, head, body, summary, pre, status, label };
+}
+
+/** 建时间线的空壳（回合开始就建，有内容才露头）。 */
+function initTurnTrace(log, agentDiv, state) {
+  const { head, btn, label } = makeTurnHead('进行中…');
+  head.hidden = true;
+
+  const trace = document.createElement('div');
+  trace.className = 'turn-trace';
+  trace.hidden = true;
+
+  log.insertBefore(head, agentDiv);
+  log.insertBefore(trace, agentDiv);
+
+  state._turnHead = head;
+  state._turnHeadLabel = label;
+  state._turnTrace = trace;
+  state._turnLog = log;
+  state._turnStart = Date.now();
+  state._toolRows = new Map();
+  state._traceTouched = false;
+  state._turnOutcome = '';
+  state._clockTimer = null;
+
+  // 时间线里任何一次点击都算「在看」：结束时不再自动收起。
+  trace.addEventListener('click', () => { state._traceTouched = true; });
+  btn.onclick = () => {
+    state._traceTouched = true;
+    const open = !head.classList.contains('open');
+    head.classList.toggle('open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    animateReveal(trace, open, (next) => { trace.hidden = !next; });
+  };
+}
+
+/** 时间线第一次有内容：露头 + 开始计时。 */
+function ensureTurnTrace(state) {
+  if (!state || !state._turnTrace) return null;
+  if (state._turnHead.hidden) {
+    state._turnHead.hidden = false;
+    state._turnTrace.hidden = false;
+    state._turnHead.classList.add('running', 'open');
+    state._clockTimer = setInterval(() => {
+      if (state._turnOutcome || state._epoch !== S.chatEpoch) return;
+      state._turnHeadLabel.textContent =
+        `进行中 · ${_fmtDuration(Date.now() - state._turnStart)}`;
+    }, 1000);
+  }
+  return state._turnTrace;
+}
+
+/** 这一轮的旁白文本挪进时间线，气泡归零准备下一轮。 */
+function freezeNarration(state, agentDiv) {
+  if (!state || !state._turnTrace) return;
+  const text = state._fullText || '';
+  if (!text.trim()) return;
+  const trace = ensureTurnTrace(state);
+  const div = document.createElement('div');
+  div.className = 'turn-narration';
+  div.innerHTML = renderMarkdown(text);
+  trace.appendChild(div);
+  stopTypewriter(state);
+  state._fullText = '';
+  state._twIndex = 0;
+  state._twDirty = false;
+  setBubbleHTML(agentDiv, '');
+}
+
+function addToolStep(state, event) {
+  const trace = ensureTurnTrace(state);
+  if (!trace) return;
+  const built = makeToolRow(event.label || event.name || '工具', event.kind,
+                            event.label || event.name || '');
+  built.row.classList.add('running');
+  built.status.textContent = '运行中';
+  if (event.id) built.row.dataset.toolId = event.id;
+  built.head.onclick = () => {
+    state._traceTouched = true;
+    const open = !built.body.classList.contains('open');
+    animateReveal(built.body, open,
+                  (next) => built.body.classList.toggle('open', next));
+  };
+  trace.appendChild(built.row);
+
+  const rec = {
+    row: built.row, body: built.body, pre: built.pre, summary: built.summary,
+    status: built.status, name: event.name, started: Date.now(),
+  };
+  if (event.id) state._toolRows.set(event.id, rec);
+  else state._toolRows.set('name:' + event.name, rec);
+  autoScrollToBottom(state._turnLog);
+}
+
+/** 找一条还在跑的记录：优先 id，老服务端没有 id 时按名字找最后一条。 */
+function _runningToolRow(state, event) {
+  if (!state || !state._toolRows) return null;
+  if (event.id && state._toolRows.has(event.id)) return state._toolRows.get(event.id);
+  let found = null;
+  state._toolRows.forEach((rec, key) => {
+    if (rec.name === event.name && rec.row.classList.contains('running')) found = rec;
+  });
+  return found;
+}
+
+function finishToolStep(state, event) {
+  const rec = _runningToolRow(state, event);
+  if (!rec) return;
+  rec.row.classList.remove('running');
+  if (event.ok === false) rec.row.classList.add('failed');
+  rec.status.textContent = event.ok === false
+    ? '失败' : _fmtToolDuration(Date.now() - rec.started);
+  if (event.summary) rec.summary.textContent = event.summary;
+  if (event.preview) {
+    rec.pre.textContent = event.preview;
+    rec.row.classList.add('has-output');
+  }
+  if (!event.summary && !event.preview) {
+    rec.summary.textContent = '没有输出';
+    rec.pre.textContent = '';
+  }
+  state._toolRows.delete(event.id || ('name:' + event.name));
+  autoScrollToBottom(state._turnLog);
+}
+
+/** 回合收尾：定格耗时；没被手动展开过就收起。 */
+function finishTurnTrace(state, outcome) {
+  if (!state || !state._turnHead || state._turnHead.hidden) return;
+  if (state._clockTimer) {
+    clearInterval(state._clockTimer);
+    state._clockTimer = null;
+  }
+  if (!state._turnOutcome) state._turnOutcome = outcome || 'done';
+  const dur = _fmtDuration(Date.now() - state._turnStart);
+  const head = state._turnHead;
+  head.classList.remove('running');
+  head.classList.add('done');
+  if (state._turnOutcome === 'interrupted') {
+    state._turnHeadLabel.textContent = `已中断 · ${dur}`;
+  } else if (state._turnOutcome === 'round_limit') {
+    state._turnHeadLabel.textContent = `已达轮次上限 · ${dur}`;
+  } else if (state._turnOutcome === 'error') {
+    state._turnHeadLabel.textContent = `出错了 · ${dur}`;
+  } else {
+    state._turnHeadLabel.textContent = `已完成 · ${dur}`;
+  }
+  if (!state._traceTouched) {
+    head.classList.remove('open');
+    const btn = head.querySelector('.turn-head-btn');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+    // 到点了就慢慢收起，而不是啪一下消失。
+    animateReveal(state._turnTrace, false,
+                  (next) => { state._turnTrace.hidden = !next; });
+  }
+  // 还在跑的工具行不应留着「运行中」（中断/异常收尾）。
+  if (state._toolRows) {
+    state._toolRows.forEach((rec) => {
+      if (rec.row.classList.contains('running')) {
+        rec.row.classList.remove('running');
+        rec.status.textContent = '未完成';
+      }
+    });
+    state._toolRows.clear();
+  }
+}
+
+/** 历史回放：把 sessions 接口返回的 steps 画成同一条时间线（默认收起）。
+ *
+ *  写作会话里 `sessions.py` 会把一轮 ReAct 的「思考 / 旁白 / 工具」按顺序
+ *  存成 steps；这里用和实时完全相同的样式重建，刷新前后看到的是同一条线。
+ */
+export function renderTurnTraceFromSteps(steps) {
+  const { head, btn, label } = makeTurnHead('');
+  const trace = document.createElement('div');
+  trace.className = 'turn-trace';
+  trace.hidden = true;
+
+  let tools = 0;
+  (steps || []).forEach((step) => {
+    if (!step) return;
+    if (step.type === 'think') {
+      if (step.text) trace.appendChild(createThinkRow(step.text, null, false));
+    } else if (step.type === 'text') {
+      if (!step.text) return;
+      const div = document.createElement('div');
+      div.className = 'turn-narration';
+      div.innerHTML = renderMarkdown(step.text);
+      trace.appendChild(div);
+    } else if (step.type === 'tool') {
+      tools += 1;
+      const built = makeToolRow(step.label || step.name, step.kind, step.label);
+      built.row.classList.remove('running');
+      if (step.ok === false) built.row.classList.add('failed');
+      built.status.textContent = step.ok === false ? '失败' : '';
+      if (step.summary) built.summary.textContent = step.summary;
+      if (step.output) {
+        built.pre.textContent = step.output;
+        built.row.classList.add('has-output');
+      }
+      built.head.onclick = () => built.body.classList.toggle('open');
+      trace.appendChild(built.row);
+    }
+  });
+
+  // 历史里没存耗时，用步数代替（比空着有用）。
+  label.textContent = tools ? `已完成 · ${tools} 步` : '已完成';
+  head.classList.add('done');
+  btn.setAttribute('aria-expanded', 'false');
+  let reopened = false;
+  btn.onclick = () => {
+    reopened = !reopened;
+    head.classList.toggle('open', reopened);
+    btn.setAttribute('aria-expanded', reopened ? 'true' : 'false');
+    animateReveal(trace, reopened, (next) => { trace.hidden = !next; });
+  };
+  return { head, trace };
+}
+
+/** 发送前就被否决的动作（如引用失效）：一行提示，不落历史。 */
+function noticeToLog(text) {
+  const log = document.getElementById('chatLog');
+  if (!log) return;
+  const row = document.createElement('div');
+  row.className = 'chat-notice';
+  row.textContent = text;
+  log.appendChild(row);
+  autoScrollToBottom(log);
+}
+
+/** 会话级提示（撞轮次上限等）：一次性、不落历史。 */
+function appendChatNotice(agentDiv, text) {
+  const row = document.createElement('div');
+  row.className = 'chat-notice';
+  row.textContent = text;
+  if (agentDiv.parentNode) {
+    agentDiv.parentNode.insertBefore(row, agentDiv.nextSibling);
+  }
+}
+
 /** Stamp the rendered row index on a live message.
  *
  * loadSession re-numbers every row at the end, but messages appended while
@@ -263,6 +881,8 @@ function createBubble(role, html, avatarEl) {
 
   if (role === 'agent' && avatarEl) {
     div.appendChild(avatarEl);
+  } else if (role === 'user' && S.userAvatarUrl) {
+    div.appendChild(createUserTurnAvatar());
   }
 
   const bubble = document.createElement('div');
@@ -288,7 +908,7 @@ function createBubble(role, html, avatarEl) {
     // "重新回复" is a reload action, not an edit — use the circular arrow
     // so it reads differently from the pencil on the user's own turn.
     btn.innerHTML = '<i data-lucide="rotate-cw"></i>';
-    btn.title = '重新回复:让书伴重新回复,从处分叉新分支';
+    btn.title = `重新回复:让${S.agentName || '留白'}重新回复,从处分叉新分支`;
     btn.onclick = function (e) {
       e.stopPropagation();
       forkRegenerate(div);
@@ -398,9 +1018,32 @@ export function addChat(role, text, extraClass, timeMs) {
   }
 
   if (extraClass) div.classList.add(extraClass);
+  if (wantsAgentAvatar(role)) {
+    // History replay appends think rows *before* the text bubble, and
+    // addChat may just have appended this turn's timestamp separator after
+    // them. Walk back over the think rows so the avatar sits above the
+    // thinking process; if a separator is in the way, lift it above the
+    // avatar so the order reads timestamp → avatar → thinking → answer.
+    const tail = log.lastElementChild;
+    const stamp = tail && tail.classList && tail.classList.contains('timestamp-sep')
+      ? tail : null;
+    let anchor = null;
+    let prev = stamp ? stamp.previousElementSibling : tail;
+    while (prev && prev.classList && prev.classList.contains('think-row')) {
+      anchor = prev;
+      prev = prev.previousElementSibling;
+    }
+    const avatar = createAgentTurnAvatar();
+    if (anchor) {
+      if (stamp) log.insertBefore(stamp, anchor);
+      log.insertBefore(avatar, anchor);
+    } else {
+      log.appendChild(avatar);
+    }
+  }
   log.appendChild(div);
   stampMsgIndex(div);
-  log.scrollTop = log.scrollHeight;
+  autoScrollToBottom(log);
   return div;
 }
 
@@ -521,7 +1164,7 @@ function showInlineEditor(prefill) {
   bar.appendChild(cancel);
   wrap.appendChild(bar);
   log.appendChild(wrap);
-  log.scrollTop = log.scrollHeight;
+  autoScrollToBottom(log);
   ta.focus();
 }
 
@@ -633,7 +1276,10 @@ function handleSSEEvent(event, state, agentDiv) {
       // so nothing was expandable until the whole answer had finished.
       if (!state._thinkRow) {
         const row = createThinkRow('', null, true);
-        agentDiv.parentNode.insertBefore(row, agentDiv);
+        // 写作页的思考行是时间线的一步；其他页面仍是气泡上方的一行。
+        const trace = state._turnTrace ? ensureTurnTrace(state) : null;
+        if (trace) trace.appendChild(row);
+        else agentDiv.parentNode.insertBefore(row, agentDiv);
         state._thinkRow = row;
       }
       break;
@@ -654,7 +1300,9 @@ function handleSSEEvent(event, state, agentDiv) {
         state._thinkRow._finishThink(duration);
       } else if (state._thinkBuf.trim()) {
         const thinkRow = createThinkRow(state._thinkBuf, duration, false);
-        agentDiv.parentNode.insertBefore(thinkRow, agentDiv);
+        const trace = state._turnTrace ? ensureTurnTrace(state) : null;
+        if (trace) trace.appendChild(thinkRow);
+        else agentDiv.parentNode.insertBefore(thinkRow, agentDiv);
       }
       state._thinkBuf = '';
       state._thinkRow = null;
@@ -671,10 +1319,43 @@ function handleSSEEvent(event, state, agentDiv) {
       break;
 
     case 'tool_start':
-      // Show a brief indicator next to the bubble
+      // 写作页：先把这一轮的旁白收进时间线，再挂上即将执行的工具。
+      // 其他页面没有时间线，保持静默（工具名不外露）。
+      if (state._turnTrace) {
+        freezeNarration(state, agentDiv);
+        addToolStep(state, event);
+      }
+      break;
+
+    case 'tool_progress':
+      // 写作长工具的进度（只报阶段与字数，正文不上屏）。
+      setWriteProgress(agentDiv, state, event);
+      break;
+
+    case 'round_limit':
+      state._turnOutcome = 'round_limit';
+      clearWriteProgress(state);
+      appendChatNotice(agentDiv,
+        `已达 ${event.rounds} 轮上限，这一轮可能还没做完——说「继续」我就接着做。`);
       break;
 
     case 'tool_end':
+      finishToolStep(state, event);
+      clearWriteProgress(state);
+      // 模型记下称呼 / 性别 / 自己的名字后，设置页立刻跟上；提示词下一轮
+      // 由 load_persona 现算，不会继续注入「初次见面」引导。
+      if (event.name === 'update_identity') {
+        document.dispatchEvent(new CustomEvent('bc:identity-changed'));
+      }
+      // 工作区文件的 git 状态要跟着工具走：助手刚写完设定，文件区就先亮
+      // U/M，不必等整轮结束（refresh 那一刻会再对齐一次）。
+      if (window._currentTab === 'write' && window.WritingUI
+          && typeof window.WritingUI.refreshStatus === 'function'
+          && (event.name === 'writing_docs'
+              || event.name === 'writing_memory'
+              || event.name === 'writing_git_change')) {
+        window.WritingUI.refreshStatus();
+      }
       if (event.name === 'tts_speak' && event.preview) {
         try {
           const result = JSON.parse(event.preview);
@@ -690,24 +1371,30 @@ function handleSSEEvent(event, state, agentDiv) {
       // 服务端已停住这一轮：冻结打字机、把已收到的正文定格，尾部标记
       // 「已中断」。后面的 done 仍会到达，markInterrupted 是幂等的。
       state._streamDone = true;
+      clearWriteProgress(state);
       markInterrupted(agentDiv, state);
       break;
 
     case 'error':
       stopTypewriter(state);
       finalizeThinkRow(state);
+      clearWriteProgress(state);
       setBubbleHTML(agentDiv,
         renderMarkdown(state._fullText || event.message || '发生错误'));
       S.chatHistory.push({ role: 'agent', content: state._fullText || event.message });
       state._historyPushed = true;
+      finishTurnTrace(state, 'error');
       break;
 
     case 'done':
       state._streamDone = true;
+      clearWriteProgress(state);
       // 兜底：interrupted 帧没读到（连接被我们 aborted，或取消到得太晚
       // 服务端已正常收尾）时，本地的停止意图也要把界面收成「已中断」。
       if (event.interrupted || state._stopping) {
         markInterrupted(agentDiv, state);
+      } else {
+        finishTurnTrace(state, 'done');
       }
       // Guard against a stream that ends mid-reasoning (no think_end frame):
       // otherwise the row would stay labelled "思考中…" forever.
@@ -722,6 +1409,7 @@ function handleSSEEvent(event, state, agentDiv) {
             window.adoptSession(event.session_id, {
               tab: state && state._sendTab,
               bookId: state && state._sendBook,
+              workId: state && state._sendWork,
             });
           } else {
             S.currentSessionId = event.session_id;
@@ -729,7 +1417,7 @@ function handleSSEEvent(event, state, agentDiv) {
           window.saveViewState && window.saveViewState();
         } else if (window.recordTabSession && state && state._sendTab) {
           window.recordTabSession(state._sendTab, event.session_id,
-            { bookId: state._sendBook });
+            { bookId: state._sendBook, workId: state._sendWork });
         }
       }
       break;
@@ -812,6 +1500,7 @@ function markInterrupted(agentDiv, state) {
     setBubbleHTML(agentDiv, '');
   }
   pushAgentHistory(state);
+  finishTurnTrace(state, 'interrupted');
   if (state._interruptedShown) return;
   state._interruptedShown = true;
   if (agentDiv && agentDiv.parentNode) {
@@ -864,19 +1553,62 @@ export async function sendMessage(overrideText) {
   const input = document.getElementById('chatInput');
   const isOverride = overrideText != null;
   const text = isOverride ? String(overrideText).trim() : input.value.trim();
-  if (!text) return;
+  // 只挂了素材、没打字也算一次发送：附件本身就是这一轮的内容。
+  const attaches = attachedMaterials.slice();
+  if (!text && !attaches.length) return;
   // 一轮只允许一条流：流式期间按钮已经变成「停止」。
   if (S._activeStream) return;
 
-  let fullText = text;
+  // 写作页：带上当前作品/章，回合结束后刷新工作台（工具可能建了书/章/正文）。
+  const writingCtx = (window._currentTab === 'write' && window.WritingUI
+    && typeof window.WritingUI.context === 'function')
+    ? window.WritingUI.context() : null;
+  const onReader = window._currentTab === 'reader';
+  const isRoleplay = S.currentMode === 'roleplay';
+
+  // 这一轮带哪段引用。出处必须和当前页面一致——切页不会清掉标签，
+  // 阅读页圈的书里原文不能跟着进写作页，反之亦然。
   // Quote-injection only for manual input from the chat box; fork/regenerate
   // paths supply their own text and never carry a selection ref.
+  let quoteText = '';
+  let quoteSrc = '';
   if (!isOverride) {
     const tagEl = document.getElementById('selectionTag');
-    if (tagEl.classList.contains('visible')) {
-      const srcEl = document.getElementById('selTagSrc');
-      fullText = `[引用自${srcEl.textContent}: "${S.lastSelection.slice(0, 200)}"]\n${text}`;
+    const src = S.selectionSource;
+    // 写作页的引用有三种：正文选区、对话引用、工作区文件/文件夹；
+    // 阅读页只接受书里选区，别把写作页的附件带过去。
+    const allowed = writingCtx
+      ? (src === 'writing' || src === 'chat' || src === 'workspace')
+      : (!isRoleplay && onReader && src !== 'writing' && src !== 'workspace');
+    if (tagEl && tagEl.classList.contains('visible') && allowed
+        && S.lastSelection) {
+      if (writingCtx && src === 'writing') {
+        // 圈完又改过正文：锚点可能已经不在本章里。带一段找不到的文字，
+        // 模型只会在正文里瞎搜——宁可当场丢掉并说一声。
+        const ed = document.getElementById('writeEditor');
+        if (ed && ed.value.includes(S.lastSelection)) {
+          quoteText = S.lastSelection;
+          quoteSrc = src;
+        } else {
+          clearSelectionRef();
+          noticeToLog('引用的那段已经不在正文里了，这次没带引用');
+        }
+      } else {
+        quoteText = S.lastSelection;
+        quoteSrc = src;
+      }
     }
+  }
+
+  let fullText = text;
+  if (attaches.length) {
+    fullText = materialAttachBlock(attaches) + (text ? `\n\n${text}` : '');
+    // 附件随这条消息送走，托盘立刻清空（与输入框同生命周期）。
+    clearAttachments();
+  }
+  if (quoteText) {
+    const srcEl = document.getElementById('selTagSrc');
+    fullText = `[引用自${srcEl.textContent}: "${quoteText.slice(0, 200)}"]\n${fullText}`;
   }
 
   // User bubble
@@ -888,19 +1620,29 @@ export async function sendMessage(overrideText) {
   S.chatLastTimestamp = now;
   // Manual user bubble (not via addChat — we want the bubble immediately)
   const userDiv = createBubble('user', '', null);
-  userDiv.querySelector('.bubble').textContent = text;
+  const bubbleEl = userDiv.querySelector('.bubble');
+  bubbleEl.textContent = text;
+  if (attaches.length) {
+    // 气泡里留一行附件名：托盘已经清了，回看时仍能知道这一轮带了什么。
+    const line = document.createElement('div');
+    line.className = 'bubble-attach';
+    attaches.forEach((m) => {
+      const chip = document.createElement('span');
+      chip.className = 'bubble-attach-chip';
+      chip.textContent = attachLabel(m.title || m.id);
+      chip.title = m.title || m.id || '';
+      line.appendChild(chip);
+    });
+    bubbleEl.prepend(line);
+  }
   log.appendChild(userDiv);
   stampMsgIndex(userDiv);
-  log.scrollTop = log.scrollHeight;
+  stickChatToBottom(log);
   S.chatHistory.push({ role: 'user', content: text });
   // 会话已经开始：撤掉模式预选，把这次会话的阅读模式固定下来。
   if (window.updateModePrelude) window.updateModePrelude();
   if (!isOverride) input.value = '';
 
-  // 写作页：带上当前作品/章，回合结束后刷新工作台（工具可能建了书/章/正文）。
-  const writingCtx = (window._currentTab === 'write' && window.WritingUI
-    && typeof window.WritingUI.context === 'function')
-    ? window.WritingUI.context() : null;
   // 手改优先：先落盘再做 agent 的事，否则回来刷新会把未保存的改动吞掉。
   if (writingCtx && typeof window.WritingUI.flush === 'function') {
     try { await window.WritingUI.flush(); } catch (_) { /* 保存失败不拦对话 */ }
@@ -916,7 +1658,12 @@ export async function sendMessage(overrideText) {
   setBubbleHTML(agentDiv, '');
   log.appendChild(agentDiv);
   stampMsgIndex(agentDiv);
-  log.scrollTop = log.scrollHeight;
+  if (wantsAgentAvatar('agent')) {
+    // Insert first: think_start inserts its row immediately before agentDiv,
+    // so the avatar stays above the thinking row.
+    log.insertBefore(createAgentTurnAvatar(), agentDiv);
+  }
+  stickChatToBottom(log);
 
   // A fork loads its child before this turn is re-sent, so the row the
   // branch switcher anchors to only exists now. Re-render it (no-op when
@@ -930,6 +1677,7 @@ export async function sendMessage(overrideText) {
     _fullText: '',
     _thinkBuf: '',
     _thinkRow: null,
+    _writeProgress: null,
     _thinkStartTime: 0,
     _twActive: false,
     _twIndex: 0,
@@ -957,14 +1705,19 @@ export async function sendMessage(overrideText) {
 
   // 三个界面各用各的提示词与上下文：主页只带 home 语境，阅读页才带书、
   // 进度、选区。写作页的现场走 writing_work_id / writing_chapter_index。
-  const onReader = window._currentTab === 'reader';
-  const isRoleplay = S.currentMode === 'roleplay';
   const page = writingCtx ? 'writing' : (onReader ? 'reader' : 'home');
   // 回复落在哪条会话线：中途切页也不能把新会话记到别的线上。
   const sendTab = window.getActiveChatTab ? window.getActiveChatTab() : 'home';
   const sendBook = S.currentBook || '';
+  // 写作会话按作品归档：记这一轮实际发出去的作品，别在落盘时现读界面
+  //（中途换作品会把旧对话记到新作品名下）。
+  const sendWork = writingCtx ? (writingCtx.workId || '') : null;
   state._sendTab = sendTab;
   state._sendBook = sendBook;
+  state._sendWork = sendWork;
+
+  // 写作页：整轮摊成可折叠的时间线。其他页面保持原样（思考行 + 气泡）。
+  if (writingCtx) initTurnTrace(log, agentDiv, state);
 
   try {
     const resp = await fetch(S.API + '/api/chat', {
@@ -987,6 +1740,11 @@ export async function sendMessage(overrideText) {
         ...(writingCtx ? {
           writing_work_id: writingCtx.workId || '',
           writing_chapter_index: writingCtx.index || 0,
+          // 只在空白会话里定模式；已有会话的模式存在服务端，之后只能
+          // 由 agent 经作者授权切换（决策 161）。
+          ...(S.currentSessionId ? {} : {
+            writing_mode: S.writingMode || 'standard',
+          }),
         } : {}),
         stream: 'v2',
         // /api/chat/cancel 用同一个 id 精确停住这一轮
@@ -1007,14 +1765,20 @@ export async function sendMessage(overrideText) {
           // never sit below what is already on screen.
           visible_chapters: (S.visibleChapters && S.visibleChapters.length)
             ? S.visibleChapters : undefined,
+          // 视口内实际渲染的文字（跨 section 拼接）。后端优先把它注入
+          // <current-passage>，而不是一块可能盖不住视窗的 chunk。
+          reading_viewport: (function () {
+            try { return captureViewportText() || undefined; }
+            catch (_) { return undefined; }
+          })(),
         } : {}),
-        selection: (!writingCtx && !isRoleplay && onReader) ? S.lastSelection : '',
-        selection_source: (!writingCtx && !isRoleplay && onReader) ? S.selectionSource : '',
+        // 引用：阅读页是「书中原文 / 对话」，写作页是「正文 / 对话」。
+        selection: quoteText,
+        selection_source: quoteSrc,
         // Structural coordinates of the selection (see state.js). The
         // backend uses them to anchor <selection-context> and to raise the
         // spoiler gate — a selected passage is text the reader has seen.
-        ...(!writingCtx && !isRoleplay && onReader && S.selectionSource === 'book'
-          && S.lastSelection ? {
+        ...(quoteSrc === 'book' && quoteText ? {
           selection_section: S.selectionSection,
           selection_chapter: S.selectionChapter,
           selection_chunk: S.selectionChunk,
@@ -1045,11 +1809,11 @@ export async function sendMessage(overrideText) {
     // case the id still belongs to the line that sent it.
     if (sid) {
       if (state._epoch === S.chatEpoch) {
-        if (window.adoptSession) window.adoptSession(sid, { tab: sendTab, bookId: sendBook });
+        if (window.adoptSession) window.adoptSession(sid, { tab: sendTab, bookId: sendBook, workId: state._sendWork });
         else S.currentSessionId = sid;
         window.saveViewState && window.saveViewState();
       } else if (window.recordTabSession) {
-        window.recordTabSession(sendTab, sid, { bookId: sendBook });
+        window.recordTabSession(sendTab, sid, { bookId: sendBook, workId: state._sendWork });
       }
     }
 
@@ -1121,10 +1885,12 @@ export async function sendMessage(overrideText) {
       } else {
         setBubbleHTML(agentDiv, renderMarkdown(state._fullText));
       }
+      finishTurnTrace(state, 'interrupted');
       return;
     }
     stopTypewriter(state);
     setBubbleHTML(agentDiv, renderMarkdown('请求失败: ' + e.message));
+    finishTurnTrace(state, 'error');
   } finally {
     if (S._activeStream && S._activeStream.abortCtrl === abortCtrl) {
       clearTimeout(S._activeStream.fallbackTimer);
@@ -1132,6 +1898,9 @@ export async function sendMessage(overrideText) {
       setSendButtonBusy(false);
     }
     if (S._chatAbort === abortCtrl) S._chatAbort = null;
+    // 兜底收尾：连接正常结束却没等到 done（服务端异常早退）时，计时器
+    // 和「运行中」状态不能一直挂着。已收尾的回合重复调用是无害的。
+    finishTurnTrace(state, state._turnOutcome || 'done');
     // 工具可能建了作品/章节、写了正文——回合结束后把工作台对齐到磁盘。
     if (writingCtx && window.WritingUI
         && typeof window.WritingUI.refresh === 'function') {
@@ -1175,7 +1944,67 @@ export function uploadAvatar() {
 
 // ── Selection handling ────────────────────────────────────────────
 
+// 阅读页的引用高亮：浏览器一收缩 DOM 选区（点聊天框、点别处）高亮就没了，
+// 所以引用成立后用 CSS Custom Highlight 单独标一段——它跟选区互不依赖。
+// 老浏览器没有这个 API 时静默退化成「只有引用条」。
+let _quoteHighlight = null;
+
+function setQuoteHighlight(range) {
+  try {
+    if (!range || typeof Highlight !== 'function'
+        || typeof CSS === 'undefined' || !CSS.highlights) return;
+    _quoteHighlight = new Highlight(range);
+    CSS.highlights.set('reader-quote', _quoteHighlight);
+  } catch (_) { _quoteHighlight = null; }
+}
+
+function clearQuoteHighlight() {
+  try {
+    if (typeof Highlight === 'function' && typeof CSS !== 'undefined'
+        && CSS.highlights) {
+      CSS.highlights.delete('reader-quote');
+    }
+  } catch (_) { /* 没有这个 API 就没有高亮要撤 */ }
+  _quoteHighlight = null;
+}
+
+/** 选区必须整段落在同一个消息气泡里，才谈得上「引用这段对话」。
+ *
+ * #chatLog 下除了消息气泡，还挂开场招呼语（.msg.agent 直接放文字，
+ * 没有 .bubble）、时间戳、会话提示条。它们都不是一轮对话的正文，
+ * 误触一句「这么晚还在……」就被当成引文带进下一轮，纯属事故。
+ * 起止两端必须在同一个 .bubble 内 —— 跨气泡拖选不是一条引用。
+ */
+function _selectionBubble(sel) {
+  if (!sel || !sel.rangeCount) return null;
+  const owner = (node) => {
+    if (!node) return null;
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    return el ? el.closest('.bubble') : null;
+  };
+  const start = owner(sel.anchorNode);
+  const end = owner(sel.focusNode);
+  return (start && start === end) ? start : null;
+}
+
+// 「×」撤销引用时，一摘 .visible 标签就从布局里消失，mouseup 往往落在
+// 它下面的元素上；而 mousedown 的 preventDefault 又刻意留着那段选区。
+// mouseup 钩子若不认这一下，就会按同一段选区把刚撤掉的引用原地装回去
+// —— 表现为「选中文字时点 × 没反应」。用一次性的指针标记跳过那一下；
+// 下一次不落在 #selectionTag 上的 mousedown 会清掉标记，免得吞掉新选区。
+let _clearQuotePointer = false;
+
+document.addEventListener('mousedown', function (e) {
+  const target = e.target;
+  if (target && target.closest && target.closest('#selectionTag')) return;
+  _clearQuotePointer = false;
+});
+
 document.addEventListener('mouseup', function (e) {
+  if (_clearQuotePointer) {
+    _clearQuotePointer = false;
+    return;
+  }
   setTimeout(function () {
     const sel = window.getSelection();
     const text = sel.toString().trim();
@@ -1183,6 +2012,9 @@ document.addEventListener('mouseup', function (e) {
       if (e.target.closest('.ann-popup') || e.target.closest('.toolbar-note-box')) return;
       if (typeof window.popupInteracting !== 'undefined' && window.popupInteracting) return;
       if (typeof window.hideAnnotationPopup === 'function') window.hideAnnotationPopup();
+      // 在书页里点一下（选区塌陷）= 取消这次引用；点聊天面板不动。
+      const pageEl = document.getElementById('bookPage');
+      if (pageEl && e.target && pageEl.contains(e.target)) clearBookSelection();
       return;
     }
 
@@ -1201,10 +2033,16 @@ document.addEventListener('mouseup', function (e) {
         S.selectionChunk = S.currentChunk;
         S.selectionAnchorText = text;
       }
+      // 选中即引用：引用条 + 常驻高亮。以前这里只把选区存进 S，界面上
+      // 什么都不显示（弹引用按钮的 popup 早已不存在），用户只能靠猜。
+      showSelectionRef(text, '书中');
+      setQuoteHighlight(S.lastRange);
       if (typeof window.popupInteracting === 'undefined' || !window.popupInteracting) {
         if (typeof window.showAnnotationPopup === 'function') window.showAnnotationPopup(sel, text);
       }
     } else if (chatEl.contains(sel.anchorNode)) {
+      // 只引用气泡里的文字；招呼语、时间戳、提示条一律不算。
+      if (!_selectionBubble(sel)) return;
       S.selectionSource = 'chat';
       S.lastSelection = text;
       S.selectionSection = null;
@@ -1212,6 +2050,7 @@ document.addEventListener('mouseup', function (e) {
       S.selectionChapter = null;
       S.selectionChunk = null;
       S.selectionAnchorText = '';
+      clearQuoteHighlight();
       showSelectionRef(text, '聊天');
     }
   }, 10);
@@ -1224,12 +2063,171 @@ export function showSelectionRef(text, source) {
   tag.classList.add('visible');
 }
 
+/**
+ * 写作页：正文编辑器里圈中的一段 → 引用条（source=正文）。
+ *
+ * 编辑器是 <textarea>，它的选区不在 window.getSelection() 里（Chrome
+ * 只给一个塌缩的 body 选区），只能由 writing.js 读 selectionStart/End
+ * 再调这里。**不自动落盘**：发送前 sendMessage 会先 flush，并在那时
+ * 复核这段文字还在不在正文里——圈完又改过的不带出去。
+ */
+export function setWritingSelection(text) {
+  const t = String(text || '').trim();
+  if (t.length < 2) return;
+  S.selectionSource = 'writing';
+  S.lastSelection = t;
+  S.lastRange = null;
+  S.selectionSection = null;
+  S.selectionCfi = '';
+  S.selectionChapter = null;
+  S.selectionChunk = null;
+  S.selectionAnchorText = '';
+  showSelectionRef(t, '正文');
+}
+
+/**
+ * 写作页：把工作区文件 / 文件夹「添加到聊天」。
+ *
+ * 与选正文不同，这里引用的是**路径**而不是正文：正文可能很长，也不该在
+ * 发送时被复制一份。agent 拿到的是路径，动它之前自己用 writing_docs 读。
+ * 文件夹以 `/` 结尾区分，提示词里会让模型先 list 再 read。
+ */
+export function setWorkspaceSelection(path, kind) {
+  const raw = String(path || '').trim();
+  if (!raw) return;
+  const isDir = kind === 'dir';
+  const text = isDir && !raw.endsWith('/') ? `${raw}/` : raw;
+  S.selectionSource = 'workspace';
+  S.lastSelection = text;
+  S.lastRange = null;
+  S.selectionSection = null;
+  S.selectionCfi = '';
+  S.selectionChapter = null;
+  S.selectionChunk = null;
+  S.selectionAnchorText = '';
+  showSelectionRef(text, isDir ? '工作区文件夹' : '工作区文件');
+}
+
+/** 换章时收起写作页的引用条；阅读页的书里选区别被连带清掉。 */
+export function clearWritingSelection() {
+  if (S.selectionSource !== 'writing') return;
+  clearSelectionRef();
+}
+
+/** 离开写作页时把工作区引用一起收掉（它只属于写作对话）。 */
+export function clearWorkspaceSelection() {
+  if (S.selectionSource !== 'workspace') return;
+  clearSelectionRef();
+}
+
+/** 阅读页：书页里的选区塌陷（换页、点正文别处）= 取消这次引用。 */
+export function clearBookSelection() {
+  if (S.selectionSource !== 'book') return;
+  clearSelectionRef();
+}
+
 export function handleQuote() {
   if (!S.lastSelection || S.lastSelection.length < 2) return;
   showSelectionRef(S.lastSelection, '书中');
 }
 
+// ── 素材附件托盘 ──────────────────────────────────────────────────
+//
+// 写作页「添加到会话」只把素材挂进托盘，不发送：作者还要在输入框里说自己
+// 要什么，而且一次可以挂好几张。附件与输入框同生命周期——按下发送就随这
+// 条消息一起送出，然后清空；不想带就点胶囊上的 ×。
+//
+// 传出的是**事实**（id / 标题 / 分类 / 路径），怎么读、要不要提升进作品、
+// 用完后记不记 use，交给 agent 的写作提示词，UI 不写流程。
+
+const attachedMaterials = [];
+
+function materialAttachBlock(items) {
+  const parts = items.map((m) => {
+    const lines = [`素材 id：${m.id || ''}`];
+    if (m.title) lines.push(`标题：${m.title}`);
+    if (m.category) lines.push(`分类：${m.category}`);
+    if (m.path) lines.push(`路径：${m.path}`);
+    return lines.join('\n');
+  });
+  return `[本轮附加素材]\n${parts.join('\n\n')}`;
+}
+
+//: 托盘胶囊只露前四个字：素材标题动辄十几字，全显示就把输入框上方铺满了。
+const ATTACH_LABEL_CHARS = 4;
+
+function attachLabel(text) {
+  const value = String(text || '').trim();
+  return value.length > ATTACH_LABEL_CHARS
+    ? `${value.slice(0, ATTACH_LABEL_CHARS)}…` : value;
+}
+
+function renderAttachTray() {
+  const tray = document.getElementById('attachTray');
+  if (!tray) return;
+  tray.textContent = '';
+  tray.hidden = attachedMaterials.length === 0;
+  attachedMaterials.forEach((item, index) => {
+    const chip = document.createElement('span');
+    chip.className = 'attach-chip';
+    // 胶囊上只剩四个字，完整标题与路径放悬停提示里。
+    chip.title = [item.title, item.path].filter(Boolean).join('\n');
+    chip.appendChild(elIcon('file-text'));
+    const label = document.createElement('span');
+    label.className = 'attach-chip-label';
+    label.textContent = attachLabel(item.title || item.id || '素材');
+    chip.appendChild(label);
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'attach-chip-remove';
+    remove.title = '取消这张素材';
+    remove.setAttribute('aria-label', '取消这张素材');
+    remove.appendChild(elIcon('x'));
+    remove.addEventListener('click', () => {
+      attachedMaterials.splice(index, 1);
+      renderAttachTray();
+    });
+    chip.appendChild(remove);
+    tray.appendChild(chip);
+  });
+  if (window.lucide && lucide.createIcons) lucide.createIcons();
+}
+
+function elIcon(name) {
+  const icon = document.createElement('i');
+  icon.setAttribute('data-lucide', name);
+  icon.setAttribute('aria-hidden', 'true');
+  return icon;
+}
+
+/** 挂一张素材到本轮；同一张（id 或路径相同）只留一份。 */
+export function attachMaterial(item) {
+  const raw = item || {};
+  const id = String(raw.id || raw.material_id || '');
+  const path = String(raw.path || '');
+  if (!id && !path) return { added: false, reason: 'empty' };
+  const dup = attachedMaterials.some(
+    (m) => (id && m.id === id) || (path && m.path === path));
+  if (dup) return { added: false, reason: 'duplicate', count: attachedMaterials.length };
+  attachedMaterials.push({
+    id,
+    title: String(raw.title || ''),
+    category: String(raw.category || ''),
+    path,
+  });
+  renderAttachTray();
+  return { added: true, count: attachedMaterials.length };
+}
+
+export function clearAttachments() {
+  if (!attachedMaterials.length) return;
+  attachedMaterials.length = 0;
+  renderAttachTray();
+}
+
 export function clearSelectionRef() {
+  const wasWriting = S.selectionSource === 'writing';
+  clearQuoteHighlight();
   document.getElementById('selectionTag').classList.remove('visible');
   S.lastSelection = '';
   S.lastRange = null;
@@ -1238,6 +2236,20 @@ export function clearSelectionRef() {
   S.selectionChunk = null;
   S.selectionCfi = '';
   S.selectionAnchorText = '';
+  if (wasWriting) {
+    // 引用条和编辑器里的高亮是同一件事：撤掉引用，正文也不该还亮着。
+    // 高亮有两份：选区镜像（失焦后画的）和 textarea 自己的选区。
+    if (typeof window.hideWriteQuoteVeil === 'function') {
+      window.hideWriteQuoteVeil();
+    }
+    // setSelectionRange 会顺手把编辑器滚到插入点，滚回原处。
+    const ed = document.getElementById('writeEditor');
+    if (ed && ed.selectionEnd > ed.selectionStart) {
+      const top = ed.scrollTop;
+      ed.setSelectionRange(ed.selectionEnd, ed.selectionEnd);
+      ed.scrollTop = top;
+    }
+  }
 }
 
 // ── Voice: recording (ASR) ─────────────────────────────────────────
@@ -1410,6 +2422,8 @@ export function createVoiceBubble(role, audioUrl, durationSec, transcript, timeM
       ? createAvatar(S.currentCharacterName, S.rpSelectedBookId || S.currentBook)
       : null;
     if (avatarEl) div.appendChild(avatarEl);
+  } else if (role === 'user' && S.userAvatarUrl) {
+    div.appendChild(createUserTurnAvatar());
   }
 
   // ── Voice bubble body ──────────────────────────────────────────
@@ -1517,7 +2531,7 @@ export function createVoiceBubble(role, audioUrl, durationSec, transcript, timeM
 
   log.appendChild(div);
   stampMsgIndex(div);
-  log.scrollTop = log.scrollHeight;
+  autoScrollToBottom(log);
   audio.load();
   return div;
 }
@@ -1680,13 +2694,19 @@ async function sendVoiceMessage(wavBlob, durationSec) {
   setBubbleHTML(agentDiv, '');
   log.appendChild(agentDiv);
   stampMsgIndex(agentDiv);
-  log.scrollTop = log.scrollHeight;
+  if (wantsAgentAvatar('agent')) {
+    // Insert first: think_start inserts its row immediately before agentDiv,
+    // so the avatar stays above the thinking row.
+    log.insertBefore(createAgentTurnAvatar(), agentDiv);
+  }
+  stickChatToBottom(log);
 
   // 6. Send to LLM (reuse sendMessage logic)
   const state = {
     _fullText: '',
     _thinkBuf: '',
     _thinkRow: null,
+    _writeProgress: null,
     _thinkStartTime: 0,
     _twActive: false,
     _twIndex: 0,
@@ -1719,8 +2739,12 @@ async function sendVoiceMessage(wavBlob, durationSec) {
   // 回复落在哪条会话线：中途切页也不能把新会话记到别的线上。
   const sendTab = window.getActiveChatTab ? window.getActiveChatTab() : 'home';
   const sendBook = S.currentBook || '';
+  const sendWork = isWriting ? (window.WritingUI.context().workId || '') : null;
   state._sendTab = sendTab;
   state._sendBook = sendBook;
+  state._sendWork = sendWork;
+
+  if (isWriting) initTurnTrace(log, agentDiv, state);
 
   try {
     const resp = await fetch(S.API + '/api/chat', {
@@ -1733,7 +2757,10 @@ async function sendVoiceMessage(wavBlob, durationSec) {
         page: page,
         ...(isWriting
           ? { writing_work_id: window.WritingUI.context().workId || '',
-              writing_chapter_index: window.WritingUI.context().index || 0 }
+              writing_chapter_index: window.WritingUI.context().index || 0,
+              ...(S.currentSessionId ? {} : {
+                writing_mode: S.writingMode || 'standard',
+              }) }
           : {}),
         stream: 'v2',
         turn_id: turnId,
@@ -1770,11 +2797,11 @@ async function sendVoiceMessage(wavBlob, durationSec) {
     // case the id still belongs to the line that sent it.
     if (sid) {
       if (state._epoch === S.chatEpoch) {
-        if (window.adoptSession) window.adoptSession(sid, { tab: sendTab, bookId: sendBook });
+        if (window.adoptSession) window.adoptSession(sid, { tab: sendTab, bookId: sendBook, workId: state._sendWork });
         else S.currentSessionId = sid;
         window.saveViewState && window.saveViewState();
       } else if (window.recordTabSession) {
-        window.recordTabSession(sendTab, sid, { bookId: sendBook });
+        window.recordTabSession(sendTab, sid, { bookId: sendBook, workId: state._sendWork });
       }
     }
 
@@ -1830,10 +2857,12 @@ async function sendVoiceMessage(wavBlob, durationSec) {
       } else {
         setBubbleHTML(agentDiv, renderMarkdown(state._fullText));
       }
+      finishTurnTrace(state, 'interrupted');
       return;
     }
     console.error('Voice message error:', e);
     setBubbleHTML(agentDiv, renderMarkdown('请求失败: ' + e.message));
+    finishTurnTrace(state, 'error');
   } finally {
     if (S._activeStream && S._activeStream.abortCtrl === abortCtrl) {
       clearTimeout(S._activeStream.fallbackTimer);
@@ -1841,6 +2870,7 @@ async function sendVoiceMessage(wavBlob, durationSec) {
       setSendButtonBusy(false);
     }
     if (S._chatAbort === abortCtrl) S._chatAbort = null;
+    finishTurnTrace(state, state._turnOutcome || 'done');
   }
 }
 
@@ -1937,13 +2967,45 @@ function attachVoiceBar(bubbleDiv, audioUrl) {
   audio.load();
 }
 
+// 取消引用的 × 走 mousedown，不走 click：click 要求按下与松开落在同一个
+// 元素上，编辑器失焦那一瞬间的布局变化会让这一下整个落空（实测第一次点 ×
+// 没有反应，要先在别处空点一次）。preventDefault 顺带让编辑器在这一下里
+// 不失焦、选区不被收走。
+(function bindSelectionClear() {
+  const btn = document.querySelector('#selectionTag .ref-clear');
+  if (!btn) return;
+  btn.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    // 这一下之后的 mouseup 不要拿还留着的选区把引用装回来。
+    _clearQuotePointer = true;
+    clearSelectionRef();
+  });
+})();
+
 // ── HTML onclick access ───────────────────────────────────────────
 window.sendMessage = sendMessage;
+// 写作页「添加到会话」：只挂附件，不发送（发送由作者按）。
+window.attachMaterial = attachMaterial;
+window.clearAttachments = clearAttachments;
 window.sendOrStop = sendOrStop;
 window.stopAgent = stopAgent;
 window.handleQuote = handleQuote;
 window.clearSelectionRef = clearSelectionRef;
+window.setWritingSelection = setWritingSelection;
+window.clearWritingSelection = clearWritingSelection;
+window.setWorkspaceSelection = setWorkspaceSelection;
+window.clearWorkspaceSelection = clearWorkspaceSelection;
+window.clearBookSelection = clearBookSelection;
 window.addChat = addChat;
+window.syncAgentAvatars = syncAgentAvatars;
+window.syncUserAvatars = syncUserAvatars;
+document.addEventListener('bc:agent-avatar', (ev) => {
+  syncAgentAvatars(ev.detail && ev.detail.url);
+});
+document.addEventListener('bc:user-avatar', (ev) => {
+  syncUserAvatars(ev.detail && ev.detail.url);
+});
 window.uploadAvatar = uploadAvatar;
 window.toggleRecording = toggleRecording;
 window.handlePendingForkAction = handlePendingForkAction;

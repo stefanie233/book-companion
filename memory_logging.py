@@ -57,7 +57,9 @@ def setup_memory_logging(
     if not enabled:
         return None
 
-    log_dir = log_dir or (Path.cwd() / "data" / "logs")
+    if log_dir is None:
+        from runtime_paths import data_path
+        log_dir = data_path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "memory.log"
 
@@ -101,7 +103,9 @@ def setup_memory_logging_from_config(config: object) -> Path | None:
     """
     level_name = str(getattr(config, "memory_log_level", "INFO")).upper()
     level = getattr(logging, level_name, logging.INFO)
-    project_dir = getattr(config, "project_dir", Path.cwd())
+    from runtime_paths import user_root
+
+    project_dir = getattr(config, "project_dir", None) or user_root()
     return setup_memory_logging(
         Path(project_dir) / "data" / "logs",
         level=level,

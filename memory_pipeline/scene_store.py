@@ -10,7 +10,7 @@ Directory layout::
       局外人.md                # one scene block per book
       _archive/                # cold books moved here (L2-3 冷热分层)
 
-book-centric for Book Companion. Pure file I/O — no LLM calls here.
+book-centric for Liubai. Pure file I/O — no LLM calls here.
 """
 
 from __future__ import annotations

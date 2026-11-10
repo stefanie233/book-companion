@@ -12,14 +12,20 @@ from services.library_service import match_in_chapters, match_page_text
 
 
 def _sync_trace(msg: str) -> None:
-    """Append a reader-sync trace line (frontend bridge debugging)."""
+    """Append a reader-sync trace line — **默认关闭**的调试通道。
+
+    阅读页每滚一次屏就写两行（recv + hit/miss）：两个多月 6500 行，
+    实际读它的只有排查视窗对齐/定章那几次；常开就是纯噪声（决策 147）。排查时设
+    ``BC_READER_SYNC_TRACE=1`` 再启服务。日志路径按仓库根解析，不跟 cwd 走。
+    """
     try:
         import time as _t
-        from pathlib import Path as _P
-        log_dir = _P("data/logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / "reader_sync.log", "a", encoding="utf-8") as f:
-            f.write(_t.strftime("%m-%d %H:%M:%S") + " " + msg + "\n")
+
+        from log_lifecycle import append_line, log_dir, sync_trace_enabled
+        if not sync_trace_enabled():
+            return
+        append_line(log_dir() / "reader_sync.log",
+                    _t.strftime("%m-%d %H:%M:%S") + " " + msg)
     except Exception:
         pass
 
@@ -194,11 +200,12 @@ async def handle_sync(request: web.Request) -> web.Response:
         session = db.get_active_session(book_id)
         if not session:
             session = db.start_reading_session(book_id)
-        last = db.get_last_position(session.id)
-        if last != (result["chapter_index"], result["chunk_index"]):
-            db.record_position(
-                session.id, result["chapter_index"], result["chunk_index"], cfi
-            )
+        # 不再按 (chapter, chunk) 提前挡掉：行级锚（决策 143）会在同一个
+        # chunk 内不断变化，record_position 自己按块原地更新，既不 append
+        # 也不会把位置历史撑大。
+        db.record_position(
+            session.id, result["chapter_index"], result["chunk_index"], cfi
+        )
     else:
         session = db.get_active_session(book_id)   # 仅用于返回 session_id
     session_id = session.id if session else ""

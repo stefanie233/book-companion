@@ -297,6 +297,304 @@ async def handle_writing_style_check(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, **result})
 
 
+async def handle_writing_contracts(request: web.Request) -> web.Response:
+    """整本的合同收录（写作台左栏「合同」）。"""
+    from services.writing_service import WritingError
+    try:
+        contracts = _writing_service(request).list_contracts(
+            request.match_info["work_id"])
+    except WritingError as exc:
+        return _writing_error(str(exc), 404)
+    return web.json_response({"ok": True, "contracts": contracts})
+
+
+async def handle_writing_docs(request: web.Request) -> web.Response:
+    """作品工作区目录（写作台左栏「草稿」）。"""
+    from services.writing_service import WritingError
+    try:
+        data = _writing_service(request).docs_list(
+            request.match_info["work_id"])
+    except WritingError as exc:
+        return _writing_error(str(exc), 404)
+    return web.json_response({"ok": True, **data})
+
+
+async def handle_writing_doc_file(request: web.Request) -> web.Response:
+    """读工作区里的一份文件（路径相对作品目录，只认 作品记忆.md / 设定 / 计划稿 / 素材）。"""
+    from services.writing_service import WritingError
+    path = request.query.get("path") or ""
+    try:
+        row = _writing_service(request).docs_read(
+            request.match_info["work_id"], path)
+    except WritingError as exc:
+        return _writing_error(str(exc), 404 if "不存在" in str(exc) else 400)
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_doc_create(request: web.Request) -> web.Response:
+    """新建工作区文件或文件夹（左栏右键「新建」）。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).docs_create(
+            request.match_info["work_id"], str(body.get("path") or ""),
+            kind=str(body.get("kind") or "file"),
+            content=str(body.get("content") or ""))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_doc_rename(request: web.Request) -> web.Response:
+    """原地改名（父目录不变，页面只给新名字）。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).docs_rename(
+            request.match_info["work_id"], str(body.get("path") or ""),
+            str(body.get("name") or ""),
+            kind=str(body.get("kind") or "file"))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_doc_delete(request: web.Request) -> web.Response:
+    """删除工作区文件或文件夹（文件夹连内容一起删）。"""
+    from services.writing_service import WritingError
+    try:
+        row = _writing_service(request).docs_delete(
+            request.match_info["work_id"],
+            request.query.get("path") or "",
+            kind=request.query.get("kind") or "file")
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_materials(request: web.Request) -> web.Response:
+    """全局素材库目录（空项目左栏；有作品时也通过固定入口进来）。"""
+    from services.writing_service import WritingError
+    try:
+        data = _writing_service(request).materials_list()
+    except WritingError as exc:
+        return _writing_error(str(exc), 404)
+    return web.json_response({"ok": True, **data})
+
+
+async def handle_writing_material_file(request: web.Request) -> web.Response:
+    """读一张素材卡。"""
+    from services.writing_service import WritingError
+    path = request.query.get("path") or ""
+    try:
+        row = _writing_service(request).materials_read(path)
+    except WritingError as exc:
+        return _writing_error(str(exc), 404 if "不存在" in str(exc) else 400)
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_save(request: web.Request) -> web.Response:
+    """页面直接编辑素材卡正文（原料不是正典，允许页面改）。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).materials_write(
+            str(body.get("path") or ""), str(body.get("content") or ""))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_create(request: web.Request) -> web.Response:
+    """新建素材文件或分类目录。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).materials_create(
+            str(body.get("path") or ""), kind=str(body.get("kind") or "file"),
+            content=str(body.get("content") or ""))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_intake(request: web.Request) -> web.Response:
+    """阅读页「收录为素材」：待归类卡落 待归类/《书名》-时间戳.md。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).materials_intake_raw(
+            excerpt=str(body.get("excerpt") or ""),
+            book_id=str(body.get("book_id") or ""),
+            book_title=str(body.get("book_title") or ""),
+            chapter_index=body.get("chapter_index"),
+            chunk_index=body.get("chunk_index"),
+            cfi=str(body.get("cfi_range") or body.get("cfi") or ""),
+            instruction=str(body.get("instruction") or ""))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_rename(request: web.Request) -> web.Response:
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).materials_rename(
+            str(body.get("path") or ""), str(body.get("name") or ""),
+            kind=str(body.get("kind") or "file"))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_move(request: web.Request) -> web.Response:
+    """换分类：保留文件名，消费连线不动。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).materials_move(
+            str(body.get("path") or ""), str(body.get("target_dir") or ""),
+            kind=str(body.get("kind") or "file"))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_delete(request: web.Request) -> web.Response:
+    """删除 = 进回收站。"""
+    from services.writing_service import WritingError
+    try:
+        row = _writing_service(request).materials_delete(
+            request.query.get("path") or "",
+            kind=request.query.get("kind") or "file")
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_empty(request: web.Request) -> web.Response:
+    """清空文件夹：里面的素材卡逐张进回收站，文件夹与子分类保留。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).materials_empty(
+            str(body.get("path") or ""))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_recycled(request: web.Request) -> web.Response:
+    """回收站清单与积压情况。"""
+    from services.writing_service import WritingError
+    try:
+        data = _writing_service(request).materials_recycled()
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **data})
+
+
+async def handle_writing_material_restore(request: web.Request) -> web.Response:
+    """从回收站放回去；不传 target 就回原分类。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        return _writing_error("invalid json")
+    try:
+        row = _writing_service(request).materials_restore(
+            str(body.get("path") or ""), target=str(body.get("target") or ""))
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **row})
+
+
+async def handle_writing_material_purge(request: web.Request) -> web.Response:
+    """显式清理回收站。``all=true`` 清空全部（页面垃圾桶按钮，先确认）；
+    不传则按年龄清理，默认 90 天（脚本/audit 的保留期语义）。"""
+    from services.writing_service import WritingError
+    try:
+        body = await request.json()
+    except ValueError:
+        body = {}
+    if body.get("all"):
+        days = 0                      # 0 = 不设保留期，全部清掉
+    else:
+        raw = body.get("days")
+        try:
+            days = 90 if raw is None else int(raw)
+        except (TypeError, ValueError):
+            return _writing_error("days 要是整数")
+    try:
+        data = _writing_service(request).materials_purge_recycled(days=days)
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **data})
+
+
+async def handle_writing_material_audit(request: web.Request) -> web.Response:
+    """素材库盘点：只报告，不改。"""
+    from services.writing_service import WritingError
+    try:
+        days = int(request.query.get("unused_days") or 90)
+    except ValueError:
+        return _writing_error("unused_days 要是整数")
+    try:
+        data = _writing_service(request).materials_audit(unused_days=days)
+    except WritingError as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **data})
+
+
+async def handle_writing_material_search(request: web.Request) -> web.Response:
+    from services.writing_service import WritingError
+    try:
+        data = _writing_service(request).materials_search(
+            request.query.get("q") or "",
+            limit=int(request.query.get("limit") or 10))
+    except (WritingError, ValueError) as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **data})
+
+
+async def handle_writing_material_uses(request: web.Request) -> web.Response:
+    """素材的消费历史：按 material_id 或 work_id 查。"""
+    from services.writing_service import WritingError
+    try:
+        data = _writing_service(request).materials_uses(
+            material_id=request.query.get("material_id") or "",
+            work_id=request.query.get("work_id") or "",
+            limit=int(request.query.get("limit") or 100))
+    except (WritingError, ValueError) as exc:
+        return _writing_error(str(exc))
+    return web.json_response({"ok": True, **data})
+
+
 async def handle_writing_contract(request: web.Request) -> web.Response:
     from services.writing_service import WritingError
     svc = _writing_service(request)
@@ -350,8 +648,15 @@ async def handle_writing_write(request: web.Request) -> web.StreamResponse:
     })
     await resp.prepare(request)
     try:
+        # 「生成」按钮是标准路径，但它不能绕过**单章**的细致覆盖：
+        # 细致模式要求动笔前交 research_brief，这个按钮给不出。
+        mode = svc.effective_writing_mode(work_id, index, "standard")
+        if mode == "detail":
+            raise WritingError(
+                "这一章是细致模式：请在对话里让写作助手起草"
+                "（它会先交 research_brief），或在对话里把这一章降回标准模式。")
         async for event in svc.stream_chapter(
-                work_id, index, style_ref=_style_query(request)):
+                work_id, index, style_ref=_style_query(request), mode=mode):
             await _sse_write_json(resp, event)
     except WritingError as exc:
         await _sse_write_json(resp, {"event": "error",
@@ -475,6 +780,22 @@ async def handle_writing_vcs_log(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "commits": commits})
 
 
+async def handle_writing_file_timeline(request: web.Request) -> web.Response:
+    """一份工作区文件的 git 历史（左栏「时间线」）。"""
+    from services.writing_service import WritingError
+    try:
+        limit = min(max(int(request.query.get("limit", "50")), 1), 200)
+    except ValueError:
+        return _writing_error("limit 必须是整数")
+    try:
+        data = _writing_service(request).vcs_file_timeline(
+            request.match_info["work_id"],
+            request.query.get("path") or "", limit=limit)
+    except WritingError as exc:
+        return _writing_error(str(exc), 404 if "不存在" in str(exc) else 400)
+    return web.json_response({"ok": True, **data})
+
+
 async def handle_writing_vcs_diff(request: web.Request) -> web.Response:
     from services.writing_service import WritingError
     text = request.query.get("text", "").lower() in ("1", "true", "yes")
@@ -484,6 +805,7 @@ async def handle_writing_vcs_diff(request: web.Request) -> web.Response:
             from_ref=request.query.get("from", "HEAD"),
             to_ref=request.query.get("to", "WORK"),
             chapter_id=request.query.get("chapter_id", ""),
+            file_path=request.query.get("file_path", ""),
             text=text)
     except WritingError as exc:
         return _writing_error(str(exc), 404 if "不存在" in str(exc) else 400)

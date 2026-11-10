@@ -28,7 +28,9 @@ from tools.import_probe import (
     _register_epub_probe_tools,
 )
 from tools.library import _register_library_tools
+from tools.profile import install_profile_tools
 from tools.registry import ToolRegistry
+from tools.self import _register_self_tools
 from tools.sessions import _register_session_tools
 from tools.voice import _register_voice_tools
 
@@ -60,6 +62,8 @@ def create_builtin_registry(
     registry = ToolRegistry()
 
     _register_basic(registry)
+    _register_self_tools(registry, config=config, bookbank_db=bookbank_db)
+    install_profile_tools(registry, config=config)
     _register_web_search(registry, search_api_key)
 
     # ── Book reader tools ─────────────────────────────────────────────

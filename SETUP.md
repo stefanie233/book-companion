@@ -1,4 +1,4 @@
-# Book Companion（书伴）— 初始化指南
+# Liubai（留白）— 初始化指南
 
 基于 AI 的 CLI 阅读陪伴助手。Python 3.12 + asyncio + prompt_toolkit + SQLite。
 
@@ -36,8 +36,8 @@ setup.bat
 |------|------|------|
 | ASR 模型 (SenseVoiceSmall) | ~231 MB | 浏览器麦克风语音输入 |
 | Tavily API Key | 免费注册 | Web 搜索工具 |
-
-| MOBI 支持 | `pip install mobi` | 导入 MOBI 格式电子书 |
+| `pip install mobi` | — | 导入 MOBI 格式电子书 |
+| `pip install pywebview pythonnet` | — | 桌面版原生窗口（可选，见下） |
 
 ASR 模型可在 `setup.bat` 中选择下载，也可稍后手动运行：
 
@@ -45,6 +45,16 @@ ASR 模型可在 `setup.bat` 中选择下载，也可稍后手动运行：
 .venv\Scripts\pip install modelscope
 python scripts\download_asr_model.py
 ```
+
+### 桌面版（可选）
+
+桌面版是一个独立的原生窗口入口 `desktop.py`，不含 CLI。打包前需额外安装
+`pywebview`（原生窗口）与 `pythonnet`（Windows 桥接），再按
+[packaging/README.md](packaging/README.md) 执行 `packaging/build.ps1`。
+
+- 应用名：**留白 / Liubai**
+- 数据目录：`%LOCALAPPDATA%\LiuBai`（`BC_HOME` 可覆盖；exe 同级放 `portable.flag` 为便携模式）
+- 源码运行（`python main.py` / `start.bat`）不受影响，仍使用仓库根目录
 
 ## 项目结构
 

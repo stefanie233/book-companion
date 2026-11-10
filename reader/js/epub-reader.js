@@ -1,4 +1,4 @@
-/* Book Companion — native EPUB rendering via epub.js (scrolled flow).
+/* Liubai — native EPUB rendering via epub.js (scrolled flow).
 
    Display layer only. The DB chunk model (chapter_index, chunk_index)
    stays the semantic authority — memory / graph / LLM / annotations all
@@ -28,6 +28,7 @@
    init falls back cleanly to the chunk view. */
 
 import { S } from './state.js';
+import { bookProgress, paintProgress } from './utils.js';
 
 let book = null;                    // epub.js Book
 let rendition = null;               // epub.js Rendition
@@ -203,12 +204,20 @@ export function isNative() {
 // 但二者是模块私有且随切书/销毁轮换——经桥转发，切书后引用自动指向新书。
 const _bookReadyCbs = [];       // [(bookId)] initNative 成功后触发
 const _sectionRenderedCbs = []; // [(contents)] 每个 section iframe 渲染后触发
+const _contentPointerCbs = [];  // [(e, doc)] 正文 iframe 内 pointerdown（不冒泡到父文档）
+const _contentClickCbs = [];    // [(e, doc)] 正文 iframe 内 click（沉浸阅读进出用）
 
 export function getRendition() { return destroyed ? null : rendition; }
 export function getBook() { return destroyed ? null : book; }
 export function getNativeBookId() { return destroyed ? null : _nativeBookId; }
 export function onBookReady(cb) { _bookReadyCbs.push(cb); }
 export function onSectionRendered(cb) { _sectionRenderedCbs.push(cb); }
+/** 正文 iframe 内的 pointerdown 回调。父文档收不到 iframe 内的事件，
+ *  需要关闭主文档弹层（如搜索面板）时靠这条桥。 */
+export function onContentPointerDown(cb) { _contentPointerCbs.push(cb); }
+/** 正文 iframe 内的 click 回调。沉浸阅读的「空点进出」需要它：
+ *  父文档收不到 iframe 里的事件，坐标、选区、双击计数都在 iframe 文档内。 */
+export function onContentClick(cb) { _contentClickCbs.push(cb); }
 
 function _notifyBookReady() {
   for (const cb of _bookReadyCbs) {
@@ -238,9 +247,9 @@ function _notifySectionRendered(view) {
 // 不用文本指纹：指纹的降级前缀 indexOf 会命中章内更早的重复出现，
 // 锚定被"稳定地"收敛到章首（实测）。重排全程静默不落库。
 export function resizeNative() {
-  if (destroyed || !rendition) return;
+  if (destroyed || !rendition) return Promise.resolve();
   const host = document.getElementById('bookPageNative');
-  if (!host || !host.clientWidth || !host.clientHeight) return;
+  if (!host || !host.clientWidth || !host.clientHeight) return Promise.resolve();
 
   // ── 冷启动恢复窗口：initNative 正在按当前宿主尺寸建 rendition 并
   //    display(cfi) 恢复进度，此刻的重排请求是"宿主由 hidden 变可见 /
@@ -249,7 +258,7 @@ export function resizeNative() {
   //    display 互相打断，落点偏 10 个 DOM 元素 = /4/192 → /4/182，并额外
   //    起一条收敛循环 → 用户感知"恢复抖动 + 收敛缓慢"）。
   //    处理：只记一个"有请求被推迟"，冷启动收尾时按终态尺寸补一次。
-  if (_coldRestoring) { _deferredResize = true; return; }
+  if (_coldRestoring) { _deferredResize = true; return Promise.resolve(); }
 
   // 宽度未变则无需重排：`flow: 'scrolled'` 下 iframe 排版只有**宽度**决定
   // 换行（高度只决定可视窗口大小，不参与行宽计算）。而 fork 的
@@ -260,7 +269,7 @@ export function resizeNative() {
   if (host.clientWidth === _lastResizeW) {
     _lastResizeH = host.clientHeight;
     _kickContinuousFill();
-    return;
+    return Promise.resolve();
   }
 
   // 至此宽度确实变了 → 需要真重排。
@@ -274,8 +283,13 @@ export function resizeNative() {
   // 等待期 + 重排全程挂 _programmaticUntil（每帧续期），零上报。
   const w0 = host.clientWidth, h0 = host.clientHeight;
   _programmaticUntil = Date.now() + PROGRAMMATIC_MS;   // 等待期即程序窗口
-  _waitLayoutStableThen(host, w0, h0, () => {
-    _resizeNativeLocked(host, w0, h0);
+  // 返回 Promise 供「进入/退出沉浸模式」的 View Transition 等待：新快照
+  // 必须在 iframe 落位之后拍，否则会拍到 clear() 后的空白或旧落点。
+  return new Promise((resolve) => {
+    const started = _waitLayoutStableThen(host, w0, h0, () => {
+      Promise.resolve(_resizeNativeLocked(host, w0, h0)).finally(resolve);
+    });
+    if (!started) resolve();     // 已销毁：等待链不会执行
   });
 }
 
@@ -291,8 +305,12 @@ function _resizeNativeLocked(host, w0, h0) {
   // ⚠️ 只比宽度：scrolled 下高度不影响换行，为高度抖动再等一轮纯属浪费。
   if (host.clientWidth !== w0) {
     const w1 = host.clientWidth, h1 = host.clientHeight;
-    _waitLayoutStableThen(host, w1, h1, () => { _resizeNativeLocked(host, w1, h1); });
-    return;
+    return new Promise((resolve) => {
+      const started = _waitLayoutStableThen(host, w1, h1, () => {
+        Promise.resolve(_resizeNativeLocked(host, w1, h1)).finally(resolve);
+      });
+      if (!started) resolve();
+    });
   }
   // 同尺寸跳过（等待期间可能已被 ResizeObserver 链路处理过）：切页往返
   // （switchTab→setChatPanelVisible→resizeNative）尺寸未变，而 fork 的
@@ -318,15 +336,20 @@ function _resizeNativeLocked(host, w0, h0) {
   // 过该窗口，中间态就穿过过期闸门进了 DB——见 docs/reader-position-redesign.md）
   _programmaticUntil = Date.now() + PROGRAMMATIC_MS;
   _programTimerArm();                // display 长扫描期间持续静默
+  // ⚠️ resize 会同步 clear() 掉所有 view，见 _resetManagerFillQueue 的注释。
+  // 前后各复位一次：前一次让在途 check 不再有人消费，后一次清掉 clear()
+  // 触发的 scroll 事件刚排进来的任务。
+  _resetManagerFillQueue();
   try { rendition.resize(host.clientWidth, host.clientHeight); }
   catch (_) { /* 重排失败不干扰阅读 */ }
+  _resetManagerFillQueue();
   _lastResizeW = host.clientWidth; _lastResizeH = host.clientHeight;
   if (!cfi) { _programTimerClear(true); _kickContinuousFill(); return; }
   // fork 的 manager.resize 内部 clear()（清空视图 + scrollTo(0,0)，continuous
   // 未 override）——resize 后靠 scroll 事件渐进渲染书首，直接 _scrollToCfi
   // 与之打架（实测漂移很远 + 收敛循环不稳定）。改走 display(cfi) 让
   // manager 自己重渲染目标 section（与批注跳转同一条路径），再段落级精修。
-  rendition.display(cfi)
+  return rendition.display(cfi)
     .catch(() => { /* display 失败仍尝试精修 */ })
     .then(() => _scrollToCfi(cfi))
     .finally(() => {
@@ -379,8 +402,10 @@ export function restoreViewport() {
     // scrollTo(0,0)）——为 20px 高度抖动重建布局，换来的是视口被清零后
     // 再 display 回来的"幽灵滚动"。
     if (host.clientWidth !== _lastResizeW) {
+      _resetManagerFillQueue();          // 同 resizeNative：clear() 会卡死补载队列
       try { rendition.resize(host.clientWidth, host.clientHeight); }
       catch (_) { /* 重排失败仍尝试定位 */ }
+      _resetManagerFillQueue();
       _lastResizeW = host.clientWidth; _lastResizeH = host.clientHeight;
     } else {
       _lastResizeH = host.clientHeight;   // 仅记录：高度不触发重建
@@ -498,11 +523,12 @@ export function resumeHostResizeObserver() {
 
 /** 视口顶一次遍历同时取出 CFI 与文本（位置模型的核心读数）。
  *
- *  · cfi —— 视口顶 y 处文本节点前 20 字 → Range → Contents.cfiFromRange。
- *    带 section base，是 epub.js 自己的语义坐标：段落级、天然唯一（可当
- *    去重键），也是 display() 能确定性消费的恢复锚。
- *  · text —— 同一节点的后续 120 字，继续喂 /api/sync 的文本指纹桥映射到
- *    DB 的 (chapter, chunk)。
+ *  · cfi —— 视口顶第一个完整可见行的行首字符 → Range → Contents.cfiFromRange。
+ *    带 section base 和字符偏移（`:N`），是 epub.js 自己的语义坐标：行级、
+ *    天然唯一（可当去重键），也是 display() 能确定性消费的恢复锚。字符
+ *    偏移与版式无关，换字号/版心后仍指向同一行文字。
+ *  · text —— 同一节点从开头起的 120 字，继续喂 /api/sync 的文本指纹桥
+ *    映射到 DB 的 (chapter, chunk)。
  *
  *  视口顶落在图片/纯空白上时返回 null（本次不上报、不锚定）。 */
 function _captureViewport() {
@@ -553,9 +579,17 @@ function _captureViewport() {
     const y = Math.max(0, viewTop - topHit.rect.top);
     const node = _textNodeAtY(topHit.c.document, y);
     if (node) {
+      // 锚到视口顶那一行的行首字符，而不是文本节点开头（`:0`）。长段落
+      // 跨多屏时，`:0` 会让重开/切页都回到段首；带上字符偏移后
+      // display(cfi)+_scrollToCfi 能落在同一行。粒度是「行」，不是像素：
+      // 像素偏移在换字号/版心后没有语义（见 docs/reader.md 决策 143）。
+      // ⚠️ 指纹文本仍从节点开头取（_textAt），偏移只影响 CFI 锚，避免
+      // 改变后端「结构定章、文本定块」的匹配语义。
+      const off = _charOffsetAtY(node, y);
+      const len = (node.nodeValue || '').length;
       const range = topHit.c.document.createRange();
-      range.setStart(node, 0);
-      range.setEnd(node, Math.min(20, (node.nodeValue || '').length));
+      range.setStart(node, off);
+      range.setEnd(node, Math.min(off + 20, len));
       cfi = topHit.c.cfiFromRange(range) || '';
     }
   } catch (_) { /* CFI 抓取失败：只上报文本，不影响落库 */ }
@@ -585,6 +619,160 @@ function _captureViewport() {
 function _captureViewportAnchorCfi() {
   const vp = _captureViewport();
   return (vp && vp.cfi) || null;
+}
+
+// ── 视口文字（阅读页聊天注入）─────────────────────────────────────────
+
+const _TEXT_BLOCK_TAGS = new Set([
+  'P', 'LI', 'BLOCKQUOTE', 'PRE', 'FIGCAPTION', 'DT', 'DD',
+  'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'TD', 'TH',
+]);
+const _SKIP_VP_TAGS = new Set([
+  'SCRIPT', 'STYLE', 'NOSCRIPT', 'SVG', 'IMG', 'HR', 'BR',
+  'VIDEO', 'AUDIO', 'CANVAS', 'IFRAME', 'OBJECT',
+]);
+
+/** 这一段元素本身承载正文（而不是容器）吗？
+ *  已知段落/标题标签直接算；其余元素看子元素是不是都是 inline ——
+ *  div>p 这种容器必须继续下钻，否则会重复收录整棵子树的文字。 */
+function _isTextBlock(el) {
+  if (_TEXT_BLOCK_TAGS.has(el.tagName)) return true;
+  const win = el.ownerDocument.defaultView;
+  for (const c of el.children) {
+    let display = '';
+    try { display = win ? win.getComputedStyle(c).display : ''; } catch (_) {}
+    if (display && !/^(inline|contents|ruby)/.test(display)) return false;
+  }
+  return !!(el.textContent || '').trim();
+}
+
+/** 块内落在 [y0, y1] 的文字，首尾按行裁切。
+ *  rect 是块在 iframe 文档里的 rect（iframe 内容不滚动：视口坐标 = 文档坐标）。 */
+function _visibleBlockText(block, rect, y0, y1) {
+  const doc = block.ownerDocument;
+  const range = doc.createRange();
+  range.selectNodeContents(block);
+  if (rect.top < y0) {
+    const n = _textNodeAtY(doc, y0);
+    if (n && block.contains(n)) {
+      try { range.setStart(n, _charOffsetAtY(n, y0)); } catch (_) {}
+    }
+  }
+  if (rect.bottom > y1) {
+    const n = _textNodeAtY(doc, y1);
+    if (n && block.contains(n)) {
+      try { range.setEnd(n, _charOffsetAtY(n, y1)); } catch (_) {}
+    }
+  }
+  return _normWs(range.toString());
+}
+
+/** 一个 section 文档里落在 [y0, y1] 的正文，按阅读顺序、块间空行分隔。 */
+function _collectVisibleText(doc, y0, y1) {
+  const body = doc.body || doc.documentElement;
+  if (!body) return '';
+  const parts = [];
+  const walk = (root) => {
+    for (const el of root.children) {
+      if (_SKIP_VP_TAGS.has(el.tagName)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom <= y0 || r.top >= y1) continue;
+      if (_isTextBlock(el)) {
+        const t = _visibleBlockText(el, r, y0, y1);
+        if (t) parts.push(t);
+      } else {
+        walk(el);
+      }
+    }
+  };
+  walk(body);
+  return parts.join('\n\n');
+}
+
+/** 视口内实际渲染的全部文字（跨 section 拼接），供阅读页聊天注入。
+ *
+ *  与 /api/sync 的指纹文本不同：这里给的是「读者屏幕上真正看得到的文字」，
+ *  首尾按行裁切、按阅读顺序拼接；跨 section 时每段带 sectionIndex，后端据此
+ *  对齐到数据库块。只读，发送消息时调用一次。 */
+export function captureViewportText() {
+  if (destroyed || !rendition) return null;
+  const scroller = _getScroller();
+  if (!scroller) return null;
+  const sr = scroller.getBoundingClientRect();
+  if (!sr.height) return null;
+  const sections = [];
+  for (const c of rendition.getContents() || []) {
+    const frame = c.window ? c.window.frameElement : null;
+    if (!frame) continue;
+    const fr = frame.getBoundingClientRect();
+    const top = Math.max(sr.top, fr.top);
+    const bottom = Math.min(sr.bottom, fr.bottom);
+    if (bottom - top <= 4) continue;
+    const text = _collectVisibleText(c.document, top - fr.top, bottom - fr.top);
+    if (text) {
+      sections.push({
+        sectionIndex: c.sectionIndex,
+        visiblePx: Math.round(bottom - top),
+        text,
+      });
+    }
+  }
+  if (!sections.length) return null;
+  return {
+    text: sections.map(s => s.text).join('\n\n'),
+    sections,
+  };
+}
+
+/** 文本节点内、视口顶 y 所在那一行的行首字符偏移（_captureViewport 用）。
+ *
+ *  取「第一行完全落在视口顶之下」的行首：二分 top >= y。不用「跨过 y 的
+ *  那一行」——恢复链（_scrollToCfiLoop）刻意把锚落在视口顶下方 24px，跨过
+ *  y 的是上一行末尾露出的那 24px；按它取锚会让每次重开都向上退一行，
+ *  反复开关就是一条向上的棘轮。只收敛到行首、不做行内水平定位：像素级锚
+ *  在任何版式变化后都会指错文本，行首已足够让重开落在同一行。
+ *
+ *  ⚠️ 单字符 rect 在空格/换行处可能为零宽或为空：空 rect 时扩到相邻字符
+ *  再量一次。CJK 正文几乎不会走到这条兜底。 */
+function _charOffsetAtY(node, yInFrame) {
+  const text = node.nodeValue || '';
+  const len = text.length;
+  if (!len) return 0;
+  const doc = node.ownerDocument;
+  const range = doc.createRange();
+  const lineRect = (i) => {
+    range.setStart(node, i);
+    range.setEnd(node, Math.min(i + 1, len));
+    let r = range.getBoundingClientRect();
+    if (!r || (!r.width && !r.height)) {
+      range.setStart(node, Math.max(0, i - 1));
+      range.setEnd(node, Math.min(len, i + 2));
+      r = range.getBoundingClientRect();
+      if (!r || (!r.width && !r.height)) {
+        const rs = range.getClientRects();
+        r = rs.length ? rs[rs.length - 1] : null;
+      }
+    }
+    return r && (r.width || r.height) ? r : null;
+  };
+  // 1) 第一行完整可见（行顶不低于视口顶）
+  let lo = 0, hi = len - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = lineRect(mid);
+    if (!r || r.top >= yInFrame) { ans = mid; hi = mid - 1; }
+    else lo = mid + 1;
+  }
+  if (ans >= 0) return ans;
+  // 2) 视口顶落在最后一行内部（或节点已整段滚到上方）：回退到跨过 y 的行
+  lo = 0; hi = len - 1; ans = len - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const r = lineRect(mid);
+    if (!r || r.bottom > yInFrame) { ans = mid; hi = mid - 1; }
+    else lo = mid + 1;
+  }
+  return Math.max(0, Math.min(ans, len - 1));
 }
 
 /** y 处（或 y 下方最近）的非空文本节点 —— _captureViewport 的视口顶探针。 */
@@ -1240,7 +1428,16 @@ function _readerThemeCss() {
   const ff = read('--t-reader-font-family')
     || '"Noto Serif SC", "Source Han Serif SC", "Songti SC", Georgia, serif';
   const link = read('--t-link') || '#4a90d9';
-  const sel = read('--t-reader-selection-color') || '#e8f0e0';
+  // 选中态两层：底色由主题页「高亮颜色/透明度/亮度」合成，字色单独一项。
+  // 旧库没有 --t-reader-selection-bg 时退回字色，保持原来的观感。
+  const selText = read('--t-reader-selection-color') || '#e8f0e0';
+  const selBg = read('--t-reader-selection-bg') || selText;
+  // 沉浸阅读：正文列居中。版心宽度来自主题页（--t-reader-measure，
+  // 默认 54em），必须与 style.css 的 `.book-page-inner` 同源，否则
+  // chunk/native 切换时版心会跳。
+  // 类挂 <html> 上，_watchTheme 能观察到 class 变化并在进出模式时重放。
+  const focusMode = document.documentElement.classList.contains('reading-focus');
+  const measure = read('--t-reader-measure') || '54em';
   const css = [
     'html, body { background-color: ' + bg + ' !important; }',
     'body { color: ' + fg + ' !important; font-size: ' + fs + ' !important;'
@@ -1253,7 +1450,7 @@ function _readerThemeCss() {
       + ' body samp, body samp *, body tt, body tt *, body var, body var *'
       + ' { font-family: "Cascadia Code", Consolas, "Courier New", monospace !important; }',
     'a, a:link, a:visited { color: ' + link + ' !important; }',
-    '::selection { background: ' + sel + ' !important; }',
+    '::selection { background: ' + selBg + ' !important; color: ' + selText + ' !important; }',
     // 标注层（iframe 内部分）——marker 样式随主题注入，幂等。
     // 收藏下划线不在 iframe：epub.js SVG Pane 挂在主文档 view 容器，样式在 style.css
     // 批注 marker = morphicons 驱动的 chevron path：亮蓝定色（不随正文），
@@ -1266,6 +1463,14 @@ function _readerThemeCss() {
     '.bc-ann-cmt svg { width:18px; height:18px; display:block; }',
     '.bc-ann-cmt svg path { fill:none; stroke:currentColor; stroke-width:2;'
       + ' stroke-linecap:round; stroke-linejoin:round; }',
+    // 沉浸态保留批注 marker：它标记「作者在这句话上写过东西」，隐掉等于
+    // 把批注从阅读里抹掉。marker 有自己的点击语义（focus-mode.js 的
+    // INTERACTIVE 里有 .bc-ann-cmt），气泡/编辑面板在沉浸态也放行
+    // （style.css 的阅读态隐藏清单，别再把它们加回去）。
+    focusMode
+      ? 'body { max-width: ' + measure + ' !important; margin: 0 auto !important;'
+        + ' padding: 0 4% !important; box-sizing: border-box !important; }'
+      : '',
   ].join('\n');
   return { css: css, bg: bg, vars: {
     '--t-reader-bg-color': bg,
@@ -1841,6 +2046,33 @@ function _kickContinuousFill() {
   } catch (_) { /* best-effort：补载驱动失败不影响阅读主链路 */ }
 }
 
+/** 解开「在途补载撞上 clear()」造成的 manager 队列死锁。
+ *
+ *  触发链（实测 2026-11-04，收起/展开交互页稳定复现）：
+ *    rendition.resize() → manager.resize() 同尺寸不同时同步 clear()
+ *      → views.clear() destroy 掉所有 view/iframe
+ *  而 continuous manager 的补载 check() 正挂在 manager.q 上，
+ *  `await Promise.all(views.map(v => v.display(request)))` 用的就是这批 view。
+ *  iframe 被 destroy 后 load 事件不再触发，Promise 永久 pending →
+ *  manager.q 的队头卡死，之后每次滚动 enqueue 的 check 全排在它后面
+ *  （实测收起后 300ms 已积压 14 条、展开后 46 条），补载再不执行；
+ *  容器里只剩 display(cfi) 渲染的那一个 section，滚到底就顶墙。
+ *
+ *  check/update 都是幂等的：丢弃积压任务、复位 running/paused 后
+ *  _kickContinuousFill 重跑一次即可恢复（实测 views 1→16、滚动恢复）。
+ *  在途任务的结果不再有人消费，但它本身也无副作用。 */
+function _resetManagerFillQueue() {
+  const m = rendition && rendition.manager;
+  const q = m && m.q;
+  if (!q) return;
+  try {
+    if (typeof q.stop === 'function') q.stop();  // _q=[] + running=false + paused=true
+    if (Array.isArray(q._q)) q._q.length = 0;
+    q.paused = false;                            // stop() 的副作用，必须复位
+    q.running = false;
+  } catch (_) { /* 队列结构随 fork 版本变化时保持原状 */ }
+}
+
 // ── 用户意图 ─────────────────────────────────────────────────────────
 
 /** 人类输入 → 打开上报窗口。这是 _commitViewport 放行的唯一依据。
@@ -1887,6 +2119,20 @@ function _programTimerClear(stopNow = false) {
   }
 }
 
+function _notifyContentPointerDown(e, doc) {
+  for (const cb of _contentPointerCbs) {
+    try { cb(e, doc); }
+    catch (e) { console.warn('[epub-reader] contentPointer 回调异常:', e); }
+  }
+}
+
+function _notifyContentClick(e, doc) {
+  for (const cb of _contentClickCbs) {
+    try { cb(e, doc); }
+    catch (err) { console.warn('[epub-reader] contentClick 回调异常:', err); }
+  }
+}
+
 function _bindUserEngage() {
   if (_engageBound) return;
   _engageBound = true;
@@ -1899,16 +2145,43 @@ function _bindUserEngage() {
 // 正文里的输入，意图窗口打不开、进度永不落库。这里把同一组监听补挂到每个
 // 已渲染 section 的 iframe document 上（rendered 事件后调用，Set 幂等去重）。
 // 程序性滚动不产生这些事件，语义不受影响。
+// 出版方转换的 EPUB 常把页码写进每个段落的 title：
+//   <p title="pagenumber_ebook=6,pagenumber_book=6">…
+// 浏览器把它当原生 tooltip，鼠标一停在正文上就弹一个白底黑框。
+// 阅读界面只该出现正文，渲染后摘掉这类标题（只认页码形态，正文自带的
+// title 不碰；属性不影响 CFI/选区/批注锚点）。
+const _PAGE_NUMBER_TITLE_RE = /pagenumber_(?:ebook|book)\b/i;
+
+function _stripPageNumberTitles(doc) {
+  try {
+    for (const el of doc.querySelectorAll('[title]')) {
+      const raw = el.getAttribute('title') || '';
+      if (_PAGE_NUMBER_TITLE_RE.test(raw)) el.removeAttribute('title');
+    }
+  } catch (_) { /* 坏 section 不影响其余 */ }
+}
+
 function _bindUserEngageOnContents() {
   if (!rendition || destroyed) return;
   try {
     for (const c of rendition.getContents() || []) {
       const doc = c && c.document;
-      if (!doc || _engageDocs.has(doc)) continue;
+      if (!doc) continue;
+      // 幂等且便宜：同一 document 原地重渲染时也要把新长出来的 title 摘掉。
+      _stripPageNumberTitles(doc);
+      if (_engageDocs.has(doc)) continue;
       _engageDocs.add(doc);
       for (const ev of USER_INPUT_EVENTS) {
         doc.addEventListener(ev, _markUserIntent, { passive: true, capture: true });
       }
+      // 正文 iframe 内的点击同样会触发「点面板外关闭」。
+      doc.addEventListener('pointerdown', function (e) {
+        _notifyContentPointerDown(e, doc);
+      }, { passive: true, capture: true });
+      // 沉浸阅读的进出判定要 click（pointerdown 拿不到 detail / 选区终态）。
+      doc.addEventListener('click', function (e) {
+        _notifyContentClick(e, doc);
+      }, true);
     }
   } catch (_) { /* best-effort：个别坏 section 不影响其余 */ }
 }
@@ -2091,8 +2364,10 @@ function _updateMetaFromPos(p) {
       : ('第 ' + (ch + 1) + ' 章');
     meta.textContent = label + ' · 段落 ' + (ck + 1) + '/' + total;
   }
-  const pos = document.getElementById('chunkPos');
-  if (pos) pos.textContent = (ck + 1) + ' / ' + total;
+  // 右上角与沉浸阅读底栏同一份全书进度；章内段号仍在 positionMeta 里。
+  const bp = bookProgress(ch, ck, S.bookChunkOffsets, S.bookChunkTotal);
+  paintProgress(document.getElementById('chunkPos'), bp);
+  paintProgress(document.getElementById('focusProgress'), bp);
   const chSel = document.getElementById('chapterSelect');
   if (chSel) chSel.value = String(ch);
   if (p.chapter_title && typeof window.updateContextBar === 'function') {

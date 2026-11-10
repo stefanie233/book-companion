@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 from permissions import PermissionMode
+from runtime_paths import data_path, user_root
 from tools.registry import ToolExposure, ToolRegistry, ToolSpec
 
 
@@ -54,7 +55,7 @@ def _resolve_voice(voice: str, book_id: str, wingman_db: Any,
         if not clone:
             result["error"] = f"未找到克隆音色 '{clone_name}'，请检查 voices.py 的 CLONE_VOICES"
             return result
-        ref_path = Path(__file__).parent / clone["ref_audio"]
+        ref_path = Path(user_root()) / clone["ref_audio"]
         b64 = _read_audio_as_b64(ref_path)
         if not b64:
             result["error"] = f"克隆参考音频文件不存在: {clone['ref_audio']}"
@@ -84,7 +85,7 @@ def _resolve_voice(voice: str, book_id: str, wingman_db: Any,
     if wingman_db and book_id:
         role = wingman_db.get_voice_role(book_id, voice)
         if role:
-            ref_path = Path(__file__).parent / role["ref_audio_path"]
+            ref_path = Path(user_root()) / role["ref_audio_path"]
             b64 = _read_audio_as_b64(ref_path)
             if b64:
                 result["model"] = "mimo-v2.5-tts-voiceclone"
@@ -127,7 +128,7 @@ def _tool_tts_speak(text: str, voice: str = "茉莉", style: str = "",
     voice_value = resolved.get("voice_value")
     user_msg = resolved.get("user_msg")
 
-    voice_dir = Path(__file__).parent / "data" / "voice" / "tts"
+    voice_dir = data_path("voice", "tts")
     voice_dir.mkdir(parents=True, exist_ok=True)
 
     cache_payload = f"{text}|{model}|{voice_value or ''}|{user_msg or ''}"
@@ -216,7 +217,7 @@ async def _tool_tts_speak_async(text: str, voice: str = "茉莉", style: str = "
     voice_value = resolved.get("voice_value")
     user_msg = resolved.get("user_msg")
 
-    voice_dir = Path(__file__).parent / "data" / "voice" / "tts"
+    voice_dir = data_path("voice", "tts")
     voice_dir.mkdir(parents=True, exist_ok=True)
 
     cache_payload = f"{text}|{model}|{voice_value or ''}|{user_msg or ''}"
@@ -303,7 +304,7 @@ async def _tool_voice_design_async(book_id: str, character_name: str, prompt: st
     if not wingman_db:
         return json.dumps({"error": "音色数据库不可用"})
 
-    ref_dir = Path(__file__).parent / "data" / "voice" / "refs"
+    ref_dir = data_path("voice", "refs")
     ref_dir.mkdir(parents=True, exist_ok=True)
 
     # Sanitize character name for filename

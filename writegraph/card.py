@@ -29,6 +29,9 @@ SECTION_KEYS = tuple(k for k, _ in SECTIONS)
 
 MAX_CHARACTERS = 20
 MAX_RISKS = 5
+#: 休眠线索：超过这么多章没推进，只在风险栏提一句（提示，不是义务）。
+DORMANT_AFTER = 5
+MAX_DORMANT = 2
 
 
 class CardIncomplete(RuntimeError):
@@ -83,15 +86,45 @@ def _character_lines(rows, focus_refs, name_of) -> list[str]:
         parts: list[str] = []
         for field_name in facts_mod.CARD_FIELDS:
             row = items.get(field_name)
-            parts.append(f"{field_name}："
-                         + (facts_mod.describe(row) if row else "未知"))
+            text = facts_mod.describe(row) if row else "未知"
+            # 作者亲手写的事实带标记：结算改不动它们，agent 得知道为什么。
+            if row and str(row.get("source_kind") or "") == "author":
+                text += "〔作者〕"
+            parts.append(f"{field_name}：{text}")
         lines.append(f"- {label} —— " + "；".join(parts))
     return lines
 
 
-def _risk_lines(overdue, contract, extra_risks) -> list[str]:
+def _dormant_lines(rows, chapter: int, groups) -> list[str]:
+    """超过 ``DORMANT_AFTER`` 章没动的开放承诺。
+
+    只提示，不升级为五类义务——义务是「这一章必须做什么」，休眠是
+    「你可能忘了它」。已经在逾期/到期/临近栏里的不重复出现。
+    """
+    covered = {str(p.get("id")) for key in promises_mod.CATEGORIES
+               for p in groups.get(key) or ()}
+    lines: list[str] = []
+    for row in rows:
+        pid = str(row.get("id") or "")
+        status = str(row.get("status") or "")
+        last = row.get("last_touched_chapter")
+        if not pid or pid in covered or last is None:
+            continue
+        if status in ("resolved", "abandoned"):
+            continue
+        idle = chapter - int(last)
+        if idle < DORMANT_AFTER:
+            continue
+        lines.append(f"- [承诺 {pid}] 已 {idle} 章未推进：{row.get('title')}")
+    return lines[:MAX_DORMANT]
+
+
+def _risk_lines(overdue, contract, extra_risks, dormant=()) -> list[str]:
     lines = [f"- [承诺 {p.get('id')}] 逾期未收：{p.get('title')}"
              for p in overdue[:3]]
+    lines.extend(dormant)
+    for item in (contract.get("withhold") or [])[:1]:
+        lines.append(f"- [合同 withhold] 可以写但不点破：{item}")
     for item in (contract.get("forbidden_cross") or [])[:2]:
         lines.append(f"- [合同 forbidden_cross] 禁止触碰：{item}")
     for item in list(extra_risks or [])[:2]:
@@ -141,7 +174,8 @@ def build_card(*, work: Mapping[str, Any], chapter: Mapping[str, Any],
         {"key": "recent", "lines": recent},
         {"key": "next_chapter", "lines": must_hit[:5]},
         {"key": "risks",
-         "lines": _risk_lines(groups["overdue"], contract, extra_risks)},
+         "lines": _risk_lines(groups["overdue"], contract, extra_risks,
+                              _dormant_lines(list(promise_rows), pos, groups))},
     ]
     for section in sections:
         if not section["lines"]:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Book Companion — CLI entry point.
+"""Liubai — CLI entry point.
 
 A reading companion / psychological agent with:
 - Persona system (SOUL.md)
@@ -51,7 +51,7 @@ def _print_greeting(config: Config, mode_label: str = "沉浸伴读") -> None:
     model = config.model
     print(f"""
 ╔══════════════════════════════════════════╗
-║         书伴 Book Companion              ║
+║               留白 Liubai                ║
 ║         Your Reading & Growth Partner    ║
 ╚══════════════════════════════════════════╝
 
@@ -365,7 +365,7 @@ def _port_occupied(port: int) -> str:
     try:
         with urlopen(f"http://127.0.0.1:{port}/api/health", timeout=1) as resp:
             info = json.loads(resp.read().decode("utf-8"))
-        return (f"端口 {port} 上已有一个 Book Companion 实例在跑"
+        return (f"端口 {port} 上已有一个 Liubai 实例在跑"
                 f"（pid {info.get('pid')}，启动于 {info.get('started', '?')}）。")
     except Exception:
         pass
@@ -390,7 +390,7 @@ async def main_async() -> None:
     # Force UTF-8 output on Windows consoles that default to GBK
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    config = load_config(Path.cwd())
+    config = load_config()
 
     # ── 端口占用闸 ────────────────────────────────────────────────
     # 必须在解析 .env / 预热模型之前：另一个实例还在跑时，本次启动没有意义，
@@ -437,7 +437,7 @@ async def main_async() -> None:
     session_db.initialize()
     # Hook pipeline
     hook_pipeline = HookPipeline()
-    hooks_dir = config.project_dir / "hooks"
+    hooks_dir = getattr(config, "resource_dir", config.project_dir) / "hooks"
     hook_pipeline.discover(hooks_dir)
     if hook_pipeline.handler_count() > 0:
         print(f"Loaded {hook_pipeline.handler_count()} hook handlers "
@@ -507,7 +507,7 @@ async def main_async() -> None:
     background_tasks.add(save_task)
     save_task.add_done_callback(background_tasks.discard)
 
-    # ── Book Companion API server (background) ──────────────────────────
+    # ── Liubai API server (background) ──────────────────────────
     from api_server import create_app as create_api_app
     from aiohttp import web
 
@@ -521,7 +521,7 @@ async def main_async() -> None:
     # Create & register BEFORE app setup (aiohttp disallows mutation after)
     try:
         from services.watcher_service import WatchService
-        watcher = WatchService(books_db, Path("data/watch"))
+        watcher = WatchService(books_db, config.project_dir / "data" / "watch")
         api_app["watcher"] = watcher
     except Exception as exc:
         print(f"  Watcher: not created ({exc})")
@@ -573,7 +573,7 @@ async def main_async() -> None:
     # Start watching after server is ready
     if api_app.get("watcher"):
         api_app["watcher"].start()
-        print(f"  Watcher: {Path('data/watch').resolve()} (auto-import EPUB/MOBI)")
+        print(f"  Watcher: {config.project_dir / 'data' / 'watch'} (auto-import EPUB/MOBI)")
 
     # ── Prompt toolkit setup ──────────────────────────────────────────
     try:
@@ -760,7 +760,7 @@ async def main_async() -> None:
         try:
             if use_rich_input:
                 user_input = await prompt_session.prompt_async([
-                    ("class:prompt", "书伴 "),
+                    ("class:prompt", "留白 "),
                     ("", "> "),
                 ])
                 user_input = user_input.strip()
@@ -768,7 +768,7 @@ async def main_async() -> None:
                     print("\nGoodbye!")
                     break
             else:
-                user_input = (await asyncio.to_thread(input, "书伴> ")).strip()
+                user_input = (await asyncio.to_thread(input, "留白> ")).strip()
         except (EOFError, KeyboardInterrupt):
             print("\nGoodbye!")
             break
@@ -927,7 +927,7 @@ async def main_async() -> None:
                 elif m.role == "assistant":
                     for b in m.blocks:
                         if b.type == "text" and b.text:
-                            session_lines.append(f"书伴：{b.text.strip()}")
+                            session_lines.append(f"留白：{b.text.strip()}")
             session_text = "\n\n".join(session_lines)
 
             if session_text.strip():

@@ -5,6 +5,7 @@ from aiohttp import web
 
 from api.text_helpers import _type_label
 from file_readers.epub_semantics import VALID_CHAPTER_TYPES
+from services.annotation_events import record_annotation_event
 
 
 
@@ -110,11 +111,12 @@ async def handle_clear_override(request: web.Request) -> web.Response:
 
 
 async def handle_list_annotations(request: web.Request) -> web.Response:
-    """List annotations with three query modes.
+    """List annotations with four query modes.
 
     ?stable_book_id=X            — all annotations for a book
     ?stable_book_id=X&chunk=Z    — annotations for a specific chunk
-    ?type=note                   — all notes (cross-book)
+    ?type=note                   — all notes (cross-book, 笔记页)
+    ?stable_book_id=X&type=note  — that book's notes (阅读页「本章批注」)
     """
     db = request.app["db"]
     stable_book_id = request.query.get("stable_book_id", "")
@@ -122,12 +124,58 @@ async def handle_list_annotations(request: web.Request) -> web.Response:
     ann_type = request.query.get("type", "")
 
     if ann_type in ("note", "highlight"):
-        limit = int(request.query.get("limit", "50"))
-        offset = int(request.query.get("offset", "0"))
-        rows = db.get_annotations_by_type(ann_type, limit=limit, offset=offset)
+
+        def _int(name: str, default: int) -> int:
+            raw = request.query.get(name)
+            if raw is None or raw == "":
+                return default
+            try:
+                return max(0, int(raw))
+            except ValueError:
+                return default
+
+        # 左栏泳道要的是每本书的条数，不是批注行。?counts=1 只回汇总。
+        if request.query.get("counts") in ("1", "true"):
+            counts = db.count_annotations_by_book(ann_type)
+            return web.json_response({
+                "counts": counts,
+                "total": sum(counts.values()),
+            })
+
+        limit = _int("limit", 50)
+        offset = _int("offset", 0)
+        # type 与 stable_book_id 同时给时要真的按书过滤：阅读页浮窗就是
+        # 这个组合，早先只看 type 会把全库批注倒进来（《窄门》里冒出
+        # 《地下室手记》的笔记）。不给 stable_book_id 才是跨书列表。
+        rows, total = db.query_annotations(
+            ann_type,
+            stable_book_id=stable_book_id or None,
+            color=request.query.get("color") or None,
+            query=(request.query.get("q") or "").strip() or None,
+            sort=request.query.get("sort", "time-desc"),
+            limit=limit,
+            offset=offset,
+        )
+        # 笔记页按「书 → 章」分组要章名。每本书查一次标题（不是每行一次）；
+        # book_id 为空（孤儿批注）就没有章名，前端退回「第 N 章」。
+        titles: dict[str, dict[int, str]] = {}
+        for r in rows:
+            bid = getattr(r, "book_id", None)
+            if bid and bid not in titles:
+                titles[bid] = db.get_chapter_titles(bid)
+        items = []
+        for r in rows:
+            item = _annotation_to_dict(r)
+            item["chapter_title"] = titles.get(item.get("book_id") or "", {}).get(
+                item.get("chapter_index")
+            ) or ""
+            items.append(item)
         return web.json_response({
-            "annotations": [_annotation_to_dict(r) for r in rows],
-            "count": len(rows),
+            "annotations": items,
+            "count": len(items),
+            "total": total,
+            "limit": limit,
+            "offset": offset,
         })
 
     if not stable_book_id:
@@ -186,8 +234,10 @@ async def handle_create_annotation(request: web.Request) -> web.Response:
 
     color = str(body.get("color", "#FFD54F"))
     note_text = str(body.get("note_text", "")) if body.get("note_text") else None
-    # v16: native 标注层——收藏样式（首版仅 underline）+ CFI 精确定位
-    style = str(body.get("style", "underline")) if ann_type == "highlight" else None
+    # v16: native 标注层——收藏样式（underline 下划线 / box 框选）+ CFI 精确定位
+    # 只认这两个值：库里 style 为空的历史收藏一律按 underline 渲染。
+    style = ("box" if str(body.get("style", "")).strip() == "box" else "underline") \
+        if ann_type == "highlight" else None
     cfi_range = str(body.get("cfi_range", "")) or None
 
     chapter_index = body.get("chapter_index")
@@ -231,6 +281,7 @@ async def handle_create_annotation(request: web.Request) -> web.Response:
         time_updated=now,
     )
     ann_id = db.insert_annotation(row)
+    record_annotation_event(db, row, "create")
 
     return web.json_response({"id": ann_id, "stable_book_id": stable_book_id}, status=201)
 
@@ -252,7 +303,15 @@ async def handle_update_annotation(request: web.Request) -> web.Response:
     if "type" in updates and updates["type"] not in ("highlight", "note"):
         return web.json_response({"error": "type must be highlight or note"}, status=400)
 
+    before = db.get_annotation(ann_id)
+    if before is None:
+        return web.json_response({"error": "Annotation not found"}, status=404)
+
+    changed = [k for k in updates if getattr(before, k, None) != updates[k]]
     db.update_annotation(ann_id, **updates)
+    if changed:
+        after = db.get_annotation(ann_id) or before
+        record_annotation_event(db, after, "update", changed_fields=changed)
     return web.json_response({"updated": True, "id": ann_id})
 
 
@@ -261,9 +320,14 @@ async def handle_delete_annotation(request: web.Request) -> web.Response:
     db = request.app["db"]
     ann_id = request.match_info["ann_id"]
 
+    before = db.get_annotation(ann_id)
+    if before is None:
+        return web.json_response({"error": "Annotation not found"}, status=404)
+
     deleted = db.delete_annotation(ann_id)
     if not deleted:
         return web.json_response({"error": "Annotation not found"}, status=404)
+    record_annotation_event(db, before, "delete")
 
     return web.json_response({"deleted": True, "id": ann_id})
 

@@ -23,6 +23,9 @@ BLOCKS = (
     ("facts_current", True, 100, None, "block", 900),
     ("prev_tail", True, 95, None, "block", 700),
     ("context_card", True, 90, None, "block", 1200),
+    # 作者的工作区（作品记忆 / 设定）。比作品图近一层，但仍是补充：
+    # 装不下先裁后丢，合同与账本永远不动。
+    ("work_docs", False, 85, 6, "degrade", 1400),
     ("work_graph_hood", False, 70, 5, "degrade", 700),
     ("user_preferences", False, 60, 4, "degrade", 400),
     ("recent_summaries", False, 50, 3, "degrade", 500),
@@ -36,6 +39,33 @@ SPECS = {b[0]: {"required": b[1], "priority": b[2], "drop_order": b[3],
                 "failure": b[4], "budget": b[5]} for b in BLOCKS}
 
 DEFAULT_TOTAL_BUDGET = 6000
+
+#: 写作子模式的块预算（决策 161）。细致模式只抬「可补充块」的余量，
+#: 必需块（合同/账本/上一章结尾/上下文卡）的语义不变；参考素材与工作区
+#: 多给一截，让 agent 选中的 refs 不至于一进门就被丢。
+MODE_PROFILES: dict[str, dict[str, Any]] = {
+    "standard": {"total": DEFAULT_TOTAL_BUDGET, "overrides": {}},
+    "detail": {
+        "total": 9000,
+        "overrides": {
+            "external_reference": 2000,
+            "reference_material": 1200,
+            "work_docs": 1800,
+            "recent_summaries": 800,
+            "context_card": 1600,
+        },
+    },
+}
+
+
+def profile_for(mode: str) -> dict[str, Any]:
+    """返回 ``{total, specs}``；不认识的模式按 standard 走。"""
+    prof = MODE_PROFILES.get(str(mode or "standard"), MODE_PROFILES["standard"])
+    specs = {bid: dict(spec) for bid, spec in SPECS.items()}
+    for bid, value in (prof.get("overrides") or {}).items():
+        if bid in specs:
+            specs[bid]["budget"] = int(value)
+    return {"total": int(prof["total"]), "specs": specs}
 
 
 class ProtectedContextOverflow(RuntimeError):
@@ -123,6 +153,7 @@ def compile_blocks(blocks: Mapping[str, str], *,
     ordered = [e for e in entries if e["required"]] + kept
     text = "\n\n".join(_titled(e) for e in ordered)
     dropped_ids = {e["id"] for e in dropped}
+    truncated_ids = {e["id"] for e in entries if e.get("reason", "").startswith("超出块预算")}
     manifest = {
         "total_tokens": used,
         "blocks": [{"id": e["id"], "tokens": e["tokens"],
@@ -131,4 +162,28 @@ def compile_blocks(blocks: Mapping[str, str], *,
                     "reason": e.get("reason", "")}
                    for e in entries],
     }
-    return {"text": text, "tokens": used, "manifest": manifest}
+    # 装配收据（决策 175）：只记身份、额度与取舍原因，不复制任何正文。
+    # 「哪些块被拒、为什么被拒、必需是否覆盖完整」必须可答，事后能复查
+    # 这次 prompt 为什么长这样；收据本身不含块内容，可以安全外传。
+    required_ids = [e["id"] for e in entries if e["required"]]
+    decision = {
+        "version": 1,
+        "budget": int(budget),
+        "used_tokens": used,
+        "required_tokens": required,
+        "coverage": {
+            "required": len(required_ids),
+            "included": len(required_ids),
+            "complete": True,
+        },
+        "blocks": [{"id": e["id"], "tokens": e["tokens"],
+                    "required": e["required"],
+                    "kept": e["id"] not in dropped_ids,
+                    "truncated": e["id"] in truncated_ids,
+                    "reason": e.get("reason", "")}
+                   for e in entries],
+        "dropped": sorted(dropped_ids),
+        "truncated": sorted(truncated_ids),
+    }
+    return {"text": text, "tokens": used, "manifest": manifest,
+            "decision": decision}

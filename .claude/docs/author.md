@@ -391,6 +391,7 @@ python scripts/test_author_sources.py      # 来源分级/引文校验/迁移/�
 python scripts/test_author_enrich_e2e.py   # 真提示词 + fake provider + 真落库
 python scripts/test_author_voice.py        # 声音：可见性/抽样/归一/合并/端到端
 python scripts/test_author_dossier.py      # 档案：投影/剧透门/覆盖度/来源/搜索/路由
+python scripts/test_author_details.py      # 攻略/依据闸门/钩子/Markdown 清洗（零 token）
 python scripts/test_writing_voice.py       # 写作透镜：预算/打分/注入/降级/风格检查
 python scripts/test_author_graph.py        # 旧作者层单测（含 agent 深挖通道）
 python scripts/check_all.py                # L0 全量（以上已列入 module-tests）
@@ -400,3 +401,149 @@ python scripts/run_voice_harvest.py --list
 python scripts/run_voice_harvest.py --book 我与地坛 --dry-run
 python scripts/run_voice_harvest.py --author 史铁生
 ```
+
+---
+
+## 五、采集攻略与细节（2026-11-05）
+
+### 149. 攻略是先验，不是证据
+
+新增 `author_exploration_plan`（`authorgraph/plan.py`）。它回答读之前
+「先去哪、花多少、什么先跳过」，**不回答「什么是真的」**。
+
+- 每条都有 `hypothesis / expected_basis / anchor_required /
+  expected_value / expected_cost / verification_action`，必须可证伪。
+- `list_type` 只有用户能改白/黑；**模型先验一律 `grey`** —— 它只能
+  影响预算排序，不能静默跳过一本书。黑名单是**目标级**的：同一 target
+  被黑掉后，模型换 hypothesis 重开的新条目也继承 black，绕不过去。
+- 身份 `provisional/conflict` 时不生成「某书是自传体」这类具体作品先验，
+  只留通用条目（读序跋）。同名会串账，这是不可逆的。
+- 规则攻略（`deterministic_plan`）零模型：有序跋就进灰名单；正文只在
+  `position=narrator` 或用户标记 `read_as=autobiographical` 时进。
+- 模型攻略（`model_plan`）一次调用，只认已入库书目；产出仍写 grey。
+- **每个 target 只有一个坑**：`upsert_plan` 按 (author, target) 复用
+  已有 `plan_id`，优先保留黑/白名单与已完成的那条；模型换措辞只更新
+  假设，不再新增条目。抽取本来就按 target 合并，多条只是页面噪音。
+- target 除 `#paratext` / `#body` 外，支持 `#chapter:<标题原词>`：目录里
+  点名的自序、附录、年表、致辞即使被导入分析误标成 `body`，也能按标题
+  精确读取；关键词必须原样出现在章标题里，由 `chunks_by_title` 取块。
+
+### 150. 观察与钩子分表，依据类型 × 通道
+
+新增 `author_observations` 与 `author_hooks`（`authorgraph/details.py`）。
+
+- 观察收**纹理**：习惯、口癖、居所、身体、关系张力、写作现场、对人的
+  判断、反复意象、忌讳。不是百科式生平。
+- 每条观察带：`topic / statement / quote / basis / basis_quote /
+  speaker / use / confidence`。`quote` 必须逐字命中候选块；找不到就
+  重定位，再找不到丢弃并报 `fabricated_quote`。
+- `basis` 与 `speaker` 是两道闸：译者序里的「作者自述」降级 `paratext`；
+  投射来自译者/编者/出版方 → 丢弃；`paratext` 缺说话人 → `reported`。
+- `use` 是第三道闸：投射不能进 `biography` / `roleplay_texture`，只能
+  `dossier`；转述不能进 `roleplay_texture`。
+- **置信度由代码推导**（`basis + speaker + 锚`），不让模型自报数字。
+- 钩子收「提到了但没说清」：`quote / known / missing / why /
+  suggested_action`。钩子不是事实，不进扮演/写作/时间轴；关闭时保留
+  「从哪条钩子来」的链。`chapter_index`（库 v5）随钩子落库，档案读侧
+  据此过剧透门；不知道章号时按「缺锚点不展示」处理。
+
+### 151. 用户标记 `read_as` 是投射锚
+
+`author_books.read_as='autobiographical'` 是用户给的书级锚。它让
+`autobiographical_projection` 可以带依据落库，但**不会把投射升格成
+传记事实**。没有用户标记或 `basis_quote` 的投射一律降级
+`fiction_projection`，`use` 只能是 `dossier`。
+
+### 152. DeepSeek Search/Fetch 作为作者层联网通道
+
+新增 `authorgraph/sources/web_deepseek.py`，复用
+`services/web_research_service.py` 的原始接口：
+
+- **Search 只产线索**：`summary/snippet/content` 都不能当引文；要引就
+  `fetch` 出正文。
+- **Fetch 的 Markdown 先洗净**（标题/强调/链接/代码标记），再用
+  `quote_located` 逐字比对 —— 不洗会把 `**` 当成原文。
+- `enrich_author` 可按端点自动选 DeepSeek（`deepseek.com` + key），
+  否则回退原有的原生搜索 + 本地抓页；两条通道的 `page` 形状一致。
+- **主模型不必是 DeepSeek**：控制台按调用点绑定，作者链路可能跑在火山
+  或别家。`web_deepseek.resolve()` 先看当前配置，不是 DeepSeek 就去
+  控制台连接表里找一条 `deepseek.com` 连接（key 只在内存里用）。找不到
+  才回退原生搜索；不静默换供应商。
+- 钩子闭合走 `sources/hook_close.py`：`missing` 搜索 → 抓页 → 一页一问
+  → 引文逐字命中才写 record/evidence 并 `close_hook`；对不上保持 open。
+- 未来新增联网 API 只改适配器，不改验证层；搜索结果/答案类接口默认
+  没有证据能力。
+
+### 153. 细节采集是独立进程、按攻略跑
+
+`scripts/run_author_details.py`：独立进程（服务内跑会冻事件循环）。
+
+```bash
+python scripts/run_author_details.py --list
+python scripts/run_author_details.py --author 史铁生 --plan
+python scripts/run_author_details.py --author 史铁生 --extract
+python scripts/run_author_details.py --book 小团圆 --read-as autobiographical --extract
+python scripts/run_author_details.py --author 史铁生 --close-hooks
+python scripts/run_author_details.py --author 阿尔贝·加缪 --plans
+python scripts/run_author_details.py --set-plan pl-xxxx black
+python scripts/run_author_details.py --all --plan --extract --dry-run
+```
+
+`--plans` 列出 `plan_id / list_type / status`；`--set-plan` 是**用户**
+改黑白名单的唯一入口（模型永远只能写 grey）。黑名单的攻略连
+`--force` 也不跑。
+
+幂等键：观察 `(author, book, chunk, quote, statement)`；钩子
+`(author, book, chunk, quote, missing)`；攻略 `(author, book, target,
+hypothesis)`。重跑就是恢复机制。**重跑的去重不看模型措辞**：同一原文
++ 同一 topic/basis/use 的观察复用旧行（同一句可支撑不同用途）；同一
+原文已有 open 钩子时不再开第二条。正文抽样有三档放行：用户标记
+`read_as=autobiographical`；作者以 `narrator` 写非虚构；或攻略预期
+是投射且作者以 `narrator`/`avatar` 在场（只产出投射与档案纹理，不升
+格成经历）。同一 target 的多条先验**任意一条**满足即可，且只抽样本，
+不扫整本。标题含「序/前言/后记/附录/年表/致辞」等的章不参与正文均匀
+抽样（避免把误分类的自序当小说正文），要读就用 `#chapter:` 点名。
+
+### 155. 钩子闭合：检索词由模型出，答案只认页面
+
+`run_author_details.py --close-hooks` 先调一次 `plan_queries`，把全部
+开放钩子交给模型出 1–2 组**短关键词**，再逐钩子搜索/抓页/一问一答。
+
+- **训练知识只管「去哪搜」**：人名、篇名、地名、机构名这类候选专名
+  允许写进检索词（「柏大夫」→「柏晓利」），但结论不许写进去。候选
+  专名是去核对，不是断言。
+- **确定性兜底**：模型漏掉原标题专名时，再补一条「作者名 + 缺口首句」
+  （按标点截断），插在模型第一组之后 —— 抓页有总数上限，兜底词不能
+  被挤到队尾。
+- 多组检索词的结果按 canonical URL 去重，抓页总数有上限（默认
+  每词 5 条、总计 10 页）；tier ≥ 4 的线索级页面一律不抓。
+- 一页一问只认这一页正文；`answered=true` 但引文对不上 → `quote_fail`
+  并保持 open。**部分补全也算闭合**，`note` 写明还缺什么；钩子不是
+  账本，闭合后仍保留原话与证据链。
+- 跑不掉的钩子就保持 open —— 它是缺口索引，不是待办欠款。
+
+### 157. 作者细节接口化：攻略可见，长任务独立进程
+
+作者层的触发点是用户驱动；接口化只是把终端里的四个动作搬到作者档案页：
+
+- **攻略先变成可见可审的东西**。`GET /api/authors/{id}/plans` 返回全部
+  攻略（含黑名单，带书名与 pending 计数）；`PATCH .../plans/{plan_id}`
+  是页面改名单的唯一入口，只收 `grey/white/black`。不做「模型建议按钮」
+  —— 模型的先验本来就只能是 grey。
+- **三个动作走后台任务**：`POST .../jobs` 收 `action`（`plan` /
+  `extract` / `close_hooks`）和 `force`，起独立子进程跑
+  `scripts/run_author_details.py`，不在 aiohttp 事件循环里调模型（与
+  图谱提取同一条教训）。返回 `202 + job_id`，前端轮询
+  `GET /api/authors/jobs/{job_id}`；状态机只有
+  `running/done/failed/cancelled`。
+- **串行**：同一时间只允许一个采集任务。子进程之间会抢 SQLite，
+  而这是低频、用户主动触发的操作，不需要并发。已有任务在跑时返回
+  `409` 并把当前任务带回去，让页面接着显示它的进度。
+- **进度只报事实**：stdout 逐行进内存环形缓冲 + 落
+  `data/logs/author_jobs/<job_id>.log`；结束行解析成摘要
+  （观察/钩子/闭合/失败）。任务记录只在内存，服务重启后历史任务消失
+  —— 日志还在，但不假装能恢复。
+- **页面**：细节页签顶部三个按钮 + 「重跑已完成」；攻略列表按书分组，
+  灰/白/黑三态可点；运行中显示日志尾部与「取消」。任务结束后自动
+  重取档案（保持当前页签），观察与钩子即时出现。轮询 2 秒，不用 SSE：
+  低频任务不值得再维护一条流。

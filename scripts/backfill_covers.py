@@ -21,7 +21,11 @@ except Exception:
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from storage.db import BookDB
-from services.library_service import extract_and_save_cover
+from services.library_service import (
+    cover_thumb_path,
+    extract_and_save_cover,
+    make_cover_thumb,
+)
 
 
 def main() -> None:
@@ -45,12 +49,21 @@ def main() -> None:
     for b in epub_books:
         bookbank = db._path.parent / "bookbank"
         # Check if cover already exists
-        existing = any(
-            (bookbank / f"{b.id}_cover.{ext}").exists()
-            for ext in ("jpg", "jpeg", "png", "gif", "webp", "svg")
+        cover_path = next(
+            (bookbank / f"{b.id}_cover.{ext}"
+             for ext in ("jpg", "jpeg", "png", "gif", "webp", "svg")
+             if (bookbank / f"{b.id}_cover.{ext}").exists()),
+            None,
         )
-        if existing:
-            print(f"  [skip] {b.title[:40]:40s}  (cover already exists)")
+        if cover_path is not None:
+            # 老封面没有缩略图：顺手补一份（幂等，已存在就跳过）
+            thumb = cover_thumb_path(cover_path)
+            if cover_path.suffix.lower() != ".svg" and not thumb.exists():
+                made = make_cover_thumb(cover_path)
+                note = f"thumb -> {made.name}" if made else "thumb skipped (already small / no Pillow)"
+            else:
+                note = "cover + thumb already exist"
+            print(f"  [skip] {b.title[:40]:40s}  ({note})")
             skipped += 1
             continue
 

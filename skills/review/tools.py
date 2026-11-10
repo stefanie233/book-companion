@@ -67,7 +67,7 @@ def register_tools(registry) -> None:
                     if ptype == "text":
                         text = d.get("text", "")
                         if text and text.strip():
-                            lines.append(f"书伴：{text.strip()}")
+                            lines.append(f"留白：{text.strip()}")
         return "\n\n".join(lines)
 
     async def _review_sessions_async(

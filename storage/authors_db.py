@@ -77,6 +77,27 @@ def _evidence_id(target_type: str, target_id: str, source_id: str,
     return f"ev-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
 
 
+def _plan_id(author_id: str, stable_book_id: str, target: str,
+             hypothesis: str) -> str:
+    key = "|".join((author_id, stable_book_id, target,
+                    " ".join(hypothesis.split())))
+    return f"pl-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _observation_id(author_id: str, stable_book_id: str, chunk_id: str,
+                    quote: str, statement: str) -> str:
+    key = "|".join((author_id, stable_book_id, chunk_id or "",
+                    " ".join(quote.split()), " ".join(statement.split())))
+    return f"ob-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _hook_id(author_id: str, stable_book_id: str, chunk_id: str,
+             quote: str, missing: str) -> str:
+    key = "|".join((author_id, stable_book_id, chunk_id or "",
+                    " ".join(quote.split()), " ".join(missing.split())))
+    return f"hk-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:16]}"
+
+
 def _trait_id(author_id: str, dimension: str, voice_domain: str,
               scope_type: str, scope_ref: str, statement: str) -> str:
     """trait 的身份：**同一句话**重跑得到同一个 id。
@@ -231,7 +252,37 @@ IDENTIFIER_SCHEMES = ("wikidata", "viaf", "isni", "openlibrary", "nlc",
 
 #: 证据目标类型（``author_evidence.target_type``）。
 EVIDENCE_TARGETS = ("record", "corpus", "relation", "claim",
-                    "voice_trait", "author_field")
+                    "voice_trait", "author_field",
+                    # 观察/钩子/攻略：它们也能带逐字证据。攻略本身不是证据，
+                    # 但「这条攻略被哪条证据坍缩」要查得回来。
+                    "observation", "hook", "plan")
+
+#: 观察（纹理）的主题。**不是传记分类** —— 这里收的是百科不写的细节：
+#: 习惯、口癖、居所、身体、关系张力、写作现场、对人的判断、反复意象、忌讳。
+OBSERVATION_TOPICS = ("habit", "language", "body", "dwelling", "relation",
+                      "writing_scene", "judgment", "motif", "fear", "other")
+
+#: 一条观察/钩子的「依据类型」。**先验不是它** —— 先验在
+#: ``author_exploration_plan`` 里，这一列只记观测到本体后的类型。
+OBSERVATION_BASES = ("author_statement", "paratext",
+                     "autobiographical_projection", "fiction_projection",
+                     "reported", "model")
+
+#: 观察的消费去向。**没有用途的不落库。**
+OBSERVATION_USES = ("biography", "roleplay_texture", "dossier")
+
+OBSERVATION_STATUSES = ("candidate", "accepted", "rejected", "superseded")
+OBSERVATION_CONFIDENCE = ("high", "medium", "low")
+
+HOOK_STATUSES = ("open", "closed", "rejected")
+HOOK_ACTIONS = ("web_search", "another_book", "ask_user")
+
+#: 攻略（先验）的词表。``list_type`` 只有用户能改白/黑；
+#: 模型先验一律 ``grey`` —— 它只影响预算排序，不许静默跳过。
+PLAN_LISTS = ("white", "black", "grey")
+PLAN_STATUSES = ("proposed", "confirmed", "refuted", "blocked", "done")
+PLAN_VALUES = ("high", "medium", "low", "unknown")
+PLAN_BASES = OBSERVATION_BASES
 
 #: 证据关系。``legacy_url_only`` 只给迁移来的旧数据：有网址、没正文引文。
 EVIDENCE_RELATIONS = ("supports", "contradicts", "contextualizes",
@@ -501,7 +552,110 @@ CORPUS_V2_INDEXES = [
 ]
 
 
+# ── v4：采集攻略 / 观察 / 钩子 ────────────────────────────────────────────
+#
+# 三张表回答三个不同的问题，**不要合并**：
+#   plan        读之前：预计哪里值得去（先验，允许错）
+#   observation 读之后：记下了什么纹理，依据是哪一类（观测，带逐字引文）
+#   hook        提到了但没说清：接下来该查什么（任务，不是事实）
+
+AUTHORS_DDL_V4 = [
+    f"""
+    CREATE TABLE IF NOT EXISTS author_exploration_plan (
+        plan_id         TEXT PRIMARY KEY,
+        author_id       TEXT NOT NULL REFERENCES {TABLE_AUTHORS}(author_id) ON DELETE CASCADE,
+        stable_book_id  TEXT NOT NULL DEFAULT '',
+        book_id         TEXT NOT NULL DEFAULT '',
+        target          TEXT NOT NULL,
+        scope           TEXT NOT NULL DEFAULT '',
+        hypothesis      TEXT NOT NULL DEFAULT '',
+        expected_basis  TEXT NOT NULL DEFAULT '',
+        anchor_required TEXT NOT NULL DEFAULT '',
+        expected_value  TEXT NOT NULL DEFAULT 'unknown',
+        expected_cost   INTEGER NOT NULL DEFAULT 1,
+        verification_action TEXT NOT NULL DEFAULT '',
+        list_type       TEXT NOT NULL DEFAULT 'grey',
+        status          TEXT NOT NULL DEFAULT 'proposed',
+        collapsed_by    TEXT NOT NULL DEFAULT '',
+        created_by      TEXT NOT NULL DEFAULT 'model_prior',
+        prompt_version  TEXT NOT NULL DEFAULT '',
+        yield_accepted  INTEGER NOT NULL DEFAULT 0,
+        yield_rejected  INTEGER NOT NULL DEFAULT 0,
+        time_created    INTEGER NOT NULL,
+        time_updated    INTEGER NOT NULL
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_aplan_author ON author_exploration_plan(author_id, status);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_aplan_key ON author_exploration_plan("
+    "author_id, stable_book_id, target, hypothesis);",
+    f"""
+    CREATE TABLE IF NOT EXISTS author_observations (
+        observation_id  TEXT PRIMARY KEY,
+        author_id       TEXT NOT NULL REFERENCES {TABLE_AUTHORS}(author_id) ON DELETE CASCADE,
+        stable_book_id  TEXT NOT NULL DEFAULT '',
+        book_id         TEXT NOT NULL DEFAULT '',
+        chunk_id        TEXT NOT NULL DEFAULT '',
+        chapter_index   INTEGER,
+        chunk_index     INTEGER,
+        topic           TEXT NOT NULL DEFAULT 'other',
+        statement       TEXT NOT NULL,
+        quote           TEXT NOT NULL DEFAULT '',
+        basis           TEXT NOT NULL DEFAULT '',
+        basis_quote     TEXT NOT NULL DEFAULT '',
+        speaker         TEXT NOT NULL DEFAULT '',
+        use             TEXT NOT NULL DEFAULT 'dossier',
+        status          TEXT NOT NULL DEFAULT 'candidate',
+        confidence      TEXT NOT NULL DEFAULT 'low',
+        prompt_version  TEXT NOT NULL DEFAULT '',
+        model           TEXT NOT NULL DEFAULT '',
+        content_hash    TEXT NOT NULL DEFAULT '',
+        time_created    INTEGER NOT NULL,
+        time_updated    INTEGER NOT NULL
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_aobs_author ON author_observations(author_id, status);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_aobs_key ON author_observations("
+    "author_id, stable_book_id, chunk_id, quote, statement);",
+    f"""
+    CREATE TABLE IF NOT EXISTS author_hooks (
+        hook_id         TEXT PRIMARY KEY,
+        author_id       TEXT NOT NULL REFERENCES {TABLE_AUTHORS}(author_id) ON DELETE CASCADE,
+        stable_book_id  TEXT NOT NULL DEFAULT '',
+        book_id         TEXT NOT NULL DEFAULT '',
+        chunk_id        TEXT NOT NULL DEFAULT '',
+        topic           TEXT NOT NULL DEFAULT 'other',
+        quote           TEXT NOT NULL DEFAULT '',
+        known           TEXT NOT NULL DEFAULT '',
+        missing         TEXT NOT NULL DEFAULT '',
+        why             TEXT NOT NULL DEFAULT '',
+        suggested_action TEXT NOT NULL DEFAULT 'web_search',
+        status          TEXT NOT NULL DEFAULT 'open',
+        closed_by       TEXT NOT NULL DEFAULT '',
+        priority        TEXT NOT NULL DEFAULT 'medium',
+        prompt_version  TEXT NOT NULL DEFAULT '',
+        time_created    INTEGER NOT NULL,
+        time_updated    INTEGER NOT NULL
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_ahook_author ON author_hooks(author_id, status);",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_ahook_key ON author_hooks("
+    "author_id, stable_book_id, chunk_id, quote, missing);",
+    # 用户标记「这本书按自传读」—— 这是投射升格的锚之一。
+    "ALTER TABLE author_books ADD COLUMN read_as TEXT NOT NULL DEFAULT '';",
+]
+
+#: v5：钩子也要带章号，档案页才能按剧透门裁剪。
+AUTHORS_DDL_V5 = [
+    "ALTER TABLE author_hooks ADD COLUMN chapter_index INTEGER;",
+]
+
+
 # ── Path resolution ───────────────────────────────────────────────────────
+
+def _default_user_root() -> Path:
+    from runtime_paths import user_root
+    return user_root()
+
 
 def resolve_authors_db_path(config: Any = None, root: Path | None = None) -> Path:
     """作者库路径。**全库一个文件**，与书无关 —— 所以没有 book_id 参数。
@@ -515,7 +669,7 @@ def resolve_authors_db_path(config: Any = None, root: Path | None = None) -> Pat
         # 调用方常把 Config 直接传进来；``project_dir`` 才是指向本仓库的
         # 那一个（测试也靠它指到临时目录，避免写真实作者库）。
         project = getattr(config, "project_dir", "")
-        base = Path(project) if project else Path(__file__).resolve().parent.parent
+        base = Path(project) if project else _default_user_root()
     return base / "data" / "authors.db"
 
 
@@ -536,7 +690,11 @@ class AuthorsDB(BaseDatabase):
     def initialize(self) -> None:
         """v1/v2 DDL 走通用迁移引擎；corpus 重建走 Python（要备份与事务）。"""
         super().initialize()
+        # v3 是 Python 事务迁移（重建表），必须排在通用引擎之后；
+        # v4 又依赖 v3 的表已就位，所以也走 Python 顺序执行。
         self._migrate_corpus_v2()
+        self._migrate_v4()
+        self._migrate_v5()
 
     # ── v3：author_corpus 重建 + 旧数据回填 ───────────────────────────────
     #
@@ -581,6 +739,43 @@ class AuthorsDB(BaseDatabase):
             "INSERT INTO schema_version (version, applied_at, description)"
             " VALUES (3, ?, ?)",
             (_now_ms(), "author corpus v2: rebuild + source backfill"))
+        conn.commit()
+
+    def _migrate_v4(self) -> None:
+        """v4：采集攻略 / 观察 / 钩子。幂等；失败整步回滚。"""
+        conn = self.get_conn()
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        if (row[0] or 0) >= 4:
+            return
+        # 老库可能已经有 read_as（手工加过）；ALTER 前先看列。
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(author_books)")}
+        with conn:
+            for ddl in AUTHORS_DDL_V4:
+                if ("read_as" in ddl and "author_books" in ddl and cols
+                        and "read_as" in cols):
+                    continue
+                conn.execute(ddl)
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at, description)"
+                " VALUES (4, ?, ?)",
+                (_now_ms(), "author exploration plan / observations / hooks"))
+        conn.commit()
+
+    def _migrate_v5(self) -> None:
+        """v5：author_hooks 加 chapter_index（剧透门需要）。"""
+        conn = self.get_conn()
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        if (row[0] or 0) >= 5:
+            return
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(author_hooks)")}
+        with conn:
+            if "chapter_index" not in cols:
+                for ddl in AUTHORS_DDL_V5:
+                    conn.execute(ddl)
+            conn.execute(
+                "INSERT INTO schema_version (version, applied_at, description)"
+                " VALUES (5, ?, ?)",
+                (_now_ms(), "author hooks: chapter_index for spoiler gate"))
         conn.commit()
 
     def _backup_file(self) -> None:
@@ -1297,6 +1492,294 @@ class AuthorsDB(BaseDatabase):
             "SELECT * FROM author_evidence WHERE author_id=?"
             " ORDER BY time_created DESC, id", (author_id,)).fetchall()
         return [dict(r) for r in rows]
+
+    # ── 采集攻略（先验）──────────────────────────────────────────────────
+
+    def upsert_plan(self, author_id: str, *, target: str,
+                    hypothesis: str, stable_book_id: str = "",
+                    book_id: str = "", scope: str = "",
+                    expected_basis: str = "", anchor_required: str = "",
+                    expected_value: str = "unknown", expected_cost: int = 1,
+                    verification_action: str = "", list_type: str = "grey",
+                    status: str = "proposed", created_by: str = "model_prior",
+                    prompt_version: str = "") -> str:
+        """写一条攻略。**用户条目不被模型覆盖** —— 只更新收益与时间。"""
+        aid = (author_id or "").strip()
+        hyp = " ".join((hypothesis or "").split())
+        if not aid or not (target or "").strip() or not hyp:
+            return ""
+        ltype = list_type if list_type in PLAN_LISTS else "grey"
+        val = expected_value if expected_value in PLAN_VALUES else "unknown"
+        basis = expected_basis if expected_basis in PLAN_BASES else ""
+        conn = self.get_conn()
+        # 攻略是「每个 target 一个坑」，不是假设集合：同一 target 已有条目
+        # 就复用它的 plan_id。否则模型每次换句措辞都会多出一条，页面上看着
+        # 像十几条互不相干的攻略，实际抽取时又按 target 合并。优先保留
+        # 用户黑名单/白名单与已完成的那条。
+        slot = conn.execute(
+            "SELECT plan_id FROM author_exploration_plan WHERE author_id=?"
+            " AND target=? ORDER BY CASE list_type WHEN 'black' THEN 0"
+            " WHEN 'white' THEN 1 ELSE 2 END,"
+            " CASE WHEN created_by='user' THEN 0 ELSE 1 END,"
+            " CASE WHEN status='done' THEN 0 ELSE 1 END, time_created"
+            " LIMIT 1", (aid, target.strip())).fetchone()
+        pid = (slot["plan_id"] if slot
+               else _plan_id(aid, stable_book_id or "", target.strip(), hyp))
+        # 黑名单是目标级的：同一 target 已被用户黑掉，模型换措辞新开的
+        # 条目也继承 black，不能靠重跑绕过去。
+        if ltype != "black" and conn.execute(
+                "SELECT 1 FROM author_exploration_plan WHERE author_id=?"
+                " AND target=? AND list_type='black' LIMIT 1",
+                (aid, target.strip())).fetchone():
+            ltype = "black"
+        row = conn.execute(
+            "SELECT plan_id, created_by, list_type, status FROM"
+            " author_exploration_plan WHERE plan_id=?", (pid,)).fetchone()
+        now = _now_ms()
+        if row:
+            # 用户设过白/黑，模型重跑不能把它改回灰；状态同理。
+            keep = row["created_by"] != "user"
+            sets = ["time_updated=?", "expected_value=?", "expected_basis=?",
+                    "expected_cost=?", "verification_action=?", "scope=?",
+                    "anchor_required=?", "prompt_version=?"]
+            vals: list[Any] = [now, val, basis, int(expected_cost or 1),
+                               verification_action or "", scope or "",
+                               anchor_required or "", prompt_version or ""]
+            if keep:
+                sets += ["created_by=?", "book_id=?", "hypothesis=?"]
+                vals += [created_by or "model_prior", book_id or "", hyp]
+            vals.append(pid)
+            conn.execute(
+                "UPDATE author_exploration_plan SET " + ", ".join(sets)
+                + " WHERE plan_id=?", vals)
+        else:
+            conn.execute(
+                "INSERT INTO author_exploration_plan (plan_id, author_id,"
+                " stable_book_id, book_id, target, scope, hypothesis,"
+                " expected_basis, anchor_required, expected_value,"
+                " expected_cost, verification_action, list_type, status,"
+                " created_by, prompt_version, time_created, time_updated)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (pid, aid, stable_book_id or "", book_id or "", target.strip(),
+                 scope or "", hyp, basis, anchor_required or "", val,
+                 int(expected_cost or 1), verification_action or "", ltype,
+                 status if status in PLAN_STATUSES else "proposed",
+                 created_by or "model_prior", prompt_version or "", now, now))
+        conn.commit()
+        return pid
+
+    def plans_for(self, author_id: str, *, stable_book_id: str | None = None,
+                  open_only: bool = True) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM author_exploration_plan WHERE author_id=?"
+        args: list[Any] = [author_id]
+        if stable_book_id is not None:
+            sql += " AND stable_book_id=?"
+            args.append(stable_book_id)
+        if open_only:
+            sql += " AND list_type<>'black' AND status IN ('proposed','confirmed')"
+        sql += (" ORDER BY CASE expected_value WHEN 'high' THEN 0"
+                " WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END,"
+                " time_created")
+        return [dict(r) for r in self.get_conn().execute(sql, args).fetchall()]
+
+    def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+        if not plan_id:
+            return None
+        row = self.get_conn().execute(
+            "SELECT * FROM author_exploration_plan WHERE plan_id=?",
+            (plan_id,)).fetchone()
+        return dict(row) if row else None
+
+    def set_plan_list(self, plan_id: str, list_type: str) -> bool:
+        """用户改白/黑名单。``created_by`` 一并改成 user，之后模型不再覆盖。"""
+        if list_type not in PLAN_LISTS:
+            return False
+        conn = self.get_conn()
+        cur = conn.execute(
+            "UPDATE author_exploration_plan SET list_type=?, created_by='user',"
+            " time_updated=? WHERE plan_id=?",
+            (list_type, _now_ms(), plan_id))
+        conn.commit()
+        return bool(cur.rowcount)
+
+    def mark_plan_result(self, plan_id: str, *, accepted: int = 0,
+                         rejected: int = 0, status: str = "done",
+                         collapsed_by: str = "") -> None:
+        if not plan_id:
+            return
+        st = status if status in PLAN_STATUSES else "done"
+        conn = self.get_conn()
+        conn.execute(
+            "UPDATE author_exploration_plan SET status=?, collapsed_by=?,"
+            " yield_accepted=yield_accepted+?, yield_rejected=yield_rejected+?,"
+            " time_updated=? WHERE plan_id=?",
+            (st, collapsed_by or "", int(accepted), int(rejected),
+             _now_ms(), plan_id))
+        conn.commit()
+
+    # ── 观察（百科不写的纹理）────────────────────────────────────────────
+
+    def add_observation(self, author_id: str, *, stable_book_id: str,
+                        statement: str, quote: str = "", chunk_id: str = "",
+                        book_id: str = "", chapter_index: int | None = None,
+                        chunk_index: int | None = None, topic: str = "other",
+                        basis: str = "", basis_quote: str = "",
+                        speaker: str = "", use: str = "dossier",
+                        status: str = "candidate", confidence: str = "low",
+                        prompt_version: str = "", model: str = "",
+                        content_hash: str = "") -> str:
+        aid = (author_id or "").strip()
+        st = " ".join((statement or "").split())
+        if not aid or not st:
+            return ""
+        top = topic if topic in OBSERVATION_TOPICS else "other"
+        bas = basis if basis in OBSERVATION_BASES else "model"
+        us = use if use in OBSERVATION_USES else "dossier"
+        stt = status if status in OBSERVATION_STATUSES else "candidate"
+        conf = confidence if confidence in OBSERVATION_CONFIDENCE else "low"
+        now = _now_ms()
+        conn = self.get_conn()
+        # 重跑时模型会把同一句原文换个说法：幂等键里带 statement，会漏成
+        # 两条。同一原文 + 同一 topic/basis/use 已经采过，就复用旧 id。
+        # （同一句话可以支撑不同用途，所以不能只按 quote 去重。）
+        if quote:
+            row = conn.execute(
+                "SELECT observation_id FROM author_observations"
+                " WHERE author_id=? AND quote=? AND topic=? AND basis=?"
+                " AND use=? LIMIT 1",
+                (aid, quote, top, bas, us)).fetchone()
+            if row:
+                return row["observation_id"]
+        oid = _observation_id(aid, stable_book_id or "", chunk_id or "",
+                              quote or "", st)
+        conn.execute(
+            "INSERT OR IGNORE INTO author_observations (observation_id,"
+            " author_id, stable_book_id, book_id, chunk_id, chapter_index,"
+            " chunk_index, topic, statement, quote, basis, basis_quote,"
+            " speaker, use, status, confidence, prompt_version, model,"
+            " content_hash, time_created, time_updated)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (oid, aid, stable_book_id or "", book_id or "", chunk_id or "",
+             chapter_index, chunk_index, top, st, quote or "", bas,
+             basis_quote or "", speaker or "", us, stt, conf,
+             prompt_version or "", model or "", content_hash or "", now, now))
+        conn.commit()
+        return oid
+
+    def observations_for(self, author_id: str, *,
+                         stable_book_id: str | None = None,
+                         status: str | None = None,
+                         limit: int = 200) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM author_observations WHERE author_id=?"
+        args: list[Any] = [author_id]
+        if stable_book_id is not None:
+            sql += " AND stable_book_id=?"
+            args.append(stable_book_id)
+        if status is not None:
+            sql += " AND status=?"
+            args.append(status)
+        sql += " ORDER BY time_created DESC, observation_id LIMIT ?"
+        args.append(max(1, int(limit)))
+        return [dict(r) for r in self.get_conn().execute(sql, args).fetchall()]
+
+    def set_observation_status(self, observation_id: str, status: str) -> bool:
+        if status not in OBSERVATION_STATUSES:
+            return False
+        conn = self.get_conn()
+        cur = conn.execute(
+            "UPDATE author_observations SET status=?, time_updated=?"
+            " WHERE observation_id=?", (status, _now_ms(), observation_id))
+        conn.commit()
+        return bool(cur.rowcount)
+
+    # ── 钩子（提到但没说清）──────────────────────────────────────────────
+
+    def add_hook(self, author_id: str, *, stable_book_id: str,
+                 quote: str = "", missing: str = "", known: str = "",
+                 why: str = "", chunk_id: str = "", book_id: str = "",
+                 chapter_index: int | None = None, topic: str = "other",
+                 suggested_action: str = "web_search",
+                 priority: str = "medium", prompt_version: str = "") -> str:
+        aid = (author_id or "").strip()
+        miss = " ".join((missing or "").split())
+        if not aid or not miss:
+            return ""
+        top = topic if topic in OBSERVATION_TOPICS else "other"
+        act = (suggested_action if suggested_action in HOOK_ACTIONS
+               else "web_search")
+        pri = priority if priority in ("high", "medium", "low") else "medium"
+        now = _now_ms()
+        conn = self.get_conn()
+        # 同一句原文 + 已有一条 open 钩子 = 同一件事还没补上，不再开第二条
+        # （重跑时 missing 的措辞会变，幂等键带 missing 拦不住）。
+        if quote:
+            row = conn.execute(
+                "SELECT hook_id FROM author_hooks"
+                " WHERE author_id=? AND quote=? AND status='open' LIMIT 1",
+                (aid, quote)).fetchone()
+            if row:
+                return row["hook_id"]
+        hid = _hook_id(aid, stable_book_id or "", chunk_id or "",
+                       quote or "", miss)
+        conn.execute(
+            "INSERT OR IGNORE INTO author_hooks (hook_id, author_id,"
+            " stable_book_id, book_id, chunk_id, chapter_index, topic, quote,"
+            " known, missing, why, suggested_action, status, priority,"
+            " prompt_version, time_created, time_updated)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?,?)",
+            (hid, aid, stable_book_id or "", book_id or "", chunk_id or "",
+             chapter_index, top, quote or "", known or "", miss, why or "",
+             act, pri, prompt_version or "", now, now))
+        conn.commit()
+        return hid
+
+    def hooks_for(self, author_id: str, *, status: str | None = "open",
+                  stable_book_id: str | None = None,
+                  limit: int = 200) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM author_hooks WHERE author_id=?"
+        args: list[Any] = [author_id]
+        if status is not None:
+            sql += " AND status=?"
+            args.append(status)
+        if stable_book_id is not None:
+            sql += " AND stable_book_id=?"
+            args.append(stable_book_id)
+        sql += (" ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium'"
+                " THEN 1 ELSE 2 END, time_created LIMIT ?")
+        args.append(max(1, int(limit)))
+        return [dict(r) for r in self.get_conn().execute(sql, args).fetchall()]
+
+    def close_hook(self, hook_id: str, *, closed_by: str = "",
+                   status: str = "closed") -> bool:
+        if status not in HOOK_STATUSES:
+            return False
+        conn = self.get_conn()
+        cur = conn.execute(
+            "UPDATE author_hooks SET status=?, closed_by=?, time_updated=?"
+            " WHERE hook_id=?", (status, closed_by or "", _now_ms(), hook_id))
+        conn.commit()
+        return bool(cur.rowcount)
+
+    # ── 这本书怎么读（用户锚）────────────────────────────────────────────
+
+    def set_read_as(self, author_id: str, stable_book_id: str,
+                    read_as: str = "autobiographical") -> bool:
+        """用户标记「这本书按自传读」。**只是锚，不是事实** —— 它让
+        投射可以带依据落库，但不会把投射升格成传记事实。"""
+        val = read_as if read_as in ("", "autobiographical") else ""
+        conn = self.get_conn()
+        cur = conn.execute(
+            "UPDATE author_books SET read_as=?, time_updated=?"
+            " WHERE author_id=? AND stable_book_id=?",
+            (val, _now_ms(), author_id, stable_book_id))
+        conn.commit()
+        return bool(cur.rowcount)
+
+    def read_as_of(self, author_id: str, stable_book_id: str) -> str:
+        row = self.get_conn().execute(
+            "SELECT read_as FROM author_books WHERE author_id=?"
+            " AND stable_book_id=?", (author_id, stable_book_id)).fetchone()
+        return (row["read_as"] if row else "") or ""
 
     # ── 刷新标记（作者级）────────────────────────────────────────────────
     #

@@ -85,6 +85,33 @@ const REL_LABEL = {
   collaborator: '合作', colleague: '同事', other: '其他',
 };
 const SOURCE_LABEL = { corpus: '书里', web: '网页', graph: '书库', model: '推测' };
+const TOPIC_LABEL = {
+  habit: '习惯', language: '语言', body: '身体', dwelling: '居所',
+  relation: '关系', writing_scene: '写作现场', judgment: '判断',
+  motif: '反复意象', fear: '忌讳', other: '其他',
+};
+const BASIS_LABEL = {
+  author_statement: '作者自述', paratext: '序跋',
+  autobiographical_projection: '自传体投射',
+  fiction_projection: '虚构投射', reported: '转述', model: '推测',
+};
+const USE_LABEL = {
+  biography: '经历', roleplay_texture: '扮演纹理', dossier: '档案',
+};
+const ACTION_LABEL = {
+  web_search: '联网查', another_book: '另一本书', ask_user: '问作者',
+};
+const LIST_LABEL = { grey: '灰名单', white: '白名单', black: '黑名单' };
+const PLAN_STATUS_LABEL = {
+  proposed: '待执行', confirmed: '待执行', refuted: '已证伪',
+  blocked: '已阻断', done: '已完成',
+};
+const SCOPE_LABEL = { paratext: '序跋', body: '正文' };
+const VALUE_SHORT = { high: '高价值', medium: '中价值', low: '低价值' };
+const SPEAKER_LABEL = {
+  author: '作者', translator: '译者', editor: '编者',
+  publisher: '出版方', other: '他人', unknown: '未注明',
+};
 const MISSING_LABEL = {
   'facts.none': '编年事实（带逐字引文）', facts: '编年事实',
   works: '作品', 'voice.none': '声音样本', 'voice.scene': '场景覆盖',
@@ -106,8 +133,9 @@ const VOICE_STATUS = {
 };
 
 const TABS = [
-  ['timeline', '年谱'], ['works', '作品'], ['voice', '声音'],
-  ['relations', '关系'], ['themes', '主题'], ['sources', '来源'],
+  ['timeline', '年谱'], ['details', '细节'], ['works', '作品'],
+  ['voice', '声音'], ['relations', '关系'], ['themes', '主题'],
+  ['sources', '来源'],
 ];
 
 let _dossier = null;
@@ -116,26 +144,35 @@ let _authorId = '';
 let _tab = 'timeline';
 let _lastFocus = null;
 let _drawerOpen = false;
+let _jobId = '';
+let _jobTimer = null;
+let _jobStarting = false;
 
 /* ══ 入口 ═════════════════════════════════════════════════════════════ */
 
-export async function openAuthorDossier(bookId, authorId) {
-  if (!authorId) return;
-  _bookId = bookId || '';
-  _authorId = authorId;
-  _tab = 'timeline';
-  _dossier = null;
-  showView();
-  const body = document.getElementById('adoBody');
-  if (body) body.innerHTML = '<div class="rp-loading">读作者台账…</div>';
+function dossierQuery() {
   const q = new URLSearchParams();
   if (_bookId) q.set('book_id', _bookId);
   // 沉浸模式带读者当前章 → 同一条剧透门；全局模式不带 = 显式全集视角。
   const gated = S.currentMode === 'roleplay' && S.currentMaxChapter != null;
   if (gated) q.set('max_chapter', String(S.currentMaxChapter));
+  return q.toString();
+}
+
+export async function openAuthorDossier(bookId, authorId) {
+  if (!authorId) return;
+  stopJobPolling();
+  _bookId = bookId || '';
+  _authorId = authorId;
+  _tab = 'timeline';
+  _dossier = null;
+  _jobId = '';
+  showView();
+  const body = document.getElementById('adoBody');
+  if (body) body.innerHTML = '<div class="rp-loading">读作者台账…</div>';
   try {
     const resp = await fetch(S.API + '/api/authors/'
-      + encodeURIComponent(authorId) + '/dossier?' + q.toString());
+      + encodeURIComponent(authorId) + '/dossier?' + dossierQuery());
     const data = await resp.json();
     if (!resp.ok || !data.found) {
       throw new Error(data.error || data.note || ('HTTP ' + resp.status));
@@ -153,6 +190,7 @@ export async function openAuthorDossier(bookId, authorId) {
 }
 
 export function closeAuthorDossier() {
+  stopJobPolling();
   closeAuthorDrawer();
   const view = document.getElementById('authorDossierView');
   if (view) view.hidden = true;
@@ -233,12 +271,15 @@ function overview(d) {
   const c = cov.counts || {};
   const chips = [
     ['事实', c.records || 0, cov.facts],
+    ['细节', ((d.details && d.details.counts
+      && d.details.counts.observations) || 0), null],
     ['作品', c.works || 0, cov.works],
     ['声音', c.voice_samples || 0, cov.voice],
     ['关系', c.relations || 0, cov.relations],
     ['来源', c.sources || 0, cov.sources],
   ].map(function (x) {
-    return '<span class="ado-chip" title="覆盖度 ' + pct(x[2]) + '%">'
+    const tip = (x[2] == null) ? '' : ' title="覆盖度 ' + pct(x[2]) + '%"';
+    return '<span class="ado-chip"' + tip + '>'
       + '<b>' + x[0] + '</b><span>' + x[1] + '</span></span>';
   }).join('');
   const ident = [];
@@ -275,6 +316,8 @@ function renderTabs(d) {
   if (!el) return;
   const counts = {
     timeline: ((d.timeline && (d.timeline.work.length + d.timeline.life.length)) || 0),
+    details: (((d.details && d.details.counts
+      && (d.details.counts.observations + d.details.counts.hooks)) || 0)),
     works: (d.works || []).length,
     voice: (d.voice && d.voice.traits.length) || 0,
     relations: (d.relations || []).length,
@@ -332,6 +375,10 @@ function renderTab() {
   if (!el || !_dossier) return;
   const d = _dossier;
   if (_tab === 'timeline') el.innerHTML = tabTimeline(d);
+  else if (_tab === 'details') {
+    el.innerHTML = tabDetails(d);
+    loadDetailTools();
+  }
   else if (_tab === 'works') el.innerHTML = tabWorks(d);
   else if (_tab === 'voice') el.innerHTML = tabVoice(d);
   else if (_tab === 'relations') el.innerHTML = tabRelations(d);
@@ -414,6 +461,385 @@ export function adoOpenTimeline() {
 export function adoToggleUndated() {
   const el = document.getElementById('adoUndatedList');
   if (el) el.hidden = !el.hidden;
+}
+
+/* ══ 细节 ═════════════════════════════════════════════════════════════ */
+
+function detailMeta(o) {
+  const bits = [];
+  if (BASIS_LABEL[o.basis]) bits.push(BASIS_LABEL[o.basis]);
+  if (SPEAKER_LABEL[o.speaker]) bits.push(SPEAKER_LABEL[o.speaker]);
+  if (USE_LABEL[o.use]) bits.push('用于' + USE_LABEL[o.use]);
+  bits.push(o.confidence === 'high' ? '高置信'
+    : o.confidence === 'medium' ? '中置信' : '低置信');
+  if (o.book_title) {
+    bits.push(o.book_title + (o.chapter_index != null
+      ? ' · 第 ' + (o.chapter_index + 1) + ' 章' : ''));
+  }
+  return bits;
+}
+
+function tabDetails(d) {
+  const box = d.details || {};
+  const items = box.items || [];
+  const hooks = box.hooks || [];
+  const head = '<div class="ado-tl-summary">'
+    + '<span class="ado-chip"><b>观察</b><span>' + items.length + '</span></span>'
+    + '<span class="ado-chip' + (hooks.length ? ' is-warn' : '') + '">'
+    + '<b>待考</b><span>' + hooks.length + '</span></span>'
+    + (box.note ? '<span class="ado-detail-note">'
+      + escapeHtml(box.note) + '</span>' : '')
+    + '</div>';
+  const tools = detailTools();
+  const plans = '<div class="ado-plans" id="adoPlans">'
+    + '<div class="ado-plan-note">读攻略…</div></div>';
+  if (!items.length && !hooks.length) {
+    return tools + head + plans + '<div class="rp-empty">'
+      + '还没有纹理观察。点「生成攻略」再点「抽取细节」；'
+      + '投射与弱证据只会出现在这里，不会进年谱。'
+      + '</div>';
+  }
+  const groups = {};
+  items.forEach(function (o) {
+    const t = o.topic || 'other';
+    (groups[t] || (groups[t] = [])).push(o);
+  });
+  let html = tools + head + plans;
+  Object.keys(TOPIC_LABEL).forEach(function (topic) {
+    const rows = groups[topic];
+    if (!rows) return;
+    html += '<div class="ado-detail-group"><div class="ado-detail-topic">'
+      + TOPIC_LABEL[topic] + '</div>'
+      + rows.map(function (o) {
+        return '<div class="ado-card ado-obs">'
+          + '<div class="ado-card-text">' + escapeHtml(o.statement) + '</div>'
+          + (o.quote ? '<blockquote class="ado-obs-quote">'
+            + escapeHtml(o.quote) + '</blockquote>' : '')
+          + '<div class="ado-card-meta">'
+          + detailMeta(o).map(function (b) {
+            return '<span class="ado-badge">' + escapeHtml(b) + '</span>';
+          }).join('') + '</div></div>';
+      }).join('') + '</div>';
+  });
+  if (hooks.length) {
+    html += '<div class="ado-detail-group"><div class="ado-detail-topic">'
+      + '待考（提到了，但没说清）</div>'
+      + hooks.map(function (h) {
+        return '<div class="ado-card ado-hook">'
+          + '<div class="ado-card-text">' + escapeHtml(h.missing) + '</div>'
+          + (h.quote ? '<blockquote class="ado-obs-quote">原话：'
+            + escapeHtml(h.quote) + '</blockquote>' : '')
+          + (h.known ? '<div class="ado-dim-statement">已知：'
+            + escapeHtml(h.known) + '</div>' : '')
+          + (h.why ? '<div class="ado-dim-statement">为什么值得追：'
+            + escapeHtml(h.why) + '</div>' : '')
+          + '<div class="ado-card-meta">'
+          + '<span class="ado-badge is-warn">下一步：'
+          + escapeHtml(ACTION_LABEL[h.suggested_action]
+            || h.suggested_action || '联网查') + '</span>'
+          + (h.book_title ? '<span class="ado-badge">'
+            + escapeHtml(h.book_title) + (h.chapter_index != null
+              ? ' · 第 ' + (h.chapter_index + 1) + ' 章' : '')
+            + '</span>' : '')
+          + '</div></div>';
+      }).join('') + '</div>';
+  }
+  return html;
+}
+
+function detailTools() {
+  return '<div class="ado-jobbar" id="adoJobbar">'
+    + '<button type="button" class="ado-job-btn"'
+    + ' data-action="plan">生成攻略</button>'
+    + '<button type="button" class="ado-job-btn"'
+    + ' data-action="extract">抽取细节</button>'
+    + '<button type="button" class="ado-job-btn"'
+    + ' data-action="close_hooks">闭合钩子</button>'
+    + '<button type="button" class="ado-job-btn ado-job-cancel"'
+    + ' data-action="cancel" hidden>取消</button>'
+    + '<label class="ado-job-force"><input type="checkbox" id="adoForce">'
+    + ' 重跑已完成</label>'
+    + '<span class="ado-job-msg" id="adoJobMsg"></span>'
+    + '</div>'
+    + '<div class="ado-joblog" id="adoJobLog" hidden></div>';
+}
+
+async function loadDetailTools() {
+  const bar = document.getElementById('adoJobbar');
+  if (bar && !bar.dataset.bound) {
+    bar.dataset.bound = '1';
+    bar.addEventListener('click', function (e) {
+      const b = e.target.closest('.ado-job-btn');
+      if (b) startJob(b.dataset.action);
+    });
+  }
+  const plans = document.getElementById('adoPlans');
+  if (plans && !plans.dataset.bound) {
+    plans.dataset.bound = '1';
+    plans.addEventListener('click', function (e) {
+      const b = e.target.closest('.ado-plan-list-btn');
+      if (b) setPlanList(b.dataset.plan, b.dataset.list);
+    });
+  }
+  await Promise.all([loadPlans(), loadLatestJob()]);
+}
+
+async function startJob(action) {
+  if (_jobStarting || !_authorId) return;
+  if (action === 'cancel') { cancelJob(); return; }
+  _jobStarting = true;
+  setJobButtons(true);
+  try {
+    const forceEl = document.getElementById('adoForce');
+    const resp = await fetch(S.API + '/api/authors/'
+      + encodeURIComponent(_authorId) + '/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: action,
+        force: !!(forceEl && forceEl.checked) }),
+    });
+    const data = await resp.json();
+    if (resp.status === 409 && data.job) {
+      if (data.job.author_id === _authorId) {
+        _jobId = data.job.job_id;
+        showJob(data.job);
+        startPolling();
+      } else {
+        setJobMsg('另一位作者的任务在跑：'
+          + (data.job.author_name || data.job.author_id), true);
+        setJobButtons(false);
+      }
+      return;
+    }
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    _jobId = data.job.job_id;
+    showJob(data.job);
+    startPolling();
+  } catch (e) {
+    setJobMsg('启动失败：' + e.message, true);
+    setJobButtons(false);
+  } finally {
+    _jobStarting = false;
+  }
+}
+
+async function cancelJob() {
+  if (!_jobId) return;
+  try {
+    await fetch(S.API + '/api/authors/jobs/'
+      + encodeURIComponent(_jobId) + '/cancel', { method: 'POST' });
+  } catch (e) { /* 下一轮轮询会看到终态 */ }
+}
+
+function stopJobPolling() {
+  if (_jobTimer) {
+    clearTimeout(_jobTimer);
+    _jobTimer = null;
+  }
+}
+
+function startPolling() {
+  stopJobPolling();
+  const tick = async function () {
+    if (!_jobId) return;
+    try {
+      const resp = await fetch(S.API + '/api/authors/jobs/'
+        + encodeURIComponent(_jobId));
+      if (resp.status === 404) {
+        stopJobPolling();
+        setJobMsg('任务记录已丢失（服务重启过）', true);
+        return;
+      }
+      const data = await resp.json();
+      if (!data.job) return;
+      showJob(data.job);
+      if (data.job.status === 'running') {
+        _jobTimer = setTimeout(tick, 2000);
+      } else {
+        stopJobPolling();
+        await reloadDossier();
+      }
+    } catch (e) {
+      _jobTimer = setTimeout(tick, 4000);
+    }
+  };
+  _jobTimer = setTimeout(tick, 800);
+}
+
+function setJobMsg(text, warn) {
+  const el = document.getElementById('adoJobMsg');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'ado-job-msg' + (warn ? ' is-warn' : '');
+}
+
+function setJobButtons(disabled) {
+  const bar = document.getElementById('adoJobbar');
+  if (!bar) return;
+  for (const b of bar.querySelectorAll('.ado-job-btn')) {
+    if (b.dataset.action === 'cancel') b.hidden = !disabled;
+    else b.disabled = disabled;
+  }
+}
+
+function showJob(job) {
+  const log = document.getElementById('adoJobLog');
+  if (log) {
+    const tail = (job.lines || []).slice(-60).join('\n');
+    log.hidden = !tail;
+    if (tail) log.textContent = tail;
+    log.scrollTop = log.scrollHeight;
+  }
+  const running = job.status === 'running';
+  setJobButtons(running);
+  if (running) {
+    setJobMsg((job.action_label || '任务') + '进行中…');
+  } else if (job.status === 'done') {
+    const s = job.summary;
+    setJobMsg(s ? ('完成：观察 +' + s.observations + ' · 钩子 +'
+      + s.hooks + ' · 闭合 ' + s.closed) : '完成');
+  } else if (job.status === 'cancelled') {
+    setJobMsg('已取消', true);
+  } else {
+    setJobMsg('失败' + (job.error ? '：' + job.error
+      : '（退出码 ' + job.returncode + '）'), true);
+  }
+}
+
+async function loadLatestJob() {
+  if (!_authorId) return;
+  try {
+    let job = null;
+    if (_jobId) {
+      const resp = await fetch(S.API + '/api/authors/jobs/'
+        + encodeURIComponent(_jobId));
+      if (resp.status === 404) {
+        _jobId = '';
+        return;
+      }
+      job = (await resp.json()).job;
+    } else {
+      const resp = await fetch(S.API + '/api/authors/'
+        + encodeURIComponent(_authorId) + '/jobs?limit=1');
+      job = ((await resp.json()).items || [])[0];
+      if (!job) return;
+      _jobId = job.job_id;
+      if (job.status === 'running') {
+        const r2 = await fetch(S.API + '/api/authors/jobs/'
+          + encodeURIComponent(job.job_id));
+        if (r2.ok) job = (await r2.json()).job || job;
+      }
+    }
+    if (!job) return;
+    showJob(job);
+    if (job.status === 'running') startPolling();
+  } catch (e) { /* 没有任务不算错误 */ }
+}
+
+async function reloadDossier() {
+  if (!_authorId) return;
+  try {
+    const resp = await fetch(S.API + '/api/authors/'
+      + encodeURIComponent(_authorId) + '/dossier?' + dossierQuery());
+    const data = await resp.json();
+    if (!resp.ok || !data.found) return;
+    _dossier = data;
+    render(data);
+  } catch (e) { /* 保留旧视图 */ }
+}
+
+/* ══ 细节：攻略 ─────────────────────────────────────────────────────── */
+
+async function loadPlans() {
+  const box = document.getElementById('adoPlans');
+  if (!box || !_authorId) return;
+  try {
+    const resp = await fetch(S.API + '/api/authors/'
+      + encodeURIComponent(_authorId) + '/plans');
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    box.innerHTML = plansHtml(data);
+  } catch (e) {
+    box.innerHTML = '<div class="ado-plan-note">攻略读取失败：'
+      + escapeHtml(e.message) + '</div>';
+  }
+}
+
+function scopeText(p) {
+  const scope = p.scope || '';
+  if (scope.indexOf('chapter:') === 0) {
+    return '章节「' + scope.slice(8) + '」';
+  }
+  return SCOPE_LABEL[scope] || scope || '—';
+}
+
+function plansHtml(data) {
+  const items = data.items || [];
+  const c = data.counts || {};
+  if (!items.length) {
+    return '<div class="ado-plan-note">还没有攻略。点「生成攻略」：'
+      + '规则先看序跋，模型再补可能值得读的部分。</div>';
+  }
+  const rows = items.map(function (p) {
+    const black = p.list_type === 'black';
+    const badges = [];
+    if (BASIS_LABEL[p.expected_basis]) {
+      badges.push('依据：' + BASIS_LABEL[p.expected_basis]);
+    }
+    if (VALUE_SHORT[p.expected_value]) {
+      badges.push(VALUE_SHORT[p.expected_value]);
+    }
+    if (p.expected_cost) badges.push('约 ' + p.expected_cost + ' 次调用');
+    const metas = badges.map(function (b) {
+      return '<span class="ado-badge">' + escapeHtml(b) + '</span>';
+    }).join('');
+    const pick = ['white', 'grey', 'black'].map(function (lt) {
+      return '<button type="button" class="ado-plan-list-btn'
+        + (p.list_type === lt ? ' is-on' : '') + '" data-plan="'
+        + escapeHtml(p.plan_id) + '" data-list="' + lt
+        + '" aria-pressed="' + (p.list_type === lt) + '">'
+        + LIST_LABEL[lt] + '</button>';
+    }).join('');
+    return '<div class="ado-plan' + (black ? ' is-black' : '') + '">'
+      + '<div class="ado-plan-top">'
+      + '<span class="ado-plan-book">《'
+      + escapeHtml(p.book_title || p.stable_book_id || '未绑定书')
+      + '》</span>'
+      + '<span class="ado-plan-scope">' + escapeHtml(scopeText(p))
+      + '</span>'
+      + '<span class="ado-badge' + (black ? ' is-warn' : '') + '">'
+      + (LIST_LABEL[p.list_type] || p.list_type) + '</span>'
+      + '<span class="ado-badge">'
+      + (PLAN_STATUS_LABEL[p.status] || p.status) + '</span>'
+      + '</div>'
+      + '<div class="ado-plan-hyp">' + escapeHtml(p.hypothesis)
+      + '</div>'
+      + (metas ? '<div class="ado-card-meta">' + metas + '</div>' : '')
+      + '<div class="ado-plan-actions">' + pick + '</div>'
+      + '</div>';
+  }).join('');
+  return '<div class="ado-detail-group"><div class="ado-detail-topic">攻略　'
+    + items.length + ' 条（灰 ' + (c.grey || 0) + ' · 白 '
+    + (c.white || 0) + ' · 黑 ' + (c.black || 0) + '）</div>'
+    + rows + '</div>';
+}
+
+async function setPlanList(planId, listType) {
+  if (!_authorId || !planId) return;
+  try {
+    const resp = await fetch(S.API + '/api/authors/'
+      + encodeURIComponent(_authorId) + '/plans/'
+      + encodeURIComponent(planId), {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ list_type: listType }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || ('HTTP ' + resp.status));
+    await loadPlans();
+  } catch (e) {
+    setJobMsg('改名单失败：' + e.message, true);
+  }
 }
 
 /* ══ 作品 ═════════════════════════════════════════════════════════════ */

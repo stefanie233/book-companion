@@ -10,6 +10,12 @@ class SessionInfo:
     """Public summary of a session (no message body)."""
     id: str
     project_id: str = ""
+    #: 写作会话绑定的作品（writing.db 的 works.id）；阅读/主页会话为空。
+    work_id: str = ""
+    #: 写作子模式：``standard`` | ``detail``（见决策 161）。
+    writing_mode: str = "standard"
+    #: 作者是否授权 agent 自己切模式（1 = 允许）。
+    auto_mode_switch: int = 0
     title: str | None = None
     model: str | None = None
     mode: str = "immersive"

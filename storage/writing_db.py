@@ -52,6 +52,10 @@ COMMIT_KINDS = ("manual", "auto", "checkpoint", "restore", "before_restore")
 
 COMMIT_AUTHORS = ("user", "agent", "system")
 
+#: 每本书的版本习惯（决策 182）。``chapter`` = 每章结算后自动留一版；
+#: ``manual`` = 只由作者/agent 在明确要求时提交，结算后工作区保持脏。
+GIT_HABITS = ("chapter", "manual")
+
 DELIVERY_STATUSES = ("blocked", "inconclusive", "pass", "revise")
 
 
@@ -61,6 +65,19 @@ def _new_id(prefix: str) -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def _goal_summary(goal: Mapping[str, Any]) -> str:
+    """与 ``writegraph.goals.summary_line`` 同步的一行摘要（避免反向依赖）。"""
+    items = list(goal.get("items") or [])
+    if not items:
+        return "本章未配置可核对的目标"
+    counts = {"completed": 0, "unmet": 0, "unknown": 0}
+    for item in items:
+        status = str(item.get("status") or "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return (f"目标核对：完成 {counts['completed']} / 未达成 {counts['unmet']}"
+            f" / 待核实 {counts['unknown']}")
 
 
 def text_hash(text: str) -> str:
@@ -563,6 +580,168 @@ WRITING_DDL_V7: list[str] = [
 ]
 
 
+#: v8：作品工作区（作品记忆 / 设定 / 计划稿）进写作 git。
+#: - ``commits.files_hash``：这条提交的文件清单指纹；空串 = 旧提交，未跟踪。
+#: - ``commit_files``：提交里每个路径指向的内容 hash。
+#: - ``work_file_blobs``：按 hash 存正文，同一份内容在多次提交间只存一份。
+WRITING_DDL_V8: list[str] = [
+    "ALTER TABLE commits ADD COLUMN files_hash TEXT NOT NULL DEFAULT ''",
+    """
+    CREATE TABLE IF NOT EXISTS commit_files (
+        commit_id TEXT NOT NULL REFERENCES commits(id) ON DELETE CASCADE,
+        path      TEXT NOT NULL,
+        hash      TEXT NOT NULL,
+        PRIMARY KEY (commit_id, path)
+    );
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS work_file_blobs (
+        work_id TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+        hash    TEXT NOT NULL,
+        content TEXT NOT NULL,
+        PRIMARY KEY (work_id, hash)
+    );
+    """,
+]
+
+
+#: v9：合同的兑现生命周期。合同是这一章的**验收单**：写之前是边界，写完之后
+#: 逐条勾；勾完就结清，不再全文注入提示词。
+#: - ``status``：``active``（在写/待写）/ ``closed``（已结算）。改合同 = 重新
+#:   立约，``set_contract`` 会把状态推回 active、旧兑现记录作废。
+#: - ``outcomes``：逐条兑现结果 ``[{item, verdict, evidence}]``，verdict ∈
+#:   hit / partial / miss；结算时由 agent 申报，宿主只存不判（判定口径另定）。
+#: - ``close_note``：结清时的一句话，留给之后的「未兑现 → 下一章/承诺」用。
+WRITING_DDL_V9: list[str] = [
+    "ALTER TABLE chapter_contracts ADD COLUMN status TEXT NOT NULL DEFAULT 'active'",
+    "ALTER TABLE chapter_contracts ADD COLUMN closed_at INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE chapter_contracts ADD COLUMN outcomes TEXT NOT NULL DEFAULT '[]'",
+    "ALTER TABLE chapter_contracts ADD COLUMN close_note TEXT NOT NULL DEFAULT ''",
+]
+
+#: v10：合同的「当前弧」指针（决策 132）。只存引用（计划稿路径），不内联正文
+#: ——计划稿会改，内联的副本一定会过期。空串 = 没挂。
+WRITING_DDL_V10: list[str] = [
+    "ALTER TABLE chapter_contracts ADD COLUMN arc_ref TEXT NOT NULL DEFAULT ''",
+]
+
+#: v11：两段式记忆维护。Phase 1 的抽取记录先落日志，Phase 2 合并后
+#: 标记 consolidated；state 存上次合并时的文件 hash 清单（发现作者改动/删除）。
+WRITING_DDL_V11: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS work_memory_log (
+        id              TEXT PRIMARY KEY,
+        work_id         TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+        chapter_index   INTEGER NOT NULL DEFAULT 0,
+        status          TEXT NOT NULL DEFAULT 'pending',
+        payload         TEXT NOT NULL DEFAULT '{}',
+        created_at      INTEGER NOT NULL DEFAULT 0,
+        consolidated_at INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_work_memory_log"
+    " ON work_memory_log(work_id, status)",
+    """
+    CREATE TABLE IF NOT EXISTS work_memory_state (
+        work_id              TEXT PRIMARY KEY REFERENCES works(id) ON DELETE CASCADE,
+        manifest             TEXT NOT NULL DEFAULT '{}',
+        last_chapter         INTEGER NOT NULL DEFAULT -1,
+        last_consolidated_at INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+]
+
+
+#: v12：合同的「不点破」清单（决策 142）。与 forbidden_cross 分开：
+#: 后者是「不许发生 / 不许揭示」，这里是「可以写进场景，但不解释」。
+#: 恒定默认值 '[]'；旧库走 ALTER，不重建表。
+WRITING_DDL_V12: list[str] = [
+    "ALTER TABLE chapter_contracts ADD COLUMN withhold TEXT NOT NULL DEFAULT '[]'",
+]
+
+#: v13：全局素材库与作品的消费连线（决策 156）。素材本体是文件，不进库；
+#: 这里只存「哪条素材被哪部作品怎么用了」——即索引，不是分支、不是目录树。
+#: ``material_id`` 是摘录哈希；改名/换分类不影响，素材被删进回收站后历史仍在。
+WRITING_DDL_V13: list[str] = [
+    """
+    CREATE TABLE IF NOT EXISTS material_uses (
+        id          TEXT PRIMARY KEY,
+        material_id TEXT NOT NULL,
+        work_id     TEXT NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'merge',
+        chapter_id  TEXT,
+        target_path TEXT NOT NULL DEFAULT '',
+        note        TEXT NOT NULL DEFAULT '',
+        session_id  TEXT NOT NULL DEFAULT '',
+        created_at  INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_material_uses_material"
+    " ON material_uses(material_id)",
+    "CREATE INDEX IF NOT EXISTS idx_material_uses_work"
+    " ON material_uses(work_id)",
+]
+
+#: v14：写作子模式（决策 161）。章上的 writing_mode 是**单章覆盖**：
+#: 空串 = 继承会话模式；'standard' / 'detail' 只作用于这一章。
+#: chapter_briefs 存每次细致模式动笔前交的取舍说明（只入库，不进写作 git）。
+WRITING_DDL_V14: list[str] = [
+    "ALTER TABLE chapters ADD COLUMN writing_mode TEXT NOT NULL DEFAULT ''",
+    """
+    CREATE TABLE IF NOT EXISTS chapter_briefs (
+        id            TEXT PRIMARY KEY,
+        work_id       TEXT NOT NULL REFERENCES works(id) ON DELETE CASCADE,
+        chapter_id    TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
+        chapter_index INTEGER NOT NULL DEFAULT 0,
+        mode          TEXT NOT NULL DEFAULT 'detail',
+        payload       TEXT NOT NULL DEFAULT '{}',
+        ref_count     INTEGER NOT NULL DEFAULT 0,
+        created_at    INTEGER NOT NULL DEFAULT 0
+    );
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_chapter_briefs_chapter"
+    " ON chapter_briefs(chapter_id, created_at DESC)",
+]
+
+#: v15：工作区记忆维护的结构化日志（决策 173 提案）。旧行 payload 不动；
+#: 新行把 kind/source/target/path/op/hash 拆成列，note 才能按 hash 幂等。
+WRITING_DDL_V15: list[str] = [
+    "ALTER TABLE work_memory_log ADD COLUMN kind TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE work_memory_log ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE work_memory_log ADD COLUMN target TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE work_memory_log ADD COLUMN path TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE work_memory_log ADD COLUMN section TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE work_memory_log ADD COLUMN op TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE work_memory_log ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_work_memory_log_hash"
+    " ON work_memory_log(work_id, content_hash, status)"
+    " WHERE content_hash <> ''",
+    "ALTER TABLE work_memory_state ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'v1'",
+    "ALTER TABLE work_memory_state ADD COLUMN dirty_chapters TEXT NOT NULL DEFAULT '[]'",
+]
+
+#: v16：consolidate 的内容级基线（path → 原文），用来生成真实 diff。
+#: 只存记忆相关文件；旧库没有 baseline 时退回「路径 + 当前内容」。
+WRITING_DDL_V16: list[str] = [
+    "ALTER TABLE work_memory_state ADD COLUMN baseline TEXT NOT NULL DEFAULT '{}'",
+]
+
+#: v17：审稿的目标逐项核对结果（决策 178）。旧库默认空对象，读取时按无清单处理。
+WRITING_DDL_V17: list[str] = [
+    "ALTER TABLE review_runs ADD COLUMN goal_review_json TEXT NOT NULL DEFAULT '{}'",
+]
+
+#: v18：同章重结算时把上一版事实标为 superseded（保留行，不参与求值）。
+WRITING_DDL_V18: list[str] = [
+    "ALTER TABLE facts ADD COLUMN superseded INTEGER NOT NULL DEFAULT 0",
+]
+
+#: v19：每本书的版本习惯（决策 182）。旧库默认每章结算后自动提交，行为不变。
+WRITING_DDL_V19: list[str] = [
+    "ALTER TABLE works ADD COLUMN git_habit TEXT NOT NULL DEFAULT 'chapter'",
+]
+
+
 class WritingDB(BaseDatabase):
     """写作库 ``data/writing.db``。"""
 
@@ -574,6 +753,18 @@ class WritingDB(BaseDatabase):
         (5, "writegraph v5: agent feedback log", WRITING_DDL_V5),
         (6, "writegraph v6: draft vs save versions", WRITING_DDL_V6),
         (7, "writegraph v7: pinned works", WRITING_DDL_V7),
+        (8, "writegraph v8: workspace files in commits", WRITING_DDL_V8),
+        (9, "writegraph v9: contract lifecycle", WRITING_DDL_V9),
+        (10, "writegraph v10: contract arc pointer", WRITING_DDL_V10),
+        (11, "writegraph v11: two-phase memory maintenance", WRITING_DDL_V11),
+        (12, "writegraph v12: contract withhold list", WRITING_DDL_V12),
+        (13, "writegraph v13: material library usage links", WRITING_DDL_V13),
+        (14, "writegraph v14: detail mode + research briefs", WRITING_DDL_V14),
+        (15, "writegraph v15: structured memory log", WRITING_DDL_V15),
+        (16, "writegraph v16: memory baseline snapshot", WRITING_DDL_V16),
+        (17, "writegraph v17: review goal checklist", WRITING_DDL_V17),
+        (18, "writegraph v18: superseded facts on re-settle", WRITING_DDL_V18),
+        (19, "writegraph v19: per-work git habit", WRITING_DDL_V19),
     ]
 
     def __init__(self, db_path: Path | str):
@@ -618,11 +809,76 @@ class WritingDB(BaseDatabase):
                     f"DELETE FROM {table} WHERE chapter_id IN"
                     " (SELECT id FROM chapters WHERE work_id=?)", (work_id,))
             conn.execute("DELETE FROM writing_runs WHERE work_id=?", (work_id,))
+            # 素材消费记录随作品一起消失：作品没了，这条历史没有意义。
+            conn.execute("DELETE FROM material_uses WHERE work_id=?", (work_id,))
             conn.execute("DELETE FROM works WHERE id=?", (work_id,))
             conn.commit()
         except Exception:
             conn.rollback()
             raise
+
+    def add_material_use(self, material_id: str, work_id: str, *,
+                         kind: str = "merge", chapter_id: str | None = None,
+                         target_path: str = "", note: str = "",
+                         session_id: str = "") -> dict[str, Any]:
+        """记一条素材消费：哪条素材、被哪部作品、以什么方式、改成了什么。"""
+        use_id = _new_id("mu")
+        now = _now_ms()
+        self.get_conn().execute(
+            "INSERT INTO material_uses (id, material_id, work_id, kind,"
+            " chapter_id, target_path, note, session_id, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (use_id, material_id, work_id, kind, chapter_id,
+             target_path, note, session_id, now),
+        )
+        self.get_conn().commit()
+        cur = self.get_conn().execute(
+            "SELECT * FROM material_uses WHERE id=?", (use_id,))
+        return self._row(cur.fetchone()) or {}
+
+    def list_material_uses(self, *, material_id: str = "", work_id: str = "",
+                           limit: int = 100) -> list[dict[str, Any]]:
+        where, args = [], []
+        if material_id:
+            where.append("material_id=?")
+            args.append(material_id)
+        if work_id:
+            where.append("work_id=?")
+            args.append(work_id)
+        sql = "SELECT * FROM material_uses"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(max(1, min(500, int(limit))))
+        cur = self.get_conn().execute(sql, tuple(args))
+        return self._rows(cur.fetchall())
+
+    def material_use_counts(self) -> dict[str, dict[str, int]]:
+        """全部素材的消费计数：material_id → {events, works, last_used}。
+
+        审计用一次查询，不按卡逐个查。
+        """
+        rows = self.get_conn().execute(
+            "SELECT material_id, COUNT(*) AS events,"
+            " COUNT(DISTINCT work_id) AS works, MAX(created_at) AS last_used"
+            " FROM material_uses GROUP BY material_id").fetchall()
+        return {str(r["material_id"]): {
+            "events": int(r["events"] or 0),
+            "works": int(r["works"] or 0),
+            "last_used": int(r["last_used"] or 0),
+        } for r in rows}
+
+    def material_use_stats(self, material_id: str) -> dict[str, Any]:
+        """一条素材被几部作品、几个使用事件消耗过（短名单单列）。"""
+        rows = self.list_material_uses(material_id=material_id, limit=500)
+        works = {str(r.get("work_id") or "") for r in rows}
+        consumed = [r for r in rows if r.get("kind") in ("merge", "inline")]
+        return {
+            "material_id": material_id,
+            "events": len(rows),
+            "works": len(works - {""}),
+            "consumed": len(consumed),
+        }
 
     def get_work(self, work_id: str) -> dict[str, Any] | None:
         cur = self.get_conn().execute("SELECT * FROM works WHERE id=?", (work_id,))
@@ -639,6 +895,16 @@ class WritingDB(BaseDatabase):
         self.get_conn().execute(
             "UPDATE works SET pinned=? WHERE id=?",
             (1 if pinned else 0, work_id))
+        self.get_conn().commit()
+
+    def set_work_git_habit(self, work_id: str, habit: str) -> None:
+        """改这本书的版本习惯。只认 ``GIT_HABITS``，不做措辞猜测。"""
+        value = str(habit or "").strip()
+        if value not in GIT_HABITS:
+            raise ValueError(f"未知版本习惯：{habit!r}")
+        self.get_conn().execute(
+            "UPDATE works SET git_habit=?, time_updated=? WHERE id=?",
+            (value, _now_ms(), work_id))
         self.get_conn().commit()
 
     def update_work_style_profile(self, work_id: str,
@@ -691,15 +957,59 @@ class WritingDB(BaseDatabase):
             (title, _now_ms(), chapter_id))
         self.get_conn().commit()
 
+    def set_chapter_writing_mode(self, chapter_id: str, mode: str) -> None:
+        """单章模式覆盖；``''`` = 继承会话模式（决策 161）。"""
+        self.get_conn().execute(
+            "UPDATE chapters SET writing_mode=?, time_updated=? WHERE id=?",
+            (str(mode or ""), _now_ms(), chapter_id))
+        self.get_conn().commit()
+
+    def add_chapter_brief(self, work_id: str, chapter_id: str,
+                          chapter_index: int, mode: str,
+                          payload: Mapping[str, Any],
+                          ref_count: int = 0) -> str:
+        """存一次动笔前的取舍说明。只入库、不进写作 git。"""
+        brief_id = _new_id("br")
+        self.get_conn().execute(
+            "INSERT INTO chapter_briefs (id, work_id, chapter_id,"
+            " chapter_index, mode, payload, ref_count, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (brief_id, work_id, chapter_id, int(chapter_index or 0),
+             str(mode or "detail"), _json(dict(payload or {})),
+             int(ref_count or 0), _now_ms()))
+        self.get_conn().commit()
+        return brief_id
+
+    def latest_chapter_brief(self, chapter_id: str) -> dict[str, Any] | None:
+        cur = self.get_conn().execute(
+            "SELECT * FROM chapter_briefs WHERE chapter_id=?"
+            " ORDER BY created_at DESC LIMIT 1", (chapter_id,))
+        row = self._row(cur.fetchone())
+        if row is not None:
+            try:
+                row["payload"] = json.loads(row.get("payload") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                row["payload"] = {}
+        return row
+
     # ── 章节合同 ──────────────────────────────────────────────────────────
 
-    _CONTRACT_JSON = ("must_hit_now", "must_preserve", "forbidden_cross")
+    _CONTRACT_JSON = ("must_hit_now", "must_preserve", "forbidden_cross",
+                      "withhold")
+
+    #: 读出来要反序列化的列。``outcomes`` 也存 JSON，但它由 ``close_contract``
+    #: 写，不开放给 ``set_contract``——兑现结果不能被随手改合同带过去。
+    _CONTRACT_LISTS = (*_CONTRACT_JSON, "outcomes")
 
     def set_contract(self, chapter_id: str, **fields: Any) -> None:
-        """写合同。列表字段接受 list 或 JSON 字符串，落库一律 JSON。"""
+        """写合同。列表字段接受 list 或 JSON 字符串，落库一律 JSON。
+
+        **改合同 = 重新立约**：状态推回 ``active``，旧的兑现结果作废。
+        合同的兑现记录只对「当时那份合同」有效，改了条款就不该继承。
+        """
         allowed = {
             "purpose", "exclusive_event", "ending_state", "next_entry_state",
-            "story_time", "target_chars", *self._CONTRACT_JSON,
+            "story_time", "target_chars", "arc_ref", *self._CONTRACT_JSON,
         }
         unknown = set(fields) - allowed
         if unknown:
@@ -711,8 +1021,9 @@ class WritingDB(BaseDatabase):
             elif val is not None and not isinstance(val, str):
                 raise TypeError(f"{key} must be list or JSON string")
 
-        cols = ["chapter_id", *fields, "time_updated"]
-        vals = [chapter_id, *fields.values(), _now_ms()]
+        cols = ["chapter_id", *fields, "status", "closed_at", "outcomes",
+                "close_note", "time_updated"]
+        vals = [chapter_id, *fields.values(), "active", 0, "[]", "", _now_ms()]
         placeholders = ",".join("?" for _ in cols)
         updates = ",".join(f"{c}=excluded.{c}" for c in cols[1:])
         self.get_conn().execute(
@@ -729,12 +1040,55 @@ class WritingDB(BaseDatabase):
         row = self._row(cur.fetchone())
         if row is None:
             return None
-        for key in self._CONTRACT_JSON:
+        for key in self._CONTRACT_LISTS:
             try:
                 row[key] = json.loads(row.get(key) or "[]")
             except (json.JSONDecodeError, TypeError):
                 row[key] = []
         return row
+
+    def close_contract(self, chapter_id: str, *, outcomes: Iterable[Any] | None = None,
+                       note: str = "") -> dict[str, Any] | None:
+        """结清合同：记下逐条兑现结果，状态转 ``closed``。
+
+        只存不判：``outcomes`` 是 agent 申报的事实，格式不对的行直接丢掉
+        （宁可少一条记录，也不让一条坏数据卡住结算）。
+        """
+        rows: list[dict[str, str]] = []
+        for item in (outcomes or []):
+            if not isinstance(item, Mapping):
+                continue
+            entry = {key: str(item.get(key) or "").strip()
+                     for key in ("item", "verdict", "evidence")}
+            if entry["item"]:
+                rows.append(entry)
+        now = _now_ms()
+        self.get_conn().execute(
+            "UPDATE chapter_contracts SET status='closed', closed_at=?,"
+            " outcomes=?, close_note=?, time_updated=? WHERE chapter_id=?",
+            (now, _json(rows), str(note or "")[:200], now, chapter_id),
+        )
+        self.get_conn().commit()
+        return self.get_contract(chapter_id)
+
+    def list_contracts(self, work_id: str) -> list[dict[str, Any]]:
+        """整本的合同，带章号/标题（写作台「合同」页签的收录视图用）。"""
+        # 合同自己也有 status（active/closed），章节的不能再用同名别名，
+        # 否则 cc.* 里那一列会被覆盖，合同页分不清「在写」还是「已结清」。
+        cur = self.get_conn().execute(
+            "SELECT cc.*, ch.chapter_index AS chapter_index,"
+            " ch.title AS chapter_title, ch.word_count AS word_count,"
+            " ch.status AS chapter_status"
+            " FROM chapter_contracts cc JOIN chapters ch ON ch.id = cc.chapter_id"
+            " WHERE ch.work_id=? ORDER BY ch.chapter_index", (work_id,))
+        rows = self._rows(cur.fetchall())
+        for row in rows:
+            for key in self._CONTRACT_LISTS:
+                try:
+                    row[key] = json.loads(row.get(key) or "[]")
+                except (json.JSONDecodeError, TypeError):
+                    row[key] = []
+        return rows
 
     # ── 账本读取（求值在 writegraph.facts / promises）────────────────────
 
@@ -762,6 +1116,149 @@ class WritingDB(BaseDatabase):
         cur = self.get_conn().execute(
             "SELECT * FROM promises WHERE id=?", (promise_id,))
         return self._row(cur.fetchone())
+
+    # ── 记忆维护日志（决策 133）──────────────────────────────────────────
+
+    def add_memory_log(self, work_id: str, chapter_index: int,
+                       payload: Mapping[str, Any], *,
+                       status: str = "pending", kind: str = "chapter",
+                       source: str = "chapter", target: str = "",
+                       path: str = "", section: str = "", op: str = "",
+                       content_hash: str = "") -> str:
+        log_id = _new_id("mem")
+        self.get_conn().execute(
+            "INSERT INTO work_memory_log (id, work_id, chapter_index, status,"
+            " payload, created_at, consolidated_at, kind, source, target,"
+            " path, section, op, content_hash)"
+            " VALUES (?,?,?,?,?,?,0,?,?,?,?,?,?,?)",
+            (log_id, work_id, int(chapter_index or 0), status,
+             _json(dict(payload or {})), _now_ms(), kind, source, target,
+             path, section, op, content_hash))
+        self.get_conn().commit()
+        return log_id
+
+    def find_memory_log_by_hash(self, work_id: str, content_hash: str, *,
+                                status: str = "pending") -> dict[str, Any] | None:
+        """同工作区、同状态、同内容 hash 的日志行；空 hash 不匹配。"""
+        if not str(content_hash or ""):
+            return None
+        row = self._row(self.get_conn().execute(
+            "SELECT * FROM work_memory_log WHERE work_id=? AND content_hash=?"
+            " AND status=? ORDER BY created_at LIMIT 1",
+            (work_id, str(content_hash), status)).fetchone())
+        if row is not None:
+            try:
+                row["payload"] = json.loads(row.get("payload") or "{}")
+            except (TypeError, ValueError):
+                row["payload"] = {}
+        return row
+
+    def list_memory_logs(self, work_id: str, *, status: str = "pending",
+                         limit: int = 50) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM work_memory_log WHERE work_id=?"
+        args: list[Any] = [work_id]
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        sql += " ORDER BY chapter_index, created_at LIMIT ?"
+        args.append(int(limit))
+        rows = self._rows(self.get_conn().execute(sql, args).fetchall())
+        for row in rows:
+            try:
+                row["payload"] = json.loads(row.get("payload") or "{}")
+            except (TypeError, ValueError):
+                row["payload"] = {}
+        return rows
+
+    def mark_memory_logs(self, ids: Iterable[str], *,
+                         status: str = "consolidated") -> int:
+        clean = [str(x) for x in ids if str(x)]
+        if not clean:
+            return 0
+        marks = ",".join("?" for _ in clean)
+        cur = self.get_conn().execute(
+            f"UPDATE work_memory_log SET status=?, consolidated_at=?"
+            f" WHERE id IN ({marks})",
+            [status, _now_ms(), *clean])
+        self.get_conn().commit()
+        return cur.rowcount
+
+    def get_memory_state(self, work_id: str) -> dict[str, Any]:
+        row = self._row(self.get_conn().execute(
+            "SELECT * FROM work_memory_state WHERE work_id=?",
+            (work_id,)).fetchone())
+        if row is None:
+            return {"work_id": work_id, "manifest": "{}",
+                    "last_chapter": -1, "last_consolidated_at": 0,
+                    "schema_version": "v1", "dirty_chapters": "[]",
+                    "baseline": "{}"}
+        row.setdefault("schema_version", "v1")
+        row.setdefault("dirty_chapters", "[]")
+        row.setdefault("baseline", "{}")
+        return row
+
+    def set_memory_state(self, work_id: str, *, manifest: Any = None,
+                         last_chapter: int | None = None,
+                         schema_version: str | None = None,
+                         dirty_chapters: Any = None,
+                         baseline: Any = None) -> None:
+        state = self.get_memory_state(work_id)
+        payload = state.get("manifest") if manifest is None else _json(manifest)
+        chapter = (state.get("last_chapter") if last_chapter is None
+                   else int(last_chapter))
+        schema = (state.get("schema_version") if schema_version is None
+                  else str(schema_version))
+        dirty = (str(state.get("dirty_chapters") or "[]")
+                 if dirty_chapters is None else _json(dirty_chapters))
+        base = (str(state.get("baseline") or "{}")
+                if baseline is None else _json(baseline))
+        self.get_conn().execute(
+            "INSERT INTO work_memory_state"
+            " (work_id, manifest, last_chapter, last_consolidated_at,"
+            " schema_version, dirty_chapters, baseline)"
+            " VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT(work_id) DO UPDATE SET manifest=excluded.manifest,"
+            " last_chapter=excluded.last_chapter,"
+            " last_consolidated_at=excluded.last_consolidated_at,"
+            " schema_version=excluded.schema_version,"
+            " dirty_chapters=excluded.dirty_chapters,"
+            " baseline=excluded.baseline",
+            (work_id, payload, chapter, _now_ms(), schema, dirty, base))
+        self.get_conn().commit()
+
+    def get_summary(self, chapter_id: str) -> dict[str, Any] | None:
+        """一章的结算摘要（含 ``state_delta`` 与 ``key_events``）。"""
+        cur = self.get_conn().execute(
+            "SELECT * FROM chapter_summaries WHERE chapter_id=?",
+            (chapter_id,))
+        row = self._row(cur.fetchone())
+        if row is None:
+            return None
+        for key in ("key_events", "state_delta"):
+            fallback = "[]" if key == "key_events" else "{}"
+            try:
+                row[key] = json.loads(row.get(key) or fallback)
+            except (json.JSONDecodeError, TypeError):
+                row[key] = [] if key == "key_events" else {}
+        return row
+
+    def set_dirty_chapters(self, work_id: str, chapters: Any) -> None:
+        """只改「已结算未抽取」章号，不动 ``last_consolidated_at``。"""
+        state = self.get_memory_state(work_id)
+        self.get_conn().execute(
+            "INSERT INTO work_memory_state"
+            " (work_id, manifest, last_chapter, last_consolidated_at,"
+            " schema_version, dirty_chapters, baseline)"
+            " VALUES (?,?,?,?,?,?,?)"
+            " ON CONFLICT(work_id) DO UPDATE SET"
+            " dirty_chapters=excluded.dirty_chapters",
+            (work_id, str(state.get("manifest") or "{}"),
+             int(state.get("last_chapter") or -1),
+             int(state.get("last_consolidated_at") or 0),
+             str(state.get("schema_version") or "v1"),
+             _json(list(chapters or [])),
+             str(state.get("baseline") or "{}")))
+        self.get_conn().commit()
 
     def recent_summaries(self, work_id: str, before_chapter: int,
                          limit: int = 3) -> list[dict[str, Any]]:
@@ -962,15 +1459,23 @@ class WritingDB(BaseDatabase):
                       author: str = "user", message: str = "",
                       chapter_index: int = 0,
                       move_head: bool = True,
-                      log_from: str | None = None) -> dict[str, Any]:
-        """写一条提交并（默认）推进分支与 HEAD。内容是版本指针，不复制正文。
+                      log_from: str | None = None,
+                      files: Mapping[str, str] | None = None
+                      ) -> dict[str, Any]:
+        """写一条提交并（默认）推进分支与 HEAD。正文存版本指针，不复制。
 
         ``move_head=False`` 用于暂存（stash）这类「只入图、不动指针」的快照。
+        ``files`` 是工作区文件（``{路径: 正文}``）；``None`` 表示不跟踪——
+        旧提交与「只提交几章」的局部提交走这条，文件留在工作区不动。
         """
-        from writegraph.versioning import normalize_tree, tree_hash, ledger_hash
+        from writegraph.versioning import (file_manifest, files_hash,
+                                           ledger_hash, normalize_tree,
+                                           tree_hash)
         norm = normalize_tree(tree)
         th = tree_hash(norm)
         lh = ledger_hash(ledger)
+        manifest = file_manifest(files) if files is not None else {}
+        fh = files_hash(manifest) if files is not None else ""
         commit_id = _new_id("cm")
         now = _now_ms()
         conn = self.get_conn()
@@ -980,11 +1485,21 @@ class WritingDB(BaseDatabase):
                 "INSERT INTO commits (id, work_id, parent_id, parent2_id,"
                 " branch_name, kind, author, message, chapter_index,"
                 " tree_json, tree_hash, ledger_json, ledger_hash,"
-                " time_created)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " files_hash, time_created)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (commit_id, work_id, parent_id, parent2_id or "",
                  branch_name, kind, author, message, int(chapter_index or 0),
-                 _json(norm), th, _json(dict(ledger)), lh, now))
+                 _json(norm), th, _json(dict(ledger)), lh, fh, now))
+            if files is not None:
+                for path, digest in manifest.items():
+                    conn.execute(
+                        "INSERT OR IGNORE INTO work_file_blobs"
+                        " (work_id, hash, content) VALUES (?,?,?)",
+                        (work_id, digest, str(files[path])))
+                    conn.execute(
+                        "INSERT OR REPLACE INTO commit_files"
+                        " (commit_id, path, hash) VALUES (?,?,?)",
+                        (commit_id, path, digest))
             if move_head:
                 conn.execute(
                     "INSERT INTO refs (work_id, name, kind, commit_id,"
@@ -1017,6 +1532,42 @@ class WritingDB(BaseDatabase):
         cur = self.get_conn().execute(
             "SELECT * FROM commits WHERE id=?", (commit_id,))
         return self._row(cur.fetchone())
+
+    # ── 提交里的工作区文件 ────────────────────────────────────────────────
+
+    def get_commit_files(self, commit_id: str) -> dict[str, str]:
+        """这条提交的文件清单：``{路径: 内容 hash}``。旧提交返回空。"""
+        cur = self.get_conn().execute(
+            "SELECT path, hash FROM commit_files WHERE commit_id=?"
+            " ORDER BY path", (commit_id,))
+        return {str(r["path"]): str(r["hash"]) for r in cur.fetchall()}
+
+    def get_file_blob(self, work_id: str, digest: str) -> str | None:
+        cur = self.get_conn().execute(
+            "SELECT content FROM work_file_blobs WHERE work_id=? AND hash=?",
+            (work_id, digest))
+        row = cur.fetchone()
+        return None if row is None else str(row["content"])
+
+    def get_commit_file_contents(self, commit_id: str) -> dict[str, str]:
+        """清单 → 正文。回放 / 合并 / 提交校验用，状态比较不用它。"""
+        cur = self.get_conn().execute(
+            "SELECT f.path, b.content FROM commit_files f"
+            " JOIN commits c ON c.id=f.commit_id"
+            " JOIN work_file_blobs b ON b.work_id=c.work_id"
+            " AND b.hash=f.hash WHERE f.commit_id=? ORDER BY f.path",
+            (commit_id,))
+        return {str(r["path"]): str(r["content"]) for r in cur.fetchall()}
+
+    def get_file_contents(self, work_id: str,
+                          manifest: Mapping[str, str]) -> dict[str, str]:
+        """按清单取正文；缺 blob（数据损坏）的路径直接跳过。"""
+        out: dict[str, str] = {}
+        for path, digest in manifest.items():
+            text = self.get_file_blob(work_id, str(digest))
+            if text is not None:
+                out[str(path)] = text
+        return out
 
     def list_commits(self, work_id: str, *, branch: str | None = None,
                      limit: int = 100,
@@ -1315,11 +1866,12 @@ class WritingDB(BaseDatabase):
                 " WHERE chapter_id=? AND status='current'", (chapter_id,))
             conn.execute(
                 "INSERT INTO review_runs (id, chapter_id, content_hash,"
-                " domains_json, quality_score, coverage, gate_status,"
-                " delivery_status, status, model, time_created)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                " domains_json, goal_review_json, quality_score, coverage,"
+                " gate_status, delivery_status, status, model, time_created)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (run_id, chapter_id, content_hash,
                  _json(result.get("criteria") or []),
+                 _json(result.get("goal_review") or {}),
                  result.get("quality_score"), result.get("coverage"),
                  result.get("gate_status"), result.get("delivery_status"),
                  "current", model, now))
@@ -1354,6 +1906,11 @@ class WritingDB(BaseDatabase):
             run["criteria"] = json.loads(run.get("domains_json") or "[]")
         except (json.JSONDecodeError, TypeError):
             run["criteria"] = []
+        try:
+            run["goal_review"] = json.loads(run.get("goal_review_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            run["goal_review"] = {}
+        run["goal_summary"] = _goal_summary(run["goal_review"])
         return run
 
     def create_revision(self, chapter_id: str, *, run_id: str | None,
@@ -1537,6 +2094,16 @@ class WritingDB(BaseDatabase):
             value, reason = str(op.get("value") or ""), None
         else:
             value, reason = None, str(op.get("unknown_reason") or "unclaimed")
+
+        if op.get("resettle"):
+            # 同一章重结算：上一版在本章起点产生的行标 superseded，
+            # 区间收到 [since, since]（满足 CHECK），但不参与求值。
+            conn.execute(
+                "UPDATE facts SET valid_until_chapter=?, superseded=1"
+                " WHERE work_id=? AND subject_ref=? AND field=?"
+                " AND valid_from_chapter=? AND superseded=0",
+                (since, work_id, subject_ref, field, since),
+            )
 
         conn.execute(
             "INSERT INTO facts (id, work_id, subject_type, subject_ref, field,"

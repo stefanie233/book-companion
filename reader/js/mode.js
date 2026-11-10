@@ -1,4 +1,4 @@
-/* Book Companion — reading mode prelude.
+/* Liubai — reading mode prelude.
  *
  * 三档分段药丸只出现在阅读页的空白会话里（开始对话后消失，模式随会话
  * 冻结）；选中块是一枚会滑动的药丸，位移带一点挤压/回弹的果冻感。
@@ -14,6 +14,12 @@ const MODE_LABELS = {
   roleplay: '扮演'
 };
 
+// 写作子模式：后端值 standard/detail，界面叫「高效/细致」（决策 161）。
+const WRITING_MODE_LABELS = {
+  standard: '高效',
+  detail: '细致'
+};
+
 // ── Sliding thumb ─────────────────────────────────────────────────
 // 药丸位置由 JS 测量（三档宽度可能随标签/图标/容器查询变化），
 // 位移动画走 WAAPI：可中断，快速连点时从当前形变处接着走，不跳帧。
@@ -25,8 +31,8 @@ function _reduceMotion() {
 }
 
 /** 量出当前选中项相对凹槽的位置；预选块不可见时返回 null。 */
-function _thumbGeometry() {
-  const seg = document.getElementById('modeSeg');
+function _thumbGeometry(segId) {
+  const seg = document.getElementById(segId || 'modeSeg');
   if (!seg) return null;
   const opt = seg.querySelector('.mode-seg-opt.active');
   const thumb = seg.querySelector('.mode-seg-thumb');
@@ -54,8 +60,8 @@ function _thumbX(thumb) {
 }
 
 /** 把药丸挪到当前选中项。animate=false 用于首次定位 / 尺寸变化。 */
-export function syncThumb(animate) {
-  const g = _thumbGeometry();
+export function syncThumb(animate, segId) {
+  const g = _thumbGeometry(segId);
   if (!g) return;
   const { seg, thumb, x, w } = g;
   seg.style.setProperty('--seg-thumb-w', w + 'px');
@@ -133,43 +139,92 @@ export function setMode(mode) {
 }
 
 /** 预选块只在「阅读页 + 空白会话」出现。发出第一条消息后它消失，
- *  该会话的阅读模式也就此固定（界面不再提供改模式的入口）。 */
+ *  该会话的阅读模式也就固定（界面不再提供改模式的入口）。 */
 export function updateModePrelude() {
   const el = document.getElementById('modePrelude');
+  if (el) {
+    const onReader = window._currentTab === 'reader';
+    const fresh = (S.chatHistory || []).length === 0 && !S.currentSessionId;
+    const show = onReader && fresh;
+    el.classList.toggle('visible', show);
+    // display:none → flex 之后才量得到宽度：下一帧把药丸摆到选中项。
+    if (show) requestAnimationFrame(function () { syncThumb(false); });
+  }
+  updateWritingModePrelude();
+}
+
+/** 写作子模式的选中态；只动界面与 S.writingMode，不动 S.currentMode。 */
+function syncWritingModeSeg(mode, animate) {
+  const seg = document.getElementById('writeModeSeg');
+  if (!seg) return;
+  seg.querySelectorAll('.mode-seg-opt').forEach(function (opt) {
+    const on = opt.dataset.mode === mode;
+    opt.classList.toggle('active', on);
+    opt.setAttribute('aria-checked', on ? 'true' : 'false');
+  });
+  requestAnimationFrame(function () { syncThumb(!!animate, 'writeModeSeg'); });
+}
+
+export function setWritingMode(mode) {
+  if (!WRITING_MODE_LABELS[mode]) return;
+  S.writingMode = mode;
+  syncWritingModeSeg(mode, true);
+}
+
+/** 与阅读模式同一套规则：只在「写作页 + 空白会话」出现，
+ *  发出第一条消息后固定；之后由 agent 经作者授权切换。 */
+export function updateWritingModePrelude() {
+  // 待归类整理建议与预选块同一套时机：会话一开始/切页就重算显隐。
+  if (window.WritingUI && typeof window.WritingUI.syncCookSuggest === 'function') {
+    window.WritingUI.syncCookSuggest();
+  }
+  const el = document.getElementById('writeModePrelude');
   if (!el) return;
-  const onReader = window._currentTab === 'reader';
+  const onWrite = window._currentTab === 'write';
   const fresh = (S.chatHistory || []).length === 0 && !S.currentSessionId;
-  const show = onReader && fresh;
+  const show = onWrite && fresh;
   el.classList.toggle('visible', show);
-  // display:none → flex 之后才量得到宽度：下一帧把药丸摆到选中项。
-  if (show) requestAnimationFrame(function () { syncThumb(false); });
+  if (show) requestAnimationFrame(function () {
+    syncWritingModeSeg(S.writingMode || 'standard', false);
+  });
 }
 
-// 方向键在三档之间移动（radiogroup 的标准键盘行为）；Tab 仍逐项可达。
-function onSegKeydown(e) {
-  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-  const opts = Array.prototype.slice.call(
-    document.querySelectorAll('#modeSeg .mode-seg-opt'));
-  const idx = opts.indexOf(document.activeElement);
-  if (idx < 0) return;
-  e.preventDefault();
-  const next = (idx + (e.key === 'ArrowRight' ? 1 : -1) + opts.length) % opts.length;
-  opts[next].focus();
-  setMode(opts[next].dataset.mode);
+// 方向键在各档之间移动（radiogroup 的标准键盘行为）；Tab 仍逐项可达。
+function _segKeydown(segId, setter) {
+  return function (e) {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const seg = document.getElementById(segId);
+    if (!seg) return;
+    const opts = Array.prototype.slice.call(
+      seg.querySelectorAll('.mode-seg-opt'));
+    const idx = opts.indexOf(document.activeElement);
+    if (idx < 0) return;
+    e.preventDefault();
+    const next = (idx + (e.key === 'ArrowRight' ? 1 : -1) + opts.length)
+      % opts.length;
+    opts[next].focus();
+    setter(opts[next].dataset.mode);
+  };
 }
 
-const segEl = document.getElementById('modeSeg');
-if (segEl) {
-  segEl.addEventListener('keydown', onSegKeydown);
+function _bindSeg(segId, setter) {
+  const el = document.getElementById(segId);
+  if (!el) return;
+  el.addEventListener('keydown', _segKeydown(segId, setter));
   // 面板拖窄会收起标签（容器查询），药丸宽度跟着变——重新量一次。
   if (typeof ResizeObserver === 'function') {
-    new ResizeObserver(function () { syncThumb(false); }).observe(segEl);
+    new ResizeObserver(function () { syncThumb(false, segId); }).observe(el);
   }
 }
+
+_bindSeg('modeSeg', setMode);
+_bindSeg('writeModeSeg', setWritingMode);
 
 // ── HTML onclick access ───────────────────────────────────────────
 window.setMode = setMode;
 window.updateModePrelude = updateModePrelude;
+window.setWritingMode = setWritingMode;
+window.updateWritingModePrelude = updateWritingModePrelude;
 window.syncModeThumb = syncThumb;
 
 // setModeLabel — lightweight: updates the segmented control only, doesn't

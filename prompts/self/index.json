@@ -1,0 +1,78 @@
+{
+  "version": 1,
+  "cards": [
+    {
+      "id": "writing-version",
+      "title": "版本（每次改动存一档）",
+      "aliases": ["git", "版本", "提交", "存档", "快照", "回滚", "撤销",
+                  "退回去", "改坏了", "分支", "合并", "历史"],
+      "pages": ["writing"],
+      "where": "写作页左栏 → 版本控制",
+      "probe": "vcs",
+      "related": ["writing-contract", "writing-workspace"],
+      "danger": ["discard", "rollback", "merge"],
+      "file": "cards/writing-version.md"
+    },
+    {
+      "id": "writing-contract",
+      "title": "合同（这一章的验收单）",
+      "aliases": ["合同", "立约", "验收单", "这一章要写什么", "改合同",
+                  "结清", "大纲"],
+      "pages": ["writing"],
+      "where": "写作页 → 章节卡 / 合同总览",
+      "probe": null,
+      "related": ["writing-workspace", "writing-version"],
+      "danger": [],
+      "file": "cards/writing-contract.md"
+    },
+    {
+      "id": "writing-workspace",
+      "title": "作品工作区（四块文件）",
+      "aliases": ["工作区", "作品记忆", "设定", "计划稿", "素材",
+                  "文件区", "文件夹", "资料"],
+      "pages": ["writing"],
+      "where": "写作页左栏 → 作品 → 工作区",
+      "probe": null,
+      "related": ["writing-contract", "writing-version"],
+      "danger": ["delete", "overwrite"],
+      "file": "cards/writing-workspace.md"
+    },
+    {
+      "id": "author-layer",
+      "title": "作者层（作者本人也是研究对象）",
+      "aliases": ["作者档案", "作者层", "作者是谁", "声音", "年谱", "序跋",
+                  "档案是空的", "作者经历", "采集"],
+      "pages": ["reader"],
+      "where": "阅读页 → 作者档案 / 时间轴",
+      "probe": "authors",
+      "related": ["model-binding"],
+      "danger": [],
+      "file": "cards/author-layer.md"
+    },
+    {
+      "id": "model-binding",
+      "title": "模型绑定（每个能力各绑一条连接）",
+      "aliases": ["模型绑定", "绑定", "连接", "配置", "模型", "控制台",
+                  "没配置", "联网", "联网搜索", "语音", "音色", "识别",
+                  "api"],
+      "pages": ["home", "reader", "writing"],
+      "where": "控制台 → 模型绑定",
+      "probe": "provider",
+      "related": ["semantic-recall"],
+      "danger": [],
+      "file": "cards/model-binding.md"
+    },
+    {
+      "id": "semantic-recall",
+      "title": "语义召回（按意思找段落）",
+      "aliases": ["语义召回", "语义搜索", "找素材", "相似内容", "召回",
+                  "向量", "索引", "embedding", "按意思找"],
+      "pages": ["writing"],
+      "where": "写作页 → 找素材（source=semantic）",
+      "probe": "semantic",
+      "related": ["model-binding"],
+      "danger": [],
+      "file": "cards/semantic-recall.md"
+    }
+  ]
+}

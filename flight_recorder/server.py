@@ -101,7 +101,7 @@ def install_context_log_routes(app: web.Application, context_recorder) -> None:
 
     1. Expose the recorder on the app (the SSE chat handler reads it).
     2. Auto-detect an external session recorder DB (~/.hermes/context_log.db)
-       and show its sessions alongside Book Companion ones.
+       and show its sessions alongside Liubai ones.
     3. Register the /api/context-log REST routes + serve the viewer page.
     """
     app["context_recorder"] = context_recorder

@@ -9,5 +9,8 @@
   "memory": {
     "char_limit": 2200,
     "user_char_limit": 1375
-  }
+  },
+  "agent_name": "留白",
+  "user_name": "",
+  "user_gender": ""
 }

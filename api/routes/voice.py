@@ -12,7 +12,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-_APP_ROOT = Path(__file__).resolve().parents[2]
+from runtime_paths import data_path
 
 
 # ── Voice (TTS + ASR) ────────────────────────────────────────────────────
@@ -45,7 +45,7 @@ def _get_sense_voice():
         if _sense_voice_model is not None:  # 双检：可能已被别的线程加载完
             return _sense_voice_model
 
-        model_dir = _APP_ROOT / "data" / "models" / "iic" / "SenseVoiceSmall"
+        model_dir = data_path("models", "iic", "SenseVoiceSmall")
         if not model_dir.exists():
             _SENSE_VOICE_STATE.update(
                 state="failed", error=f"model not found: {model_dir}")
@@ -121,7 +121,7 @@ async def warm_asr_background(grace_s: float = 2.5) -> None:
 
 
 
-_VOICE_DIR = _APP_ROOT / "data" / "voice"
+_VOICE_DIR = data_path("voice")
 _VOICE_TTS_DIR = _VOICE_DIR / "tts"
 _VOICE_REC_DIR = _VOICE_DIR / "recordings"
 _VOICE_REFS_DIR = _VOICE_DIR / "refs"

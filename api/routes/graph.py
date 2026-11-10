@@ -9,7 +9,6 @@ from typing import Any
 
 from aiohttp import web
 
-_APP_ROOT = Path(__file__).resolve().parents[2]
 
 
 # ── BookGraph endpoints ───────────────────────────────────────────────────
@@ -104,8 +103,8 @@ def _get_graph_db(request: web.Request, book_id: str):
     elif config:
         graph_path = config.graph_db_path(book_id)
     else:
-        from pathlib import Path
-        graph_path = _APP_ROOT / "data" / "graphs" / f"graph_{book_id}.db"
+        from runtime_paths import data_path
+        graph_path = data_path("graphs", f"graph_{book_id}.db")
     return GraphDB(graph_path)
 
 

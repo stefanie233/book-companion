@@ -1,10 +1,14 @@
-/* Book Companion — entry point: init, view state, tab switching, UI shell. */
+/* Liubai — entry point: init, view state, tab switching, UI shell. */
 
 import { S } from './state.js';
+import { escapeHtml } from './utils.js';
 import { getWelcomeMessage } from './greetings.js';
-import { loadSettings, applySettings, populateThemeForm } from './theme.js';
+import { loadSettings, applySettings, populateThemeForm,
+         loadAgentProfile, refreshAgentProfile,
+         loadUserProfile, refreshUserProfile,
+         refreshBenchPreview } from './theme.js';
 import { loadShelfSort, loadShelfScene, updateShelfSortUI, loadShelf, loadBookDropdown, refreshBooks, refreshWatchStatus, initStickyCompact, initSortPanel, initShelfReorder } from './shelf.js';
-import { selectBook } from './reader.js';
+import { renderBookProgress, selectBook } from './reader.js';
 import { refreshUsage } from './context-usage.js';
 import { checkOnboarding } from './onboarding.js';
 import { resizeNative, suspendHostResizeObserver, resumeHostResizeObserver,
@@ -12,6 +16,7 @@ import { resizeNative, suspendHostResizeObserver, resumeHostResizeObserver,
          whenHostVisible,
          jumpToCfi, jumpToAnchor } from './epub-reader.js';
 import { onSearchLeftScroll } from './search.js';
+import { leaveFocusModeSilently } from './focus-mode.js';
 import { createMorph } from '../lib/morphicons.dom.js';
 import './mode.js';     // side-effect: registers window.setMode / window.setModeLabel
 
@@ -185,9 +190,10 @@ export function updateContextBar(bookTitle, chapterTitle) {
   const bar = document.getElementById('contextBar');
   if (!bookTitle) { bar.style.display = 'none'; return; }
   bar.style.display = '';
-  let text = '\u{1F4D6} 正在阅读《' + bookTitle + '》';
-  if (chapterTitle) text += ' · ' + chapterTitle;
-  bar.textContent = text;
+  // 图标用项目统一的 lucide（丑拒 emoji）；书名/章名要转义，这里改了 innerHTML。
+  bar.innerHTML = '<i data-lucide="book-open"></i> 正在阅读《'
+    + escapeHtml(bookTitle) + '》'
+    + (chapterTitle ? ' · ' + escapeHtml(chapterTitle) : '');
 }
 
 export function hideContextBar() {
@@ -318,6 +324,17 @@ export function recordTabSession(tab, sid, opts) {
   if (tab === 'reader') {
     entry.bookId = (opts && opts.bookId) || S.currentBook || '';
   }
+  if (tab === 'write') {
+    // 写作会话按作品归档：显式传来的一轮现场优先（可能是别的作品的
+    // 会话被点开），否则取写作页当前打开的那本。
+    if (opts && opts.workId !== undefined && opts.workId !== null) {
+      entry.workId = opts.workId || '';
+    } else {
+      const ctx = window.WritingUI && window.WritingUI.context
+        ? window.WritingUI.context() : null;
+      entry.workId = (ctx && ctx.workId) || '';
+    }
+  }
   map[tab] = entry;
   _writeTabSessions(map);
 }
@@ -435,8 +452,25 @@ export function switchTab(tab, skipLoad) {
   // 切离阅读 tab 前暂存视口 CFI。.page 的 display 切换会让滚动容器塌成 0
   // 尺寸、scrollTop 丢失——不暂存的话切回来视口停在书首，随后的 scrolled
   // 事件把 (0,0) 落库，表现为"切页后进度收敛到 1/N"。
-  if (window._currentTab === 'reader' && tab !== 'reader') stashViewport();
+  if (window._currentTab === 'reader' && tab !== 'reader') {
+    // 沉浸态是阅读页的姿势，别把 body 类带到别的页上（侧栏/聊天都藏了）。
+    leaveFocusModeSilently();
+    stashViewport();
+  }
+  // 点导航栏 = 离开现场：写作页/阅读页的引用都是「选一下就成立」的，
+  // 切页后既看不到原文也没法撤销，留着只会在下一次发送时悄悄带上。
+  if (typeof window.clearWritingSelection === 'function') {
+    window.clearWritingSelection();
+  }
+  if (typeof window.clearWorkspaceSelection === 'function') {
+    window.clearWorkspaceSelection();
+  }
+  if (typeof window.clearBookSelection === 'function') {
+    window.clearBookSelection();
+  }
   window._currentTab = tab;
+  // 会话面板的页签跟着界面走：写作页只有「按作品」，其它页没有写作页签。
+  if (window.refreshSessionChrome) window.refreshSessionChrome();
 
   document.querySelectorAll('.sidebar .tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
@@ -505,6 +539,9 @@ export function switchTab(tab, skipLoad) {
   if (tab === 'theme') {
     setChatPanelVisible(false);
     hideContextBar();
+    refreshAgentProfile();
+    refreshUserProfile();
+    refreshBenchPreview();
   }
   if (tab === 'console') {
     setChatPanelVisible(false);
@@ -585,8 +622,7 @@ export async function jumpToPosition(bookId, chapterIdx, chunkIdx, cfi) {
     S.currentChunk = chunk;
     const chSel = document.getElementById('chapterSelect');
     if (chSel) chSel.value = chapter;
-    const pos = document.getElementById('chunkPos');
-    if (pos) pos.textContent = (chunk + 1) + ' / ...';
+    renderBookProgress(chapter, chunk);
     if (window.loadChunk) await window.loadChunk();
   }
   saveViewState();
@@ -745,6 +781,8 @@ document.addEventListener('DOMContentLoaded', function () {
   const settings = loadSettings();
   applySettings(settings);
   populateThemeForm(settings);
+  loadAgentProfile();
+  loadUserProfile();
 
   // ── Click-outside listeners ─────────────────────────────────
   // Session panel — two-tier hit-test:

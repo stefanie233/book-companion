@@ -20,6 +20,7 @@ TABLE_BOOK_FTS = "book_fts"
 TABLE_SESSION_FTS = "session_fts"
 TABLE_IMPORT_LOG = "import_log"
 TABLE_ANNOTATIONS = "annotations"
+TABLE_ANNOTATION_EVENTS = "annotation_events"
 
 # ── DDL ────────────────────────────────────────────────────────────────────
 
@@ -175,6 +176,23 @@ ALTER TABLE {TABLE_SESSIONS} ADD COLUMN role_kind TEXT NOT NULL DEFAULT 'charact
 # 存 id 不存名字：名字会随去重/改名漂移，而这一列是**解析的入口**。
 ALTER_SESSIONS_ROLE_REF = f"""
 ALTER TABLE {TABLE_SESSIONS} ADD COLUMN role_ref TEXT NOT NULL DEFAULT '';
+"""
+
+# 写作会话绑定的作品 id（writing.db 的 works.id）。阅读会话用 project_id
+# 装书，写作会话没有书；不另开一张表，是因为它会跟着每条消息**重绑**到
+# 当前打开的作品上（换作品继续聊 = 这段对话现在属于新作），一行列最省。
+ALTER_SESSIONS_WORK_ID = f"""
+ALTER TABLE {TABLE_SESSIONS} ADD COLUMN work_id TEXT NOT NULL DEFAULT '';
+"""
+
+# 写作子模式（细致 / 标准）与「允许 agent 自己切」的持久授权。
+# 都存在会话上：同一本书可以开两条线，一条标准一条细致；切作品不带走模式。
+ALTER_SESSIONS_WRITING_MODE = f"""
+ALTER TABLE {TABLE_SESSIONS} ADD COLUMN writing_mode TEXT NOT NULL DEFAULT 'standard';
+"""
+
+ALTER_SESSIONS_AUTO_MODE_SWITCH = f"""
+ALTER TABLE {TABLE_SESSIONS} ADD COLUMN auto_mode_switch INTEGER NOT NULL DEFAULT 0;
 """
 
 ALTER_CHAPTERS_TYPE = f"""
@@ -576,6 +594,41 @@ ANNOTATION_INDEXES = [
     f"ON {TABLE_ANNOTATIONS}(book_id, chapter_index, chunk_index);",
 ]
 
+# ── Annotation event journal (append-only) ────────────────────────────────
+# annotations 只存最终态：更新覆盖旧值、删除是物理 DELETE。要回答「我最近
+# 改/删了哪条笔记收藏」，必须在动作发生时留一笔。这张表不做外键（批注删了
+# 事件还要在），书名也存快照（书后来被删时日志仍可读）。
+
+CREATE_ANNOTATION_EVENTS = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_ANNOTATION_EVENTS} (
+    id                TEXT PRIMARY KEY,
+    annotation_id     TEXT NOT NULL,
+    stable_book_id    TEXT NOT NULL,
+    book_id           TEXT,
+    book_title        TEXT NOT NULL DEFAULT '',
+    event_type        TEXT NOT NULL,
+    annotation_type   TEXT NOT NULL DEFAULT '',
+    style             TEXT,
+    selected_text     TEXT NOT NULL DEFAULT '',
+    note_text         TEXT,
+    changed_fields    TEXT NOT NULL DEFAULT '[]',
+    chapter_index     INTEGER,
+    chunk_index       INTEGER,
+    time_created      INTEGER NOT NULL
+);
+"""
+
+ANNOTATION_EVENT_INDEXES = [
+    f"CREATE INDEX IF NOT EXISTS idx_annotation_events_time "
+    f"ON {TABLE_ANNOTATION_EVENTS}(time_created DESC);",
+    f"CREATE INDEX IF NOT EXISTS idx_annotation_events_stable "
+    f"ON {TABLE_ANNOTATION_EVENTS}(stable_book_id, time_created DESC);",
+    f"CREATE INDEX IF NOT EXISTS idx_annotation_events_ann "
+    f"ON {TABLE_ANNOTATION_EVENTS}(annotation_id);",
+    f"CREATE INDEX IF NOT EXISTS idx_annotation_events_type "
+    f"ON {TABLE_ANNOTATION_EVENTS}(event_type);",
+]
+
 BOOK_DDL = [
     CREATE_BOOK_CATEGORIES,
     CREATE_BOOKS,
@@ -600,6 +653,12 @@ class SessionRow:
     """Lightweight row representation — no messages attached."""
     id: str
     project_id: str = ""
+    #: 写作会话绑定的作品（writing.db 的 works.id）；非写作会话为空。
+    work_id: str = ""
+    #: 写作子模式：``standard`` | ``detail``。非写作会话保持默认。
+    writing_mode: str = "standard"
+    #: 作者是否授权 agent 自己切写作模式（1 = 允许）。
+    auto_mode_switch: int = 0
     parent_id: str | None = None
     title: str | None = None
     agent: str | None = None
@@ -773,6 +832,31 @@ class ImportLogRow:
     first_paragraph: str | None = None
     source_filename: str = ""
     import_count: int = 1
+    time_created: int = 0
+
+
+@dataclass
+class AnnotationEventRow:
+    """An append-only journal entry for a user note/highlight action.
+
+    ``book_title`` is a snapshot: the book may be deleted later while the
+    event log must stay readable.  ``note_text`` / ``selected_text`` keep
+    the full body so a deleted note can still be identified (the query
+    tool truncates it for display).
+    """
+    id: str
+    annotation_id: str
+    stable_book_id: str
+    book_id: str | None = None
+    book_title: str = ""
+    event_type: str = "create"       # create | update | delete
+    annotation_type: str = ""        # highlight | note | both
+    style: str | None = None
+    selected_text: str = ""
+    note_text: str | None = None
+    changed_fields: str = "[]"       # JSON array of field names
+    chapter_index: int | None = None
+    chunk_index: int | None = None
     time_created: int = 0
 
 

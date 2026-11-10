@@ -24,13 +24,13 @@
 - `name` 用正文里**最完整的那一种写法**，没有全称就用最常用的那个。
   中文名不要替它补姓，译名不要自己音译 —— 正文里没出现过的写法不是名字。
 - **光有称谓的要加限定词。** 正文里只叫「母亲」「舅舅」「女仆」的人，`name`
-  写成「沈砚的母亲」这种**带名字**的形式，把「母亲」放进 `aliases`。
+  写成「人物A的母亲」这种**带名字**的形式，把「母亲」放进 `aliases`。
   否则书里两个母亲会被合成一个人 —— 而这是表格里最贵的一种错。
   （实测：写成抽象的「某某的母亲」，模型会照抄「母亲」两个字的裸称谓，
   一本书里出现两个「母亲」节点。）
 - `aliases` 收正文里**真实出现过的**其它叫法：昵称、称谓（「表姐」「舅舅」）、
   全名、简称。**不要收别的译本或别处的写法**。
-- `identity` 一句话，**这个人一出场就成立**的那种：「药铺学徒，祁元朗的关门
+- `identity` 一句话，**这个人一出场就成立**的那种：「药铺学徒，人物B的关门
   弟子，做事缜密」；不要写成某个场景里的动作（「她在窗边哭泣」）。
 - **不要写结局。** 死亡、远走、后来的婚嫁、最后的变故 —— 一个字都不要进
   `identity`。这句话会直接进角色卡，而角色卡**不按章节过滤**：写了结局，
@@ -103,26 +103,26 @@
 ```json
 {
   "entities": [
-    {"name": "沈砚", "kind": "character",
-     "aliases": ["沈师弟", "小沈"],
-     "identity": "柳记药铺的学徒，祁元朗的关门弟子，做事缜密",
-     "chapter": 2, "evidence": "沈砚在柜上抓药，手比谁都稳。"},
-    {"name": "祁元朗", "kind": "character",
-     "aliases": ["祁先生", "师父"],
-     "identity": "柳记药铺的坐堂大夫", "chapter": 2,
-     "evidence": "祁先生坐在里间，隔着帘子听外头报药名。"},
-    {"name": "沈荷", "kind": "character",
-     "aliases": ["阿荷", "姐姐"],
-     "identity": "沈砚的姐姐，在城南替人浆洗", "chapter": 3,
-     "evidence": "阿荷每月十五来看他一回。"}
+    {"name": "人物A", "kind": "character",
+     "aliases": ["A师弟", "小A"],
+     "identity": "某药铺的学徒，人物B的关门弟子，做事缜密",
+     "chapter": 2, "evidence": "人物A在柜上抓药，手比谁都稳。"},
+    {"name": "人物B", "kind": "character",
+     "aliases": ["B先生", "师父"],
+     "identity": "某药铺的坐堂大夫", "chapter": 2,
+     "evidence": "B先生坐在里间，隔着帘子听外头报药名。"},
+    {"name": "人物C", "kind": "character",
+     "aliases": ["阿C", "姐姐"],
+     "identity": "人物A的姐姐，在城南替人浆洗", "chapter": 3,
+     "evidence": "阿C每月十五来看他一回。"}
   ],
   "relations": [
-    {"source": "沈砚", "kind": "sibling_of", "target": "沈荷",
-     "chapter": 3, "evidence": "阿荷每月十五来看他一回。", "detail": "姐弟"},
-    {"source": "沈砚", "kind": "student_of", "target": "祁元朗",
-     "chapter": 2, "evidence": "沈砚在柜上抓药，手比谁都稳。", "detail": "师徒"},
-    {"source": "沈砚", "kind": "works_at", "target": "柳记药铺",
-     "chapter": 2, "evidence": "沈砚在柜上抓药，手比谁都稳。", "detail": "学徒"}
+    {"source": "人物A", "kind": "sibling_of", "target": "人物C",
+     "chapter": 3, "evidence": "阿C每月十五来看他一回。", "detail": "姐弟"},
+    {"source": "人物A", "kind": "student_of", "target": "人物B",
+     "chapter": 2, "evidence": "人物A在柜上抓药，手比谁都稳。", "detail": "师徒"},
+    {"source": "人物A", "kind": "works_at", "target": "某药铺",
+     "chapter": 2, "evidence": "人物A在柜上抓药，手比谁都稳。", "detail": "学徒"}
   ]
 }
 ```

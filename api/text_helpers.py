@@ -137,6 +137,57 @@ def _resolve_selection_position(db, book_id, body, position):
     return None, None
 
 
+_WRITING_SELECTION_LIMIT = 1200
+
+
+def writing_selection_block(selection: str, source: str) -> str:
+    """`<user-selection>` block for the writing page.
+
+    Two sources, both page-local: ``writing`` is a passage the author selected
+    in the chapter editor, ``chat`` is a sentence they quoted from the agent's
+    previous reply. Neither is reading-page context.
+
+    The editor passage is verbatim chapter text and the frontend flushes the
+    editor before sending, so it is already on disk — that makes it usable as
+    an ``anchor_quote`` for ``writing_replace_text`` and findable in
+    ``writing_read_chapter``. Truncation is 1200 chars rather than the reading
+    page's 200: a writing selection is usually a whole paragraph, and cutting
+    at 200 would split the very passage the author wants rewritten.
+    """
+    body = (selection or "")[: _WRITING_SELECTION_LIMIT]
+    if len(selection or "") > _WRITING_SELECTION_LIMIT:
+        body += "…（已截断）"
+    if source == "workspace":
+        if body.endswith("/"):
+            return (
+                "<user-selection source=\"工作区文件夹\">\n"
+                f"  作者把这个工作区文件夹加进了聊天：{body}\n"
+                "  先 writing_docs(action=\"list\", path=…) 看里面有什么，"
+                "需要时再逐份 read；不要假设内容。\n"
+                "</user-selection>"
+            )
+        return (
+            "<user-selection source=\"工作区文件\">\n"
+            f"  作者把这份工作区文件加进了聊天：{body}\n"
+            "  引用或修改它之前，先 writing_docs(action=\"read\", path=…) "
+            "读正文；不要凭文件名猜内容。\n"
+            "</user-selection>"
+        )
+    if source == "chat":
+        return (
+            "<user-selection source=\"对话引用\">\n"
+            f"  作者引用了你之前说过的话: \"{body}\"\n"
+            "</user-selection>"
+        )
+    return (
+        "<user-selection source=\"写作正文\">\n"
+        f"  作者在正文编辑器里选中了这一段（逐字，已随本轮落盘）: \"{body}\"\n"
+        "  这是本轮要处理的对象：改动用它作 writing_replace_text 的"
+        " anchor_quote，核对上下文用 writing_read_chapter 读本章。\n"
+        "</user-selection>"
+    )
+
+
 def _type_label(chapter_type: str) -> str:
     """Human-readable label for chapter type."""
     labels = {

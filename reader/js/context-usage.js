@@ -1,4 +1,4 @@
-/* Book Companion — context usage ring: 上下文水位圆环 + 明细 popover.
+/* Liubai — context usage ring: 上下文水位圆环 + 明细 popover.
  *
  * 数据源: SSE done 事件的 usage payload(实时) + GET /api/context/usage(切会话回查).
  * 口径: 总量为最后一轮 API usage(权威), 五块按本地占比对齐, 明细和恒等于总量.

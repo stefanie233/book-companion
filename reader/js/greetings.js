@@ -1,4 +1,4 @@
-/* Book Companion — time-based greetings. */
+/* Liubai — time-based greetings. */
 
 const GREETING_POOLS = {
   morning: [   // 6:00–10:30

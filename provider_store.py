@@ -74,6 +74,7 @@ ROUTE_GROUPS: tuple[tuple[str, str], ...] = (
     ("memory", "记忆"),
     ("import", "导入分析"),
     ("enrich", "元数据清洗"),
+    ("reading", "阅读会话"),
 )
 GROUP_LABELS: dict[str, str] = dict(ROUTE_GROUPS)
 
@@ -136,6 +137,13 @@ CALL_POINTS: tuple[dict, ...] = (
      "desc": "立论 → 证伪 → 机械校验 → 回炉"},
     {"id": "enrich.metadata", "group": "enrich", "label": "元数据清洗",
      "desc": "书名 / 作者 / 国籍清洗"},
+    # 阅读会话
+    {"id": "reading.session", "group": "reading", "label": "逐章细读",
+     "desc": "每章一次调用，产出 rich note + 引文"},
+    {"id": "reading.map", "group": "reading", "label": "认路地图合成",
+     "desc": "每卷一次，把逐章摘要压成路标图"},
+    {"id": "reading.tag", "group": "reading", "label": "引文分级回填",
+     "desc": "给已有引文补 kind / tag / who"},
 )
 
 CALL_POINT_MAP: dict[str, dict] = {c["id"]: c for c in CALL_POINTS}
@@ -355,9 +363,9 @@ class ProviderStore:
                           for f in _tb.extract_stack()[-5:-1]],
             }
             log_path = self.path.parents[1] / "logs" / "providers.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            from log_lifecycle import append_jsonl
+            append_jsonl(log_path, rec, max_bytes=1 * 1024 * 1024,
+                         backup_count=3)
         except Exception:
             pass
 

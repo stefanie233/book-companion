@@ -1,9 +1,11 @@
-/* Book Companion — sentence search (two modes: proximity + chapter). */
+/* Liubai — sentence search (two modes: proximity + chapter). */
 
 import { S } from './state.js';
 import { escapeHtml, getChapterName } from './utils.js';
-import { loadChunk } from './reader.js';
+import { loadChunk, renderBookProgress } from './reader.js';
 import * as EpubReader from './epub-reader.js';
+
+let _overviewSeq = 0;   // 作废在途概览：关闭面板后响应不许再把它打开
 
 // ── Mode toggle ───────────────────────────────────────────────────
 
@@ -16,45 +18,75 @@ export function updateSearchButtonStates() {
   btnCh.classList.toggle('active', chActive);
 }
 
+/** 收起搜索展开栏。章节模式随之回到「就近」，与再次点模式按钮的
+ *  关闭行为保持一致；在途概览响应一并作废，避免刚关又被写回来。 */
+function closeSearchPanel() {
+  _overviewSeq++;
+  // 搜面板是被「点空白」关掉的：给沉浸阅读留一枚时间戳，让同一个手势
+  // 只负责关面板，不再顺手进出模式（pointerdown 到 click 之间状态已翻）。
+  window._bcOverlayClosedAt = performance.now();
+  S.searchPanelOpen = false;
+  S.searchMode = 'proximity';
+  S.selectedSearchChapter = null;
+  const resultsEl = document.getElementById('searchResults');
+  const infoEl = document.getElementById('searchInfo');
+  if (resultsEl) resultsEl.classList.remove('visible');
+  if (infoEl) infoEl.classList.remove('visible');
+  updateSearchButtonStates();
+}
+
 export function setSearchMode(mode) {
   const resultsEl = document.getElementById('searchResults');
   const infoEl = document.getElementById('searchInfo');
+  const input = document.getElementById('searchInput');
 
   // Toggle: clicking the active mode again → close panel, restore default
   if (S.searchPanelOpen && mode === S.searchMode) {
-    S.searchPanelOpen = false;
-    resultsEl.classList.remove('visible');
-    infoEl.classList.remove('visible');
-    if (mode === 'chapter') {
-      S.searchMode = 'proximity';
-      S.selectedSearchChapter = null;
-    }
-    updateSearchButtonStates();
+    closeSearchPanel();
     return;
   }
 
-  // Switch to (or activate) the requested mode
-  S.searchMode = mode;
-  S.searchPanelOpen = true;
-  S.selectedSearchChapter = null;
-  updateSearchButtonStates();
+  // 「章节」是检索完成后的结果筛选器，不是检索前的章节选择器：
+  // 没有查询、也没有上一次命中结果时，不展开面板，只把焦点送回搜索框。
+  const inputQuery = input ? input.value.trim() : '';
+  const effectiveQuery = inputQuery
+    || (S.searchPanelOpen && S.searchChapterList && S.searchChapterList.length
+        ? S.searchQuery : '');
 
-  // Re-run search if there's a query
-  const query = document.getElementById('searchInput').value.trim();
-  if (query) {
-    searchBook();
-  } else {
+  S.searchMode = mode;
+  S.selectedSearchChapter = null;
+
+  if (!effectiveQuery) {
     if (mode === 'chapter') {
-      showChapterSelector();
-    } else {
-      resultsEl.classList.add('visible');
+      S.searchPanelOpen = false;
+      resultsEl.classList.remove('visible');
       infoEl.classList.remove('visible');
-      document.getElementById('searchLeft').innerHTML =
-        '<div class="search-none">输入关键词开始搜索</div>';
-      document.getElementById('searchRight').innerHTML =
-        '<div class="search-none">输入关键词开始搜索</div>';
+      updateSearchButtonStates();
+      if (input) {
+        input.placeholder = '先输入关键词搜索，再点击「章节」筛选';
+        input.focus();
+      }
+      return;
     }
+    // 就近模式没有查询：保持原有的空面板提示
+    S.searchPanelOpen = true;
+    updateSearchButtonStates();
+    resultsEl.classList.add('visible');
+    infoEl.classList.remove('visible');
+    if (input) input.placeholder = '搜索...';
+    document.getElementById('searchLeft').innerHTML =
+      '<div class="search-none">输入关键词开始搜索</div>';
+    document.getElementById('searchRight').innerHTML =
+      '<div class="search-none">输入关键词开始搜索</div>';
+    return;
   }
+
+  if (!S.currentBook) return;
+  S.searchQuery = effectiveQuery;
+  S.searchPanelOpen = true;
+  updateSearchButtonStates();
+  if (input) input.placeholder = '搜索...';
+  loadSearchOverview();
 }
 
 // ── Main search ───────────────────────────────────────────────────
@@ -74,6 +106,7 @@ export async function searchBook() {
   }
   if (!S.currentBook) return;
 
+  if (input.placeholder !== '搜索...') input.placeholder = '搜索...';
   S.searchPanelOpen = true;
   updateSearchButtonStates();
   S.searchQuery = query;
@@ -83,6 +116,7 @@ export async function searchBook() {
 // ── Load search results ───────────────────────────────────────────
 
 async function loadSearchOverview() {
+  const seq = ++_overviewSeq;
   const resultsEl = document.getElementById('searchResults');
   const infoEl = document.getElementById('searchInfo');
   const leftEl = document.getElementById('searchLeft');
@@ -94,10 +128,16 @@ async function loadSearchOverview() {
   leftEl.innerHTML = '';
 
   try {
-    const overviewUrl = S.API + '/api/books/' + S.currentBook + '/search/overview?q='
-      + encodeURIComponent(S.searchQuery) + '&current=' + S.currentChapter;
+    let overviewUrl = S.API + '/api/books/' + S.currentBook + '/search/overview?q='
+      + encodeURIComponent(S.searchQuery);
+    // 只给「就近」传 current：章节模式必须保持 chapter_index 升序，
+    // 不能被后端按距当前章远近重排（否则右侧章节栏是乱序）。
+    if (S.searchMode === 'proximity') {
+      overviewUrl += '&current=' + S.currentChapter;
+    }
     const resp = await fetch(overviewUrl);
     const data = await resp.json();
+    if (seq !== _overviewSeq) return;     // 面板已关闭/换了新搜索
     if (data.error) {
       rightEl.innerHTML = '<div class="search-none">' + data.error + '</div>';
       leftEl.innerHTML = '';
@@ -138,9 +178,10 @@ function renderChapterPanel(chapters, activeChIdx) {
   if (S.searchMode === 'chapter' && activeChIdx === null) {
     header = '<i data-lucide="book-open"></i> 全文顺序 (点击章节缩小)';
   } else if (S.searchMode === 'chapter') {
-    header = '\u{1F4CB} 已选章节 (点击切换)';
+    header = '<i data-lucide="list-ordered"></i> 已选章节 (点击切换)';
   } else {
-    header = '\u{1F4D1} 章节命中 (就近)';
+    // 与「就近」模式按钮同一枚图标（map-pin），不用 emoji。
+    header = '<i data-lucide="map-pin"></i> 章节命中 (就近)';
   }
 
   let items = '';
@@ -152,7 +193,11 @@ function renderChapterPanel(chapters, activeChIdx) {
       + '<span class="ci-count">ALL</span>'
       + '</div>';
   }
-  items += chapters.map(ch => {
+  // 章节模式固定按 chapter_index 升序；就近模式保留后端的距离排序。
+  const panelChapters = S.searchMode === 'chapter'
+    ? chapters.slice().sort((a, b) => a.chapter_index - b.chapter_index)
+    : chapters;
+  items += panelChapters.map(ch => {
     const chName = ch.chapter_title
       ? ch.chapter_title.slice(0, 16)
       : '第' + ch.chapter_index + '章';
@@ -307,57 +352,14 @@ export function onSearchLeftScroll() {
   }
 }
 
-// ── Chapter selector (mode 2: pick chapter before search) ─────────
-
-function showChapterSelector() {
-  const resultsEl = document.getElementById('searchResults');
-  const infoEl = document.getElementById('searchInfo');
-  const leftEl = document.getElementById('searchLeft');
-  const rightEl = document.getElementById('searchRight');
-
-  const chSelect = document.getElementById('chapterSelect');
-  const options = chSelect ? chSelect.options : [];
-
-  let html = '<div class="search-panel-header">\u{1F4CB} 选择章节 (可选)</div>';
-  html += '<div class="search-chapter-select selected"'
-    + ' onclick="pickSearchChapter(null)">'
-    + '● <i data-lucide="book-open"></i> 全文顺序搜索</div>';
-  for (let i = 0; i < options.length; i++) {
-    const val = parseInt(options[i].value);
-    const text = options[i].text;
-    html += '<div class="search-chapter-select"'
-      + ' onclick="pickSearchChapter(' + val + ')">'
-      + '○ '
-      + escapeHtml(text)
-      + '</div>';
-  }
-
-  leftEl.innerHTML = '<div class="search-none">输入关键词搜索，或点击右侧选择章节</div>';
-  rightEl.innerHTML = html;
-  S.searchPanelOpen = true;
-  updateSearchButtonStates();
-  resultsEl.classList.add('visible');
-  infoEl.classList.remove('visible');
-}
-
-export function pickSearchChapter(chIdx) {
-  S.selectedSearchChapter = chIdx;
-  showChapterSelector();
-  const query = document.getElementById('searchInput').value.trim();
-  if (query) {
-    loadSearchOverview();
-  }
-}
-
 // ── Jump ──────────────────────────────────────────────────────────
 
 export function jumpToSearchResult(chapterIdx, chunkIdx) {
-  document.getElementById('searchResults').classList.remove('visible');
-  document.getElementById('searchInfo').classList.remove('visible');
+  closeSearchPanel();
   S.currentChapter = chapterIdx;
   document.getElementById('chapterSelect').value = chapterIdx;
   S.currentChunk = chunkIdx;
-  document.getElementById('chunkPos').textContent = (chunkIdx + 1) + ' / ...';
+  renderBookProgress(chapterIdx, chunkIdx);
   if (S.renderMode === 'native') {
     // 原生模式：跳到语义坐标 (chapter, chunk) 对应位置
     EpubReader.jumpToAnchor(chapterIdx, chunkIdx);
@@ -392,10 +394,27 @@ function highlightSearchTerm() {
   }
 }
 
+// ── Click outside → close the floating search panel ───────────────
+// 侧边栏是切页导航：点它不算「面板外」，也不清状态 —— 切页往返后
+// 搜索栏保持展开。其余位置（顶部、阅读区、右侧聊天面板）都关闭。
+document.addEventListener('pointerdown', function (e) {
+  if (!S.searchPanelOpen) return;
+  const readerPage = document.getElementById('page-reader');
+  if (!readerPage || !readerPage.classList.contains('active')) return;
+  const t = e.target;
+  if (!(t instanceof Element)) return;
+  if (t.closest('.search-shell') || t.closest('.sidebar')) return;
+  closeSearchPanel();
+}, true);
+
+// native 模式下正文在 section iframe 里，pointerdown 不冒泡到父文档。
+EpubReader.onContentPointerDown(function () {
+  if (S.searchPanelOpen) closeSearchPanel();
+});
+
 // ── HTML onclick access ───────────────────────────────────────────
 window.setSearchMode = setSearchMode;
 window.searchBook = searchBook;
 window.selectSearchChapter = selectSearchChapter;
 window.loadMoreSentences = loadMoreSentences;
-window.pickSearchChapter = pickSearchChapter;
 window.jumpToSearchResult = jumpToSearchResult;

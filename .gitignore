@@ -5,48 +5,15 @@
 # （无前导斜杠会匹配任意层级的 docs/，曾经把 .claude/docs/ 一起吞掉）
 /docs/
 
-# Data (gitignored — user data)
-data/config/
-data/sessions/
-data/memory/
-data/bookbank/
-data/.input_history
-data/book-companion.db
-data/book-companion.db-*
-data/wingman.db
-data/wingman.db-*
-data/memory.db
-data/memory.db-*
-data/books.db
-data/books.db-*
-data/sessions.db
-data/sessions.db-*
-data/context_log.db
-data/context_log.db-*
-data/writing.db
-data/writing.db-*
-data/writing/
-data/graphs/
-data/fixtures/
-data/logs/
-data/watch/
-data/.migrated_to_sqlite
+# Data (gitignored — user data: SQLite, vectors, logs, models, uploads)
+# 整目录忽略：里面没有任何需要入库的文件（词典/词表在 assets/，不在 data/）。
+data/
 
 # User-uploaded content
 roles/avatars/
 
 # Generated role cards (regenerable from BookGraph)
 roles/graph_*.md
-
-# Generated voice files
-data/voice/
-data/scenes/
-
-# Local AI models
-data/models/
-
-# Local tokenizer files (vendor presets — heavy, machine-local)
-data/tokenizers/
 
 # Code intelligence indices
 .codegraph/
@@ -64,7 +31,6 @@ venv/
 .idea/
 
 # Test artifacts
-data/test_*/
 agents/
 refinement/
 
@@ -84,9 +50,8 @@ book-companion-share-*.tar.gz
 
 # Plan-mode design docs (work in progress)
 .claude/plans/
-data/graph.db
-data/graph.db-*
-data/authors.db
-data/authors.db-shm
-data/authors.db-wal
-data/backups/
+
+# PyInstaller / Inno Setup 产物（spec 与 iss 入库，产物不入库）
+build/
+dist/
+packaging/__pycache__/

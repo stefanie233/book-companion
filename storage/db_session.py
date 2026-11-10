@@ -16,9 +16,12 @@ from storage.models import (
     ALTER_SESSIONS_FORK_POINT_INDEX,
     ALTER_SESSIONS_KEYWORDS,
     ALTER_SESSIONS_REVIEW_COUNT,
+    ALTER_SESSIONS_AUTO_MODE_SWITCH,
     ALTER_SESSIONS_ROLE_KIND,
     ALTER_SESSIONS_ROLE_REF,
     ALTER_SESSIONS_TIME_REVIEWED,
+    ALTER_SESSIONS_WORK_ID,
+    ALTER_SESSIONS_WRITING_MODE,
     ALL_DDL,
     CREATE_ARCHIVABLE_INDEX,
     CREATE_SESSION_FTS,
@@ -51,6 +54,37 @@ def _usage_test_model_filter() -> str:
 
 
 # ── Migrations (session-only) ─────────────────────────────────────────────
+
+#: 事件式压缩的 checkpoint。摘要必须逐字稳定——两次压缩之间
+#: 它进每次请求的前缀，任何重写都会让缓存从摘要处整段失效。
+_CREATE_SESSION_COMPACTIONS = """
+CREATE TABLE IF NOT EXISTS session_compactions (
+    session_id     TEXT NOT NULL,
+    seq            INTEGER NOT NULL,
+    raw_count      INTEGER NOT NULL,
+    summary        TEXT NOT NULL,
+    dropped_count  INTEGER NOT NULL DEFAULT 0,
+    tokens_before  INTEGER NOT NULL DEFAULT 0,
+    tokens_after   INTEGER NOT NULL DEFAULT 0,
+    trigger        TEXT NOT NULL DEFAULT 'auto',
+    time_created   INTEGER NOT NULL,
+    PRIMARY KEY (session_id, seq)
+);
+"""
+
+#: 身份资料（称呼 / 性别 / agent 名字）的变更证据。append-only：
+#: 每改一个字段一行，带改它的会话与时间，便于回答「什么时候知道的」。
+_CREATE_IDENTITY_EVENTS = """
+CREATE TABLE IF NOT EXISTS identity_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    field         TEXT NOT NULL,
+    old_value     TEXT NOT NULL DEFAULT '',
+    new_value     TEXT NOT NULL DEFAULT '',
+    session_id    TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT 'agent',
+    time_created  INTEGER NOT NULL
+);
+"""
 
 _SESSION_MIGRATIONS: list[tuple[int, str, str | list[str]]] = [
     (1, "Initial schema: sessions, messages, parts", list(ALL_DDL)),
@@ -86,6 +120,27 @@ _SESSION_MIGRATIONS: list[tuple[int, str, str | list[str]]] = [
         ALTER_SESSIONS_ROLE_KIND,
         ALTER_SESSIONS_ROLE_REF,
     ]),
+    (13, "Session compaction checkpoints (event compaction)", [
+        _CREATE_SESSION_COMPACTIONS,
+        "CREATE INDEX IF NOT EXISTS idx_scomp_session "
+        "ON session_compactions(session_id, seq);",
+    ]),
+    (14, "Writing sessions bound to a work (work_id)", [
+        ALTER_SESSIONS_WORK_ID,
+        "CREATE INDEX IF NOT EXISTS idx_sessions_work "
+        "ON sessions(work_id);",
+    ]),
+    (15, "Writing sub-mode (standard/detail) + autonomous switch permission", [
+        ALTER_SESSIONS_WRITING_MODE,
+        ALTER_SESSIONS_AUTO_MODE_SWITCH,
+    ]),
+    (16, "Identity change journal: which session/turn produced a name/gender", [
+        _CREATE_IDENTITY_EVENTS,
+        "CREATE INDEX IF NOT EXISTS idx_identity_events_time "
+        "ON identity_events(time_created);",
+        "CREATE INDEX IF NOT EXISTS idx_identity_events_session "
+        "ON identity_events(session_id);",
+    ]),
 ]
 
 
@@ -111,11 +166,14 @@ class SessionDB(BaseDatabase):
         conn = self.get_conn()
         conn.execute(
             f"""INSERT INTO {TABLE_SESSIONS}
-                (id, project_id, parent_id, title, agent, model, mode,
+                (id, project_id, work_id, writing_mode, auto_mode_switch,
+                 parent_id, title, agent, model, mode,
                  character_name, role_kind, role_ref, fork_point_index,
                  compaction_count, message_count, time_created, time_updated)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
-            (row.id, row.project_id, row.parent_id, row.title,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+            (row.id, row.project_id, row.work_id or "",
+             row.writing_mode or "standard", int(row.auto_mode_switch or 0),
+             row.parent_id, row.title,
              row.agent, row.model, row.mode,
              row.character_name or "",
              row.role_kind or "character", row.role_ref or "",
@@ -171,6 +229,9 @@ class SessionDB(BaseDatabase):
         search: str | None = None,
         project_id: str | None = None,
         character_name: str | None = None,
+        mode: str | None = None,
+        exclude_mode: str | None = None,
+        work_id: str | None = None,
         start: int | None = None,
         include_archived: bool = False,
     ) -> list[SessionRow]:
@@ -191,6 +252,16 @@ class SessionDB(BaseDatabase):
         if character_name is not None:
             conditions.append("character_name=?")
             params.append(character_name)
+        # 会话按页面分线（决策 84）：写作页只取写作会话，其它页排除它们。
+        if mode is not None:
+            conditions.append("mode=?")
+            params.append(mode)
+        if exclude_mode is not None:
+            conditions.append("mode<>?")
+            params.append(exclude_mode)
+        if work_id is not None:
+            conditions.append("work_id=?")
+            params.append(work_id)
         if start is not None:
             conditions.append("time_updated >= ?")
             params.append(start)
@@ -235,6 +306,7 @@ class SessionDB(BaseDatabase):
 
     def search_session_content(
         self, query: str, limit: int = 10, include_archived: bool = False,
+        mode: str | None = None, exclude_mode: str | None = None,
     ) -> list[dict]:
         conn = self.get_conn()
         results: list[dict] = []
@@ -243,9 +315,22 @@ class SessionDB(BaseDatabase):
         fts_query = f'"{safe}"' if " " in safe else safe
 
         archive_filter = "" if include_archived else "AND s.time_archived IS NULL"
+        # 搜索也要按页面的会话线过滤：写作会话不能出现在主页/阅读页的
+        # 结果里，反之亦然（页签已经藏了，搜索不能成为后门）。
+        line_filter = ""
+        bare_filter = ""
+        line_params: list[Any] = []
+        if mode is not None:
+            line_filter += "AND s.mode=? "
+            bare_filter += "AND s.mode=? "
+            line_params.append(mode)
+        if exclude_mode is not None:
+            line_filter += "AND s.mode<>? "
+            bare_filter += "AND s.mode<>? "
+            line_params.append(exclude_mode)
         try:
             cur = conn.execute(
-                f"SELECT m.session_id, s.title, s.mode, s.time_updated, "
+                f"SELECT m.session_id, s.title, s.mode, s.work_id, s.time_updated, "
                 f"p.type, m.role, "
                 f"snippet({TABLE_SESSION_FTS}, 0, '…', '…', '', 40) as snippet "
                 f"FROM {TABLE_SESSION_FTS} "
@@ -253,8 +338,9 @@ class SessionDB(BaseDatabase):
                 f"JOIN {TABLE_MESSAGES} m ON p.message_id = m.id "
                 f"JOIN {TABLE_SESSIONS} s ON m.session_id = s.id "
                 f"WHERE {TABLE_SESSION_FTS} MATCH ? {archive_filter} "
+                f"{line_filter}"
                 f"ORDER BY rank LIMIT ?;",
-                (fts_query, limit * 3),
+                (fts_query, *line_params, limit * 3),
             )
             results = [dict(r) for r in cur.fetchall()]
         except sqlite3.OperationalError:
@@ -263,15 +349,16 @@ class SessionDB(BaseDatabase):
         if not results:
             like_pattern = f"%{query}%"
             cur = conn.execute(
-                f"SELECT DISTINCT m.session_id, s.title, s.mode, s.time_updated, "
-                f"p.data, p.type, m.role "
+                f"SELECT DISTINCT m.session_id, s.title, s.mode, s.work_id, "
+                f"s.time_updated, p.data, p.type, m.role "
                 f"FROM {TABLE_PARTS} p "
                 f"JOIN {TABLE_MESSAGES} m ON p.message_id = m.id "
                 f"JOIN {TABLE_SESSIONS} s ON m.session_id = s.id "
                 f"WHERE p.searchable_text LIKE ? {archive_filter} "
+                f"{bare_filter}"
                 f"ORDER BY s.time_updated DESC "
                 f"LIMIT ?",
-                (like_pattern, limit * 3),
+                (like_pattern, *line_params, limit * 3),
             )
             for r in cur.fetchall():
                 d = dict(r)
@@ -305,6 +392,7 @@ class SessionDB(BaseDatabase):
                 "session_id": sid,
                 "title": r.get("title") or "无标题",
                 "mode": r.get("mode", ""),
+                "work_id": r.get("work_id", "") or "",
                 "time_updated": r["time_updated"],
                 "snippets": [snippet] if snippet else [],
             })
@@ -494,6 +582,42 @@ class SessionDB(BaseDatabase):
         conn.execute(f"DELETE FROM {TABLE_MESSAGES} WHERE session_id=?;", (session_id,))
         conn.commit()
 
+    # ── Compaction checkpoints ────────────────────────────────────────────
+
+    def insert_compaction(
+        self,
+        session_id: str,
+        *,
+        seq: int,
+        raw_count: int,
+        summary: str,
+        dropped_count: int = 0,
+        tokens_before: int = 0,
+        tokens_after: int = 0,
+        trigger: str = "auto",
+    ) -> None:
+        """写一条压缩 checkpoint。``seq`` 单调递增，最新一条即当前前缀。"""
+        conn = self.get_conn()
+        conn.execute(
+            """INSERT OR REPLACE INTO session_compactions
+               (session_id, seq, raw_count, summary, dropped_count,
+                tokens_before, tokens_after, trigger, time_created)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);""",
+            (session_id, int(seq), int(raw_count), summary or "",
+             int(dropped_count), int(tokens_before), int(tokens_after),
+             trigger or "auto", _now_ms()),
+        )
+        conn.commit()
+
+    def latest_compaction(self, session_id: str) -> dict[str, Any] | None:
+        """最新 checkpoint；没有返回 None。"""
+        row = self.get_conn().execute(
+            "SELECT * FROM session_compactions WHERE session_id=? "
+            "ORDER BY seq DESC LIMIT 1;",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
     # ── LLM usage log (console 用量分析) ────────────────────────────────────
 
     def insert_usage_log(
@@ -567,3 +691,62 @@ class SessionDB(BaseDatabase):
             "calls": row["calls"] or 0,
             "by_source": [dict(r) for r in cur.fetchall()],
         }
+
+    # ── Identity change journal ────────────────────────────────────────────
+
+    def insert_identity_event(
+        self,
+        field: str,
+        old_value: str,
+        new_value: str,
+        *,
+        session_id: str = "",
+        source: str = "agent",
+        time_created: int | None = None,
+    ) -> None:
+        """Append one identity change.
+
+        ``session_id`` 是「从哪次对话里得到这条信息」的证据；设置页改的
+        没有会话，留空。append-only，不更新、不删除。
+        """
+        conn = self.get_conn()
+        conn.execute(
+            """INSERT INTO identity_events
+               (field, old_value, new_value, session_id, source, time_created)
+               VALUES (?, ?, ?, ?, ?, ?);""",
+            (field, old_value or "", new_value or "", session_id or "",
+             source or "agent", time_created or _now_ms()),
+        )
+        conn.commit()
+
+    def list_identity_events(
+        self,
+        *,
+        field: str | None = None,
+        session_id: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Page through identity changes, newest first. Returns ``(rows, total)``."""
+        where: list[str] = []
+        params: list[Any] = []
+        if field:
+            where.append("field = ?")
+            params.append(field)
+        if session_id:
+            where.append("session_id = ?")
+            params.append(session_id)
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        conn = self.get_conn()
+        total = conn.execute(
+            f"SELECT COUNT(*) AS n FROM identity_events{where_sql};", params
+        ).fetchone()["n"]
+        cur = conn.execute(
+            f"""SELECT id, field, old_value, new_value, session_id, source,
+                       time_created
+                FROM identity_events{where_sql}
+                ORDER BY time_created DESC, id DESC
+                LIMIT ? OFFSET ?;""",
+            [*params, max(1, int(limit)), max(0, int(offset))],
+        )
+        return [dict(r) for r in cur.fetchall()], int(total)

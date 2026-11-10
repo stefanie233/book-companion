@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="tomGrad" cx="40%" cy="36%" r="72%">
+      <stop offset="0" stop-color="#ff5420"/>
+      <stop offset="0.55" stop-color="#f01504"/>
+      <stop offset="1" stop-color="#d50a00"/>
+    </radialGradient>
+    <radialGradient id="sunGrad" cx="34%" cy="34%" r="80%">
+      <stop offset="0" stop-color="#ffc61e"/>
+      <stop offset="0.7" stop-color="#f6a807"/>
+      <stop offset="1" stop-color="#e08f04"/>
+    </radialGradient>
+    <linearGradient id="skyGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2e6f9f"/>
+      <stop offset="0.55" stop-color="#1d5480"/>
+      <stop offset="1" stop-color="#123c5e"/>
+    </linearGradient>
+    <linearGradient id="hillGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7a5830"/>
+      <stop offset="0.55" stop-color="#5c4128"/>
+      <stop offset="1" stop-color="#42301d"/>
+    </linearGradient>
+
+    <path id="pagePath" d="M 320 0 L 964 0 Q 1024 0 1024 60 L 1024 964 Q 1024 1024 964 1024 L 60 1024 Q 0 1024 0 964 L 0 320 Z"/>
+    <clipPath id="pageClip"><use href="#pagePath"/></clipPath>
+
+    <clipPath id="tomClip"><ellipse cx="690" cy="610" rx="252" ry="247"/></clipPath>
+
+    <path id="sepal" d="M 0 -7 C 44 -24 140 -21 220 0 C 142 20 46 23 0 7 Z"/>
+
+    <filter id="flapShadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+
+    <filter id="groundShadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <!-- 画页本身就是图标外形，折角与四周留透明 -->
+  <use href="#pagePath" fill="url(#skyGrad)"/>
+
+  <g clip-path="url(#pageClip)">
+
+    <!-- 山体：向右抬升的圆隆山脊 + 一条上山土路 -->
+    <path d="M 0 900 C 140 820 300 700 500 640 C 680 586 840 540 960 500 C 990 490 1010 486 1024 484 L 1024 1024 L 0 1024 Z" fill="url(#hillGrad)"/>
+    <path d="M 0 900 C 140 820 300 700 500 640 C 680 586 840 540 960 500 C 990 490 1010 486 1024 484" fill="none" stroke="#0c0a0c" stroke-width="20"/>
+    <path d="M 30 1024 C 190 985 300 920 450 885 C 600 850 690 865 810 835 C 920 808 985 786 1024 775"
+          fill="none" stroke="#0c0a0c" stroke-width="38"/>
+    <path d="M 30 1024 C 190 985 300 920 450 885 C 600 850 690 865 810 835 C 920 808 985 786 1024 775"
+          fill="none" stroke="#b29a80" stroke-width="26"/>
+    <ellipse cx="680" cy="860" rx="240" ry="58" fill="#000" opacity="0.32" filter="url(#groundShadow)"/>
+
+    <!-- 番茄 -->
+    <g id="tomato">
+      <ellipse cx="690" cy="610" rx="268" ry="263" fill="#0c0a0c"/>
+      <ellipse cx="690" cy="610" rx="252" ry="247" fill="url(#tomGrad)"/>
+      <g clip-path="url(#tomClip)">
+        <path d="M 552 388 C 496 450 466 520 462 600 C 458 678 486 742 534 786"
+              fill="none" stroke="#ff8230" stroke-width="28" opacity="0.34" stroke-linecap="round"/>
+        <path d="M 872 430 C 908 500 916 590 892 668 C 874 724 842 770 800 806"
+              fill="none" stroke="#a90b02" stroke-width="36" opacity="0.22" stroke-linecap="round"/>
+        <ellipse cx="566" cy="466" rx="76" ry="58" fill="#ff9a4a" opacity="0.12" transform="rotate(-24 566 466)"/>
+      </g>
+    </g>
+
+    <!-- 花萼（西西弗斯）：复用原画五片萼片，按番茄比例缩放 -->
+    <g id="calyx" transform="translate(690 610) scale(0.648) translate(-700 -700)">
+      <g transform="translate(0 20)">
+        <g>
+          <use href="#sepal" transform="translate(590 878) rotate(184) scale(1.21 1.45)" fill="#33490f" stroke="#0a0c04" stroke-width="13"/>
+          <use href="#sepal" transform="translate(590 878) rotate(-4) scale(1.41 1.1)" fill="#3b5411" stroke="#0a0c04" stroke-width="13"/>
+          <use href="#sepal" transform="translate(590 878) rotate(216) scale(0.85 1.5)" fill="#2f450c" stroke="#0a0c04" stroke-width="13"/>
+          <use href="#sepal" transform="translate(590 878) rotate(41) scale(1.11 1.5)" fill="#364c0e" stroke="#0a0c04" stroke-width="13"/>
+        </g>
+        <g fill="none" stroke="#7d9138" stroke-width="8" stroke-linecap="round" opacity="0.45">
+          <path d="M 565 868 L 478 812"/>
+          <path d="M 552 886 L 408 870"/>
+          <path d="M 622 862 L 840 868"/>
+          <path d="M 622 900 L 760 1040"/>
+        </g>
+        <g fill="none" stroke="#182404" stroke-width="8" stroke-linecap="round" opacity="0.85">
+          <path d="M 590 878 L 500 820"/>
+          <path d="M 590 878 L 440 872"/>
+          <path d="M 590 878 L 838 865"/>
+          <path d="M 590 878 L 762 1042"/>
+        </g>
+        <g fill="none" stroke="#0a0c04" stroke-width="10" stroke-linecap="round" opacity="0.8">
+          <path d="M 475 888 C 525 904 565 910 618 904"/>
+          <path d="M 545 852 C 580 864 615 864 645 856"/>
+        </g>
+        <g>
+          <ellipse cx="590" cy="876" rx="44" ry="34" fill="#a39c50" stroke="#0a0c04" stroke-width="9"/>
+          <ellipse cx="578" cy="866" rx="15" ry="11" fill="#d6cf72" opacity="0.85"/>
+          <path d="M 566 868 L 578 886" stroke="#0a0c04" stroke-width="5" stroke-linecap="round" fill="none"/>
+          <path d="M 604 860 L 610 880" stroke="#0a0c04" stroke-width="5" stroke-linecap="round" fill="none"/>
+          <ellipse cx="606" cy="914" rx="24" ry="17" fill="#7a9433" stroke="#0a0c04" stroke-width="7"/>
+        </g>
+      </g>
+      <g transform="translate(565 894) scale(1.55 1) translate(-565 -894)">
+        <ellipse cx="505" cy="1234" rx="27" ry="9" transform="rotate(-18 505 1234)" fill="#0b0806" opacity="0.35"/>
+        <path d="M 565 894 C 578 944 590 996 595 1046 C 598 1093 586 1146 560 1196 C 544 1220 524 1231 505 1232 C 546 1200 584 1160 606 1114 C 624 1074 629 1030 627 988 C 623 948 616 916 609 898 Z"
+              fill="#354a10" stroke="#0a0c04" stroke-width="12" stroke-linejoin="round"/>
+        <path d="M 577 1006 C 588 1050 590 1092 578 1130" stroke="#1b2705" stroke-width="20" fill="none" opacity="0.6" stroke-linecap="round"/>
+        <path d="M 572 918 C 586 970 594 1018 593 1058 C 590 1102 575 1148 552 1186" stroke="#8a9a44" stroke-width="10" fill="none" opacity="0.7" stroke-linecap="round"/>
+        <path d="M 615 1032 C 621 1064 618 1096 608 1124" stroke="#0a0c04" stroke-width="7" fill="none" opacity="0.8" stroke-linecap="round"/>
+        <path d="M 596 1070 C 606 1082 613 1098 616 1116" stroke="#0a0c04" stroke-width="6" fill="none" opacity="0.7" stroke-linecap="round"/>
+      </g>
+    </g>
+
+    <!-- 折角 = 太阳：黄半圆折页 + 黑折痕 + 几何光线；缺角为透明 -->
+    <g>
+      <path d="M 320 0 A 226 226 0 0 1 0 320 Z" transform="translate(22 24)" fill="#000" opacity="0.4" filter="url(#flapShadow)"/>
+      <path d="M 320 0 A 226 226 0 0 1 0 320 Z" fill="url(#sunGrad)"/>
+      <path d="M 320 0 A 226 226 0 0 1 0 320" stroke="#0c0a0c" stroke-width="16" fill="none"/>
+      <path d="M 320 0 L 0 320" stroke="#0c0a0c" stroke-width="16" fill="none"/>
+      <path d="M 310.6 9.4 A 213 213 0 0 1 9.4 310.6" stroke="#ffe9b0" stroke-width="4.5" opacity="0.85" fill="none"/>
+      <path d="M 312 12 L 12 312" stroke="#ffe9b0" stroke-width="4" opacity="0.6" fill="none"/>
+      <path d="M 340 20 L 20 340" stroke="#d98a05" stroke-width="24" opacity="0.16" fill="none"/>
+      <path d="M 369.2 290.5 L 462.2 328.6 L 468.8 316.3 L 385.2 260.5 Z" fill="#0c0a0c"/>
+      <path d="M 305.1 359.4 L 377.0 429.6 L 387.8 420.6 L 331.1 337.5 Z" fill="#0c0a0c"/>
+      <path d="M 219.9 399.2 L 260.3 491.2 L 273.6 486.9 L 252.2 388.7 Z" fill="#0c0a0c"/>
+    </g>
+
+  </g>
+</svg>

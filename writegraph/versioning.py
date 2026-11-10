@@ -167,6 +167,32 @@ def merge3_text(base: str, ours: str, theirs: str) -> tuple[str, bool]:
     return "\n".join(out), True
 
 
+# ── 作品工作区文件：清单 / 指纹 / 增删改 ────────────────────────────────
+# 作品记忆 / 设定 / 计划稿 / 素材 和正文一起进提交图。提交里存「路径 → 内容 hash」
+# 的清单，正文落在 work_file_blobs（同一个 hash 只存一份）；状态比较只比
+# 清单，回放时才按 hash 取正文。
+
+
+def file_manifest(files: Mapping[str, str]) -> dict[str, str]:
+    """``{路径: 正文}`` → ``{路径: sha256}``。路径排序保证指纹稳定。"""
+    return {str(path): hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+            for path, text in sorted(files.items())}
+
+
+def files_hash(manifest: Mapping[str, str]) -> str:
+    return digest(sorted(manifest.items()))
+
+
+def diff_files(before: Mapping[str, Any],
+               after: Mapping[str, Any]) -> dict[str, list[str]]:
+    """两份清单的增 / 删 / 改。只比 hash——作者看到的是「这份设定变了」。"""
+    added = sorted(p for p in after if p not in before)
+    removed = sorted(p for p in before if p not in after)
+    changed = sorted(p for p in after
+                     if p in before and before[p] != after[p])
+    return {"added": added, "removed": removed, "changed": changed}
+
+
 # ── 提交图：祖先、合并基、领先/落后 ──────────────────────────────────────
 
 def ancestor_ids(commits: Mapping[str, Mapping[str, Any]],

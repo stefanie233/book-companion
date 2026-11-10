@@ -1,4 +1,4 @@
-/* Book Companion — 首次运行引导：把填 Key 从手编 .env 挪进可视化界面。
+/* Liubai — 首次运行引导：把填 Key 从手编 .env 挪进可视化界面。
  *
  * 触发：app.js 启动时调 checkOnboarding()，/api/health 的 llm_ready=false
  * （无 key、占位 key）即弹出模态。保存走控制台既有端点（provider save →

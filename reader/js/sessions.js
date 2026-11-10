@@ -1,9 +1,10 @@
-/* Book Companion — session (chat history) management. */
+/* Liubai — session (chat history) management. */
 
 import { S } from './state.js';
 import { escapeHtml, formatSessionTime } from './utils.js';
 import { getWelcomeMessage } from './greetings.js';
-import { addChat, createVoiceBubble, createThinkRow, createInterruptNote } from './chat.js';
+import { addChat, createVoiceBubble, createThinkRow, createInterruptNote,
+         stickChatToBottom, renderTurnTraceFromSteps } from './chat.js';
 import { refreshUsage } from './context-usage.js';
 
 const SESSION_MODE_LABELS = {
@@ -14,11 +15,19 @@ const SESSION_MODE_LABELS = {
   writing: '写作'
 };
 
+// 写作页这条线上全是写作会话，meta 里的「写作」没有信息量：换成会话
+// 绑定的作品名（没绑作品的归「空项目」）。其它页面照旧显示模式。
+function sessionModeLabel(s) {
+  if (s.mode === 'writing' && isWritingLine()) return s.work_title || '空项目';
+  return SESSION_MODE_LABELS[s.mode] || s.mode;
+}
+
 // ── Sub-nav state ─────────────────────────────────────────────────
 let _cachedSessions = [];
-let _currentSubnavTab = 'all';    // 'all' | 'books' | 'characters' | 'writing'
+let _currentSubnavTab = 'all';    // 'all' | 'books' | 'characters' | 'writing-all' | 'writing-works'
 let _drillBookId = null;          // null = show group list; string = drilled into a specific group
 let _drillCharName = null;        // null = show character list; string = drilled into a specific character
+let _drillWorkId = null;          // 写作页：null = 作品分组列表；string = 已进入某本/'__empty__'
 let _searchTerm = '';             // current search query
 let _searchTimeout = null;        // debounce timer
 let _listOffset = 0;              // pagination offset
@@ -61,7 +70,7 @@ const _expandedSessions = new Set(); // expanded session ids
 // 打开面板先看见自己那批，少点一次切换。
 function defaultSubnavTab() {
   if (window._currentTab === 'reader') return 'books';
-  if (window._currentTab === 'write') return 'writing';
+  if (window._currentTab === 'write') return 'writing-works';
   return 'all';
 }
 
@@ -72,19 +81,62 @@ export function toggleSessionPanel() {
   } else {
     panel.classList.add('visible');
     // Reset sub-nav to default on open：每个界面预先选中自己那条会话线 ——
-    // 书架页看「全部」，阅读页看「按书籍」，写作页看「写作」。
+    // 书架页看「全部」，阅读页看「按书籍」，写作页看「按作品」。
     // 只影响打开时的预选页签，页签顺序不变，其他页签也不锁。
     _currentSubnavTab = defaultSubnavTab();
     _drillBookId = null;
+    _drillCharName = null;
+    _drillWorkId = null;
     _searchTerm = '';
     _listOffset = 0;
     _listHasMore = true;
     var searchInput = document.getElementById('sessionSearchInput');
     if (searchInput) searchInput.value = '';
+    applySessionChrome();
     updateSubnavActive();
     loadSessionList(true);
   }
 }
+
+/** 写作页的会话面板只留「全部 / 按作品」两个页签，别的页签不适用。 */
+function isWritingLine() {
+  return window._currentTab === 'write';
+}
+
+function isWritingTab(tab) {
+  return tab === 'writing-all' || tab === 'writing-works';
+}
+
+function applySessionChrome() {
+  const nav = document.getElementById('sessionSubnav');
+  if (!nav) return;
+  // 用 class 而不是 hidden：.session-subnav 自带 display:flex，
+  // 会盖掉 UA 的 [hidden]{display:none}（之前页签就是这么漏出来的）。
+  nav.classList.toggle('is-writing', isWritingLine());
+}
+
+/**
+ * 切页时调用：页签跟着界面走；面板若正开着，按新页面重新取一遍会话——
+ * 否则在写作页打开的列表会留在主页面上，写作会话就漏出来了。
+ */
+function refreshSessionChrome() {
+  applySessionChrome();
+  const panel = document.getElementById('sessionPanel');
+  if (!panel || !panel.classList.contains('visible')) return;
+  _currentSubnavTab = defaultSubnavTab();
+  _drillBookId = null;
+  _drillCharName = null;
+  _drillWorkId = null;
+  _searchTerm = '';
+  _listOffset = 0;
+  _listHasMore = true;
+  var searchInput = document.getElementById('sessionSearchInput');
+  if (searchInput) searchInput.value = '';
+  updateSubnavActive();
+  loadSessionList(true);
+}
+
+window.refreshSessionChrome = refreshSessionChrome;
 
 // ── Sub-nav tab switching ─────────────────────────────────────────
 
@@ -92,6 +144,7 @@ export function switchSubnavTab(tab) {
   _currentSubnavTab = tab;
   _drillBookId = null;
   _drillCharName = null;
+  _drillWorkId = null;
   _searchTerm = '';
   var searchInput = document.getElementById('sessionSearchInput');
   if (searchInput) searchInput.value = '';
@@ -134,10 +187,14 @@ export async function loadSessionList(reset) {
     listEl.innerHTML = '<div class="session-empty">加载中...</div>';
   }
 
+  // 会话按页面分线（决策 84）：写作页只取写作会话，其它页把写作会话
+  // 整个排除——列表和搜索都要带这个条件，搜索不能成为后门。
+  var lineParam = isWritingLine() ? '&mode=writing' : '&exclude_mode=writing';
+
   // ── Search path ──────────────────────────────────────────────
   if (_searchTerm) {
     try {
-      var searchResp = await fetch(S.API + '/api/sessions/search?q=' + encodeURIComponent(_searchTerm) + '&limit=30');
+      var searchResp = await fetch(S.API + '/api/sessions/search?q=' + encodeURIComponent(_searchTerm) + '&limit=30' + lineParam);
       var searchData = await searchResp.json();
       if (searchData.error) {
         listEl.innerHTML = '<div class="session-empty">' + escapeHtml(searchData.error) + '</div>';
@@ -153,17 +210,22 @@ export async function loadSessionList(reset) {
       _cachedSessions.forEach(function (s) { cacheById[s.id] = s; });
       listEl.innerHTML = results.map(function (r) {
         var cached = cacheById[r.session_id];
+        // 写作页的搜索结果：作品名放 meta 行，标题上不挂胶囊
+        var label = cached && !isWritingLine() ? (cached.book_title || '') : '';
+        var modeText = (r.mode === 'writing' && isWritingLine())
+          ? ((cached && cached.work_title) || '空项目')
+          : (SESSION_MODE_LABELS[r.mode] || r.mode);
         var snippetHtml = (r.snippets || []).map(function (s) {
           return '<div class="si-snippet">' + escapeHtml(s) + '</div>';
         }).join('');
         return '<div class="session-item' + (r.session_id === S.currentSessionId ? ' active' : '') + '"'
           + ' onclick="loadSession(\'' + r.session_id + '\')">'
-          + (cached && cached.book_title ? '<span class="si-book">' + escapeHtml(cached.book_title) + '</span>' : '')
+          + (label ? '<span class="si-book">' + escapeHtml(label) + '</span>' : '')
           + (cached && cached.character_name ? '<span class="si-char"><i data-lucide="drama"></i> ' + escapeHtml(cached.character_name) + '</span>' : '')
           + '<div class="si-title"><span class="si-title-text">' + escapeHtml(r.title || '(无标题)') + '</span></div>'
           + snippetHtml
           + '<div class="si-meta">'
-          + '<span class="si-mode">' + (SESSION_MODE_LABELS[r.mode] || r.mode) + '</span>'
+          + '<span class="si-mode">' + escapeHtml(modeText) + '</span>'
           + '<span>' + (r.time_updated ? formatSessionTime(r.time_updated) : '') + '</span>'
           + '</div></div>';
       }).join('');
@@ -176,7 +238,7 @@ export async function loadSessionList(reset) {
 
   // ── Normal list path (with pagination) ────────────────────────
   try {
-    var resp = await fetch(S.API + '/api/sessions/list?limit=' + _pageSize + '&offset=' + _listOffset + '&root_only=true');
+    var resp = await fetch(S.API + '/api/sessions/list?limit=' + _pageSize + '&offset=' + _listOffset + '&root_only=true' + lineParam);
     var data = await resp.json();
     if (data.error) {
       listEl.innerHTML = '<div class="session-empty">' + escapeHtml(data.error) + '</div>';
@@ -201,12 +263,24 @@ export async function loadSessionList(reset) {
 }
 
 function renderSessionView() {
+  // 写作页只有自己那组页签（全部 / 按作品）；若状态还停在别的页签上
+  // （切页时面板关着就走了捷径），先归位再渲染。
+  if (isWritingLine()) {
+    if (!isWritingTab(_currentSubnavTab)) {
+      _currentSubnavTab = 'writing-works';
+      updateSubnavActive();
+    }
+    renderWritingTab();
+    return;
+  }
+  if (isWritingTab(_currentSubnavTab)) {
+    _currentSubnavTab = 'all';
+    updateSubnavActive();
+  }
   if (_currentSubnavTab === 'all') {
     renderAllSessions();
   } else if (_currentSubnavTab === 'characters') {
     renderCharactersTab();
-  } else if (_currentSubnavTab === 'writing') {
-    renderWritingTab();
   } else {
     renderBooksTab();
   }
@@ -216,11 +290,14 @@ function renderSessionView() {
 
 function renderAllSessions() {
   var listEl = document.getElementById('sessionList');
-  if (!_cachedSessions.length) {
+  // 写作会话不属于主页/阅读页的「全部」；服务端已经排除，这里再兜一层
+  //（面板在切换页签前缓存过写作列表时也不会漏出来）。
+  var rows = _cachedSessions.filter(function (s) { return s.mode !== 'writing'; });
+  if (!rows.length) {
     listEl.innerHTML = '<div class="session-empty">暂无历史会话</div>';
     return;
   }
-  var html = _cachedSessions.map(function (s) { return renderSessionItem(s); }).join('');
+  var html = rows.map(function (s) { return renderSessionItem(s); }).join('');
   // "Load more" button when there are more sessions to fetch
   if (_listHasMore && !_searchTerm) {
     html += '<div class="session-load-more" onclick="loadMoreSessions()">── 加载更多 ──</div>';
@@ -233,9 +310,15 @@ function loadMoreSessions() {
   loadSessionList(false);
 }
 
-// ── "写作" tab — writing-page conversations ────────────────────
-// 写作页有自己的会话线（与阅读互不续接），这里按 mode 归类。
-// 旧写作会话可能带 project_id（历史遗留），同样只按 mode 判断。
+// ── 写作页：按作品收录的会话 ─────────────────────────────────────
+// 写作页只留两个页签：「全部」是这条会话线的平铺列表（按时间，每行带
+// 作品标签），「按作品」是作品卡片，点进去才是这一本的对话。会话绑在
+// 作品上（sessions.work_id）；没绑作品的老会话与「空项目」里聊出来的
+// 会话归到「空项目」组。
+
+function writingGroupKey(s) {
+  return s.work_id || '__empty__';
+}
 
 function renderWritingTab() {
   var listEl = document.getElementById('sessionList');
@@ -244,22 +327,87 @@ function renderWritingTab() {
     listEl.innerHTML = '<div class="session-empty">暂无写作会话</div>';
     return;
   }
-  var html = rows.map(function (s) { return renderSessionItem(s); }).join('');
-  if (_listHasMore && !_searchTerm) {
-    html += '<div class="session-load-more" onclick="loadMoreSessions()">── 加载更多 ──</div>';
+
+  // 「全部」：写作页这条线上的所有会话，平铺按时间倒序
+  if (_currentSubnavTab === 'writing-all') {
+    var flat = rows.slice().sort(function (a, b) {
+      return (b.time_updated || 0) - (a.time_updated || 0);
+    }).map(function (s) { return renderSessionItem(s); }).join('');
+    if (_listHasMore && !_searchTerm) {
+      flat += '<div class="session-load-more" onclick="loadMoreSessions()">── 加载更多 ──</div>';
+    }
+    listEl.innerHTML = flat;
+    return;
   }
-  listEl.innerHTML = html;
+
+  var groups = new Map();
+  rows.forEach(function (s) {
+    var key = writingGroupKey(s);
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key: key,
+        title: key === '__empty__' ? '空项目' : (s.work_title || '未知作品'),
+        sessions: []
+      });
+    }
+    groups.get(key).sessions.push(s);
+  });
+
+  // 钻进去：这一本（或空项目）的对话列表
+  if (_drillWorkId !== null) {
+    var group = groups.get(_drillWorkId);
+    var label = group ? group.title
+      : (_drillWorkId === '__empty__' ? '空项目' : '作品');
+    var members = group ? group.sessions : [];
+    var html = '<div class="session-back" onclick="drillWorkOut()"><i data-lucide="arrow-left"></i> 返回作品列表<span style="color:var(--text-muted);margin-left:8px;font-size:0.6875rem;">'
+      + escapeHtml(label) + ' · ' + members.length + '条会话</span></div>';
+    if (!members.length) {
+      html += '<div class="session-empty">暂无会话</div>';
+    } else {
+      html += members.map(function (s) { return renderSessionItem(s); }).join('');
+    }
+    if (_listHasMore && !_searchTerm) {
+      html += '<div class="session-load-more" onclick="loadMoreSessions()">── 加载更多 ──</div>';
+    }
+    listEl.innerHTML = html;
+    return;
+  }
+
+  // 分组列表：最近聊过的作品在前，空项目垫底
+  var sorted = Array.from(groups.values()).sort(function (a, b) {
+    if (a.key === '__empty__') return 1;
+    if (b.key === '__empty__') return -1;
+    return (b.sessions[0].time_updated || 0) - (a.sessions[0].time_updated || 0);
+  });
+  var cards = sorted.map(function (g) {
+    var icon = g.key === '__empty__'
+      ? '<i data-lucide="sparkles"></i>'
+      : '<i data-lucide="pen-line"></i>';
+    return '<div class="session-book-group" onclick="drillWorkIn(\''
+      + escapeHtml(g.key) + '\')">'
+      + '<span class="sbg-icon">' + icon + '</span>'
+      + '<div class="sbg-info">'
+      + '<div class="sbg-title">' + escapeHtml(g.title) + '</div>'
+      + '<div class="sbg-count">' + g.sessions.length + '条会话</div>'
+      + '</div>'
+      + '<span class="sbg-arrow">›</span>'
+      + '</div>';
+  }).join('');
+  if (_listHasMore && !_searchTerm) {
+    cards += '<div class="session-load-more" onclick="loadMoreSessions()">── 加载更多 ──</div>';
+  }
+  listEl.innerHTML = cards;
 }
 
 function renderSessionItem(s, depth) {
   depth = depth || 0;
   var title = escapeHtml(s.title || '(无标题)');
-  var modeLabel = SESSION_MODE_LABELS[s.mode] || s.mode;
+  var modeLabel = escapeHtml(sessionModeLabel(s));
   var isActive = s.id === S.currentSessionId;
   var time = formatSessionTime(s.time_updated);
   // Book label — show for sessions with project_id, "主会话" for home-page sessions.
-  // 写作会话不属于任何书：旧库里的 project_id 是历史遗留，同样不展示，
-  // 只留 meta 行里的「写作」mode 徽标。
+  // 写作会话不属于任何书：旧库里的 project_id 是历史遗留，不展示；
+  // 作品名放 meta 行（替换「写作」），不在标题上再挂一个胶囊。
   var bookLabel = s.mode === 'writing'
     ? ''
     : (s.book_title
@@ -451,6 +599,16 @@ export function drillCharOut() {
   renderSessionView();
 }
 
+export function drillWorkIn(workId) {
+  _drillWorkId = workId;
+  renderSessionView();
+}
+
+export function drillWorkOut() {
+  _drillWorkId = null;
+  renderSessionView();
+}
+
 // ── Load / delete / new session ──────────────────────────────────
 
 /** 会话属于哪条会话线。三个界面的提示词不同，会话不能串线续写。 */
@@ -515,7 +673,16 @@ export async function loadSession(sid, opts) {
     // 记进这条线（本日可恢复）——在别的页签点开时 openSessionTab 已经
     // 记过一次，这里统一用会话的真实归属再落一遍。
     window.recordTabSession && window.recordTabSession(
-      surface, data.id, { bookId: data.project_id || '' });
+      surface, data.id, {
+        bookId: data.project_id || '',
+        workId: data.work_id || '',
+      });
+    // 写作会话绑在作品上：点开某本的对话，写作台跟着切到那本，
+    // 否则下一句话的提示词和这段历史来自两个作品。
+    if (surface === 'write' && window.WritingUI
+        && typeof window.WritingUI.openWork === 'function') {
+      window.WritingUI.openWork(data.work_id || '');
+    }
     refreshUsage();  // ring follows the loaded session's watermark
 
     // Restore role-play state when loading a role-play session
@@ -568,13 +735,37 @@ export async function loadSession(sid, opts) {
         }
       });
 
+      // ── 2b. 写作回合的时间线（回放）─────────────────────────────
+      // 实时是「头 + 步骤流 + 气泡」；重载必须长成同一个样子，否则刷新
+      // 之后工具调用就凭空消失了。最后一段正文留在气泡里，前面的旁白
+      // 和工具行进时间线。
+      var writeTrace = null;
+      var writeFinalText = null;
+      if (surface === 'write' && role === 'agent'
+          && m.steps && m.steps.length) {
+        // 只有「最后一次工具调用之后」的正文才是最终回答；撞轮次上限 /
+        // 中断的回合可能停在工具上，那时最后一段正文只是旁白。
+        var lastText = -1;
+        var lastTool = -1;
+        for (var si = m.steps.length - 1; si >= 0; si--) {
+          var st = m.steps[si];
+          if (lastTool < 0 && st.type === 'tool') lastTool = si;
+          if (lastText < 0 && st.type === 'text' && st.text) lastText = si;
+        }
+        if (lastText > lastTool) writeFinalText = m.steps[lastText].text;
+        var traceSteps = lastText > lastTool
+          ? m.steps.slice(0, lastText) : m.steps;
+        if (traceSteps.length) writeTrace = renderTurnTraceFromSteps(traceSteps);
+      }
+
       // ── 3. Think rows (agent only, above text bubble) ──────────
       // One row per persisted thinking block == one LLM call. A multi-step
       // ReAct turn stores its rounds in call order; rendering the merged
       // `thinking` string collapsed them into a single row, which on reload
       // looked like only the last call's reasoning was kept. `thinking`
       // remains the fallback for sessions written by older servers.
-      if (role === 'agent') {
+      // 写作回合的思考行已经在时间线里，不再单独重复一份。
+      if (role === 'agent' && !writeTrace) {
         var thinkParts = (m.thinkings && m.thinkings.length)
           ? m.thinkings
           : (m.thinking ? [m.thinking] : []);
@@ -596,8 +787,8 @@ export async function loadSession(sid, opts) {
             S.chatHistory.push({ role: 'user', content: m.content });
           }
         } else {
-          var cleanContent = m.content;
-          if (!m.thinking) {
+          var cleanContent = writeTrace ? (writeFinalText || '') : m.content;
+          if (!m.thinking && !writeTrace) {
             // Backward compat: old sessions had <think> tags in content.
             // Extract thinking → render expandable thinkRow, then strip.
             var thinkRe = /<think>([\s\S]*?)<\/think>/g;
@@ -615,6 +806,13 @@ export async function loadSession(sid, opts) {
             var _agentBubble = addChat('agent', cleanContent, null, m.time_created);
             if (_agentBubble && m.id) _agentBubble.dataset.msgId = m.id;
             S.chatHistory.push({ role: 'agent', content: cleanContent });
+            if (writeTrace) {
+              // addChat 返回的就是 .msg 行本身（不是里面的气泡），直接插在
+              // 它前面：用户气泡 → 时间线 → 回复气泡。
+              _agentBubble.parentNode.insertBefore(writeTrace.head, _agentBubble);
+              _agentBubble.parentNode.insertBefore(writeTrace.trace, _agentBubble);
+              writeTrace = null;
+            }
           }
         }
       } else if (role === 'agent' && m.interrupted) {
@@ -647,6 +845,13 @@ export async function loadSession(sid, opts) {
         }
       }
 
+      // 整轮没有最终正文（只有工具与旁白）：时间线照样要出现。
+      if (writeTrace) {
+        var _traceLog = document.getElementById('chatLog');
+        _traceLog.appendChild(writeTrace.head);
+        _traceLog.appendChild(writeTrace.trace);
+      }
+
       // ── 4b. Interrupt marker (agent only) ──────────────────────
       // 注记不进正文，和流式时的 UI 保持一致。
       if (role === 'agent' && m.interrupted) {
@@ -666,6 +871,11 @@ export async function loadSession(sid, opts) {
       // 写作会话不动阅读模式徽标（写作页的行由页签决定）。
       window.setModeLabel(data.mode);
     }
+    if (surface === 'write' && data.writing_mode
+        && typeof window.setWritingMode === 'function') {
+      // 会话已冻结的写作模式：同步界面状态，但不重新显示预选。
+      window.setWritingMode(data.writing_mode);
+    }
     // 已有内容的会话不再提供模式预选：模式随会话一起冻结。
     if (window.updateModePrelude) window.updateModePrelude();
 
@@ -675,7 +885,7 @@ export async function loadSession(sid, opts) {
     if (!document.querySelector('.si-rename-input')) {
       document.getElementById('sessionPanel').classList.remove('visible');
     }
-    log.scrollTop = log.scrollHeight;
+    stickChatToBottom(log);
 
     // Assign sequential indices to rendered message bubbles (used by fork
     // to compute fork_point_index and to locate the preceding user message).
@@ -964,7 +1174,11 @@ export function resetChatView() {
   _loadSeq++;
   S.chatEpoch++;
   const log = document.getElementById('chatLog');
-  if (log) log.innerHTML = '<div class="msg agent">' + getWelcomeMessage() + '</div>';
+  if (log) {
+    log.innerHTML = '<div class="msg agent">' + getWelcomeMessage() + '</div>';
+    // 新会话回到「跟随底部」，别继承上一段会话里用户上滚留下的停顿。
+    stickChatToBottom(log);
+  }
   S.chatHistory = [];
   S.chatLastTimestamp = 0;
   S.currentSessionId = '';
@@ -995,6 +1209,8 @@ window.drillBookIn = drillBookIn;
 window.drillBookOut = drillBookOut;
 window.drillCharIn = drillCharIn;
 window.drillCharOut = drillCharOut;
+window.drillWorkIn = drillWorkIn;
+window.drillWorkOut = drillWorkOut;
 window.startRename = startRename;
 window.scheduleClickLoad = scheduleClickLoad;
 window.cancelPendingClickLoad = cancelPendingClickLoad;

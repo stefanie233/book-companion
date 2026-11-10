@@ -12,17 +12,22 @@ import re
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator, Mapping, Sequence
 
 from llm_json import loads_tolerant
+from runtime import StreamTruncated
 from authorgraph.voice.select import eligible_traits, select_for_scene
 from storage.authors_db import AuthorsDB, resolve_authors_db_path
-from storage.writing_db import WritingDB
+from storage.writing_db import GIT_HABITS, WritingDB
 import usage_log
 from writegraph import budget as budget_mod
 from writegraph import card as card_mod
 from writegraph import facts as facts_mod
+from writegraph import goals as goals_mod
 from writegraph import lens as lens_mod
+from writegraph import outline as outline_mod
+from writegraph import reference as reference_mod
 from writegraph import review as review_mod
 from writegraph import state as state_mod
 from writegraph import versioning as vcs
@@ -37,27 +42,63 @@ class WritingError(RuntimeError):
     """可展示给用户的失败（缺合同、没配模型、结算被拒）。"""
 
 
-#: 把参考书候选压成「可迁移的细节卡」。去专名、不总结剧情、不写指导语。
-#: 只给观察与细节；写法/信息给法建议会和合同抢戏——基准里两处
-#: 合同违规都来自这类建议。
-REFERENCE_DISTILL = """你在为一位中文小说作者准备「可迁移的细节素材卡」。
-输入是另一本书的片段与人物观察。你要把它们拆成这位作者能直接借用的
-观察方式与细节，不能让他照搬原书，也不能让他照着写情节。
+#: 写作子模式（决策 161）。``detail`` 只抬证据门槛与预算，不换流水线。
+WRITING_MODES = ("standard", "detail")
 
-输出纯文本，不超过 520 字，固定两节：
 
-【可借用的观察】2-3 条，只讲「看什么、怎么看得见」：视角落在哪个部位、
-用哪个感官锚定、在哪个动作上停住。不写情节走向，不写人物关系判断，
-不写「先抑后扬」这类叙事策略，不给结局或点题的比喻。
+def normalize_writing_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return mode if mode in WRITING_MODES else "standard"
 
-【可转化的细节】3-5 条，具体、可感的物象或动作，能放进另一个故事。
 
-硬规则：
-1. 不得出现原书的人名、地名、作品名；
-2. 不得总结原书剧情，不得出现可被照搬的完整对白；
-3. 不写「应该」「建议」这类指导语，直接写素材本身；
-4. 找不到就少写，不要编。
-"""
+def _mode_label(mode: str) -> str:
+    # 界面叫法：standard = 高效，detail = 细致（决策 161）。
+    return "细致" if mode == "detail" else "高效"
+
+
+def validate_research_brief(brief: Any, refs: Sequence[Any] | None,
+                            mode: str) -> dict[str, Any]:
+    """把 agent 交的取舍说明压成可存的形状；细致模式缺说明直接拒绝。
+
+    只验形状，不判质量、不设数量配额：``questions`` / ``searched`` /
+    ``gaps`` 都可以短，但细致模式下「没给 refs 又什么都没说」不接受。
+    """
+    mode = normalize_writing_mode(mode)
+    if brief is None:
+        brief = {}
+    if not isinstance(brief, Mapping):
+        raise WritingError("research_brief 要是一个对象")
+    questions = [str(x).strip() for x in (brief.get("questions") or [])
+                 if str(x).strip()]
+    searched = []
+    for row in brief.get("searched") or []:
+        if isinstance(row, Mapping):
+            item = {k: str(row.get(k) or "").strip()
+                    for k in ("source", "query", "result")}
+            if any(item.values()):
+                searched.append(item)
+        elif str(row).strip():
+            searched.append({"source": "", "query": str(row).strip(),
+                             "result": ""})
+    gaps = [str(x).strip() for x in (brief.get("gaps") or [])
+            if str(x).strip()]
+    notes = str(brief.get("notes") or "").strip()
+    out = {"questions": questions, "searched": searched, "gaps": gaps}
+    if notes:
+        out["notes"] = notes
+    if mode == "detail" and not (refs or gaps):
+        raise WritingError(
+            "细致模式动笔前要交 research_brief：要么给 refs，"
+            "要么在 gaps 里说明这一章为什么不需要外部素材")
+    return out
+
+
+#: 正文输出预算：目标字数 ×1.8 + 推理开销，撞上限时翻倍重试。
+#: 端点的默认额度经常就是 4096，2500 字的中文正文加推理链必然撞线。
+_DRAFT_MIN_TOKENS = 4096
+_DRAFT_MAX_TOKENS = 16384
+_DRAFT_BUDGET_RETRIES = 2
+
 
 #: 必须排在最后：素材块也会给「只输出正文」的收尾指令，长度纪律要压过它。
 LENGTH_PROMPT = """
@@ -144,6 +185,15 @@ class ThinkStreamFilter:
 
 
 class WritingService:
+    #: 工作区文件在「更改」里的状态字母（VS Code 式）。写作 git 没有暂存区
+    #: （一次提交是整份工作区快照，决策 127），所以不存在 A（已加索引）：
+    #: 新文件一律是 U（未跟踪）。
+    FILE_STATUS = {
+        "changed": ("M", "已修改"),
+        "added": ("U", "未跟踪"),
+        "removed": ("D", "已删除"),
+    }
+
     def __init__(self, config, *, db: WritingDB | None = None,
                  api_client=None, recorder=None, recorder_session: str = ""):
         self.config = config
@@ -250,6 +300,18 @@ class WritingService:
         if (confirm_title or "").strip() != title:
             raise WritingError("删除确认不匹配：请传作品名")
         self.db.delete_work(work_id)
+        # 工作区是普通文件，库删了它不会自己走；顺手清掉，别留孤儿目录。
+        project_dir = getattr(self.config, "project_dir", None)
+        if project_dir is not None:
+            try:
+                import shutil
+
+                from writegraph import docs as docs_mod
+                root = docs_mod.workspace_root(project_dir, work_id)
+                if root.exists():
+                    shutil.rmtree(root, ignore_errors=True)
+            except OSError:
+                log.warning("writegraph: 删除工作区失败：%s", work_id)
         return {"deleted": work_id, "title": title}
 
     def rename_chapter(self, work_id: str, chapter_index: int,
@@ -278,8 +340,44 @@ class WritingService:
             raise WritingError(f"第{chapter_index}章不存在")
         return chapter
 
+    def effective_writing_mode(self, work_id: str, chapter_index: int,
+                               session_mode: str = "standard") -> str:
+        """会话模式 + 单章覆盖（决策 161）。"""
+        mode = normalize_writing_mode(session_mode)
+        try:
+            chapter = self.db.get_chapter(work_id, chapter_index)
+        except Exception:                            # noqa: BLE001
+            chapter = None
+        override = str((chapter or {}).get("writing_mode") or "")
+        return normalize_writing_mode(override) if override else mode
+
+    def set_chapter_writing_mode(self, work_id: str, chapter_index: int,
+                                 mode: str) -> dict[str, Any]:
+        """设/清单章覆盖。``inherit`` 清空覆盖。"""
+        chapter = self.chapter(work_id, chapter_index)
+        wanted = str(mode or "").strip().lower()
+        if wanted == "inherit":
+            self.db.set_chapter_writing_mode(chapter["id"], "")
+            return {"ok": True, "chapter_index": chapter_index,
+                    "mode": "inherit"}
+        value = normalize_writing_mode(wanted)
+        self.db.set_chapter_writing_mode(chapter["id"], value)
+        return {"ok": True, "chapter_index": chapter_index, "mode": value}
+
+    def _effective_mode(self, work_id: str, chapter_index: int,
+                        session_mode: str) -> str:
+        if not work_id:
+            return normalize_writing_mode(session_mode)
+        return self.effective_writing_mode(work_id, chapter_index,
+                                           session_mode)
+
     def contract(self, chapter_id: str) -> dict[str, Any] | None:
         return self.db.get_contract(chapter_id)
+
+    @staticmethod
+    def contract_stats(contract: Mapping[str, Any] | None) -> dict[str, Any]:
+        """合同的兑现盘点（只数申报行，不判证据真假）。"""
+        return contract_stats(contract)
 
     def set_contract(self, chapter_id: str, **fields: Any) -> dict[str, Any]:
         try:
@@ -287,6 +385,976 @@ class WritingService:
         except (ValueError, TypeError) as exc:
             raise WritingError(str(exc)) from exc
         return self.db.get_contract(chapter_id) or {}
+
+    def list_contracts(self, work_id: str) -> list[dict[str, Any]]:
+        """整本的合同（写作台「合同」页签）。只读——写合同仍归写作助手。"""
+        self._work_or_raise(work_id)
+        return self.db.list_contracts(work_id)
+
+    # ── 作品工作区（作品记忆 / 设定 / 计划稿 / 素材）──────────────────────
+    # 落盘在 data/writing/works/<work_id>/，并且和正文一起进写作 git：
+    # 设定与正文是同一本书，回滚到某个版本时设定也该回到那时（决策 127）。
+
+    def docs_root(self, work_id: str) -> Path:
+        work = self._work_or_raise(work_id)
+        project_dir = getattr(self.config, "project_dir", None)
+        if project_dir is None:
+            raise WritingError("没有工作目录配置，工作区不可用")
+        try:
+            from writegraph import docs as docs_mod
+            root = docs_mod.workspace_root(project_dir, work_id)
+            return docs_mod.ensure_workspace(root, str(work.get("title") or ""))
+        except OSError as exc:
+            raise WritingError(f"工作区不可用：{exc}") from exc
+
+    def docs_list(self, work_id: str) -> dict[str, Any]:
+        from writegraph import docs as docs_mod
+        root = self.docs_root(work_id)
+        return {"work_id": work_id, "root": str(root),
+                "files": docs_mod.list_files(root),
+                "dirs": docs_mod.list_dirs(root)}
+
+    def docs_read(self, work_id: str, path: str) -> dict[str, Any]:
+        from writegraph import docs as docs_mod
+        root = self.docs_root(work_id)
+        try:
+            return docs_mod.read_file(root, path)
+        except docs_mod.DocError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def docs_write(self, work_id: str, path: str, content: str, *,
+                   append: bool = False, dedupe: bool = False,
+                   check_duplicate: bool = False,
+                   log_memory: bool = False) -> dict[str, Any]:
+        from writegraph import docs as docs_mod
+        from writegraph import memory_guard
+        root = self.docs_root(work_id)
+        try:
+            rel = docs_mod.normalize(path)
+
+            def remember(text: str, op: str, old: str = "") -> None:
+                """作者点名直写设定 → 记一条 pending，交给 consolidate 去重。"""
+                if not (log_memory and text.strip()
+                        and rel.startswith(docs_mod.DOCS_DIR + "/")):
+                    return
+                try:
+                    self.memory_note(
+                        work_id, target="setting", path=rel, op=op,
+                        text=text, old=old, evidence="agent 直接写入",
+                        source="agent")
+                except Exception as exc:             # noqa: BLE001
+                    log.warning("writegraph: log direct setting failed: %s",
+                                exc)
+
+            try:
+                prior = docs_mod.read_file(root, rel)["content"]
+            except docs_mod.DocError:
+                prior = ""
+
+            if check_duplicate:
+                dupes = memory_guard.find_content_duplicates(
+                    root, content, exclude=rel)
+                if dupes:
+                    raise WritingError(
+                        "内容与已有设定重复：" + "、".join(dupes)
+                        + "；先合并或改写，别新建第二份")
+            if append:
+                try:
+                    existing = docs_mod.read_file(root, rel)["content"]
+                except docs_mod.DocError:
+                    existing = ""
+                addition, skipped = memory_guard.append_deduped(
+                    existing, content)
+                if not addition.strip():
+                    row = docs_mod.read_file(root, rel)
+                    row.pop("content", None)
+                    return {**row, "action": "append", "exists": True,
+                            "skipped_duplicates": skipped}
+                row = docs_mod.write_file(root, rel, addition, append=True)
+                remember(addition, "append")
+                return {**row, "action": "append", "exists": False,
+                        "skipped_duplicates": skipped}
+            row = docs_mod.write_file(root, rel, content)
+            remember(content, "replace" if prior.strip() else "append",
+                     old=prior if prior.strip() else "")
+            return row
+        except docs_mod.DocError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def docs_create(self, work_id: str, path: str, *, kind: str = "file",
+                    content: str = "") -> dict[str, Any]:
+        """新建文件或文件夹（页面右键「新建」）。"""
+        from writegraph import docs as docs_mod
+        if kind not in ("file", "dir"):
+            raise WritingError("条目类型只能是 file / dir")
+        root = self.docs_root(work_id)
+        try:
+            if kind == "dir":
+                row = docs_mod.create_dir(root, path)
+            else:
+                row = docs_mod.create_file(root, path, content)
+        except docs_mod.DocError as exc:
+            raise WritingError(str(exc)) from exc
+        return {"work_id": work_id, **row}
+
+    def docs_rename(self, work_id: str, path: str, new_name: str, *,
+                    kind: str = "file") -> dict[str, Any]:
+        """原地改名：页面只给新名字，父目录不变。"""
+        from writegraph import docs as docs_mod
+        root = self.docs_root(work_id)
+        try:
+            row = docs_mod.rename_entry(root, path, new_name, kind=kind)
+        except docs_mod.DocError as exc:
+            raise WritingError(str(exc)) from exc
+        return {"work_id": work_id, **row}
+
+    def docs_delete(self, work_id: str, path: str, *,
+                    kind: str = "file") -> dict[str, Any]:
+        from writegraph import docs as docs_mod
+        root = self.docs_root(work_id)
+        try:
+            return docs_mod.delete_entry(root, path, kind=kind)
+        except docs_mod.DocError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def docs_search(self, work_id: str, query: str, *, scope: str = "",
+                    limit: int = 10) -> dict[str, Any]:
+        """按关键词找 设定 / 素材 / 计划稿 里的条目（决策 129）。"""
+        from writegraph import docs as docs_mod
+        root = self.docs_root(work_id)
+        try:
+            return {"work_id": work_id,
+                    **docs_mod.search(root, query, scope=scope, limit=limit)}
+        except docs_mod.DocError as exc:
+            raise WritingError(str(exc)) from exc
+
+    # ── 全局素材库（决策 156）──────────────────────────────────────────────
+    # 不属于任何作品、不进写作 git、不自动进上下文。生产主要两条：作者点名
+    # 收录，以及写作时召回并实际用上的一段顺手沉淀；消费靠一张连线表，
+    # 素材本体始终是文件。
+
+    def materials_root(self) -> Path:
+        from writegraph import materials as mat
+        project_dir = getattr(self.config, "project_dir", None)
+        if project_dir is None:
+            raise WritingError("没有工作目录配置，素材库不可用")
+        try:
+            return mat.ensure_library(mat.library_root(project_dir))
+        except OSError as exc:
+            raise WritingError(f"素材库不可用：{exc}") from exc
+
+    def materials_list(self) -> dict[str, Any]:
+        from writegraph import materials as mat
+        root = self.materials_root()
+        cards = mat.list_cards(root)
+        return {"root": str(root),
+                "files": cards,
+                "dirs": mat.list_dirs(root),
+                # 阅读页收集的待归类卡还堆在 待归类：页面用它显示「整理一下」气泡。
+                "pending_count": sum(1 for c in cards if c.get("raw"))}
+
+    def _resolve_material_path(self, path: str = "",
+                               material_id: str = "") -> str:
+        """素材身份 → 相对路径：read/cook 既认 path 也认 material_id。"""
+        rel = str(path or "").strip()
+        if rel:
+            return rel
+        mid = str(material_id or "").strip()
+        if not mid:
+            return ""
+        from writegraph import materials as mat
+        return mat.find_by_id(self.materials_root(), mid)
+
+    def _material_path_or_raise(self, path: str = "",
+                                material_id: str = "") -> str:
+        rel = self._resolve_material_path(path, material_id)
+        if rel:
+            return rel
+        mid = str(material_id or "").strip()
+        if mid:
+            raise WritingError(f"找不到素材卡：{mid}")
+        raise WritingError("缺少 path（也可以给 material_id）")
+
+    def materials_read(self, path: str = "", *,
+                       material_id: str = "") -> dict[str, Any]:
+        """读一张卡：path 优先；只给素材身份时按身份找路径。"""
+        from writegraph import materials as mat
+        rel = self._material_path_or_raise(path, material_id)
+        try:
+            return mat.read_card(self.materials_root(), rel)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_write(self, path: str, content: str) -> dict[str, Any]:
+        """页面编辑卡片正文。抬头里的身份行不许删——消费记录靠它。"""
+        from writegraph import materials as mat
+        root = self.materials_root()
+        try:
+            old = mat.read_card(root, path)
+        except mat.MaterialError:
+            old = {}
+        mid = str(old.get("material_id") or "")
+        if mid and f"素材 {mid}" not in str(content or ""):
+            raise WritingError("卡片抬头不能删：身份和消费记录都靠它")
+        try:
+            return mat.write_text(root, path, content)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_create(self, path: str, *, kind: str = "file",
+                         content: str = "") -> dict[str, Any]:
+        from writegraph import materials as mat
+        if kind not in ("file", "dir"):
+            raise WritingError("条目类型只能是 file / dir")
+        try:
+            root = self.materials_root()
+            if kind == "dir":
+                return mat.create_dir(root, path)
+            return mat.create_file(root, path, content)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_rename(self, path: str, new_name: str, *,
+                         kind: str = "file") -> dict[str, Any]:
+        from writegraph import materials as mat
+        try:
+            return mat.rename_entry(self.materials_root(), path, new_name,
+                                    kind=kind)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_move(self, path: str, target_dir: str, *,
+                       kind: str = "file") -> dict[str, Any]:
+        """换分类：作者改主意时不用删了重收，消费连线不动。"""
+        from writegraph import materials as mat
+        try:
+            return mat.move_entry(self.materials_root(), path, target_dir,
+                                  kind=kind)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_delete(self, path: str, *, kind: str = "file") -> dict[str, Any]:
+        """删除 = 进回收站。素材库没有 git，硬删就真的找不回来了。"""
+        from writegraph import materials as mat
+        try:
+            return mat.recycle(self.materials_root(), path, kind=kind)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_merge(self, path: str, into: str, *,
+                        authorized: bool = False) -> dict[str, Any]:
+        """把包含型短卡并入长卡；必须先过作者许可门（authorized）。"""
+        from writegraph import materials as mat
+        try:
+            plan = mat.merge_plan(self.materials_root(), path, into)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+        uses = self.db.material_use_stats(str(plan.get("from_id") or ""))
+        plan["uses"] = int(uses.get("events") or 0)
+        if plan["uses"]:
+            raise WritingError(
+                f"短卡已被作品消费 {plan['uses']} 次，V1 不自动合并；"
+                "先请作者确认消费连线怎么处理，或保留两张。")
+        if not authorized:
+            return {"ok": True, "needs_authorization": True, **plan}
+        try:
+            return mat.merge_cards(self.materials_root(), path, into)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_empty(self, path: str) -> dict[str, Any]:
+        """清空文件夹：逐张进回收站，保留文件夹与子分类。"""
+        from writegraph import materials as mat
+        try:
+            return mat.empty_dir(self.materials_root(), path)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_recycled(self) -> dict[str, Any]:
+        from writegraph import materials as mat
+        root = self.materials_root()
+        return {"items": mat.list_recycled(root),
+                "summary": mat.recycled_summary(root)}
+
+    def materials_restore(self, recycled: str, *,
+                          target: str = "") -> dict[str, Any]:
+        from writegraph import materials as mat
+        try:
+            return mat.restore(self.materials_root(), recycled, target=target)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_purge_recycled(self, *, days: int | None = None) -> dict[str, Any]:
+        """显式清理回收站。页面/脚本才调，agent 工具不暴露。"""
+        from writegraph import materials as mat
+        return mat.purge_recycled(
+            self.materials_root(),
+            days=mat.RECYCLE_RETENTION_DAYS if days is None else days)
+
+    def materials_audit(self, *, unused_days: int = 90) -> dict[str, Any]:
+        """盘点：未消费、近重复、坏抬头、回收站积压。只报告，不改。"""
+        from writegraph import materials as mat
+        counts = {mid: int(row.get("events") or 0)
+                  for mid, row in self.db.material_use_counts().items()}
+        data = mat.audit(self.materials_root(), use_counts=counts,
+                         unused_days=unused_days)
+        # healthy 只回答「有没有需要人看一眼的东西」；近重复与待归类超期
+        # 也算，否则 agent 看到 healthy=true 就不会去读候选。
+        attention: list[str] = []
+        for key, label in (("broken_count", "坏抬头"),
+                           ("duplicate_id_count", "身份重复"),
+                           ("near_duplicate_count", "近重复候选"),
+                           ("identity_mismatch_count", "原文改过")):
+            if int(data.get(key) or 0):
+                attention.append(f"{label} {int(data.get(key) or 0)}")
+        if int((data.get("recycled") or {}).get("overdue") or 0):
+            attention.append(
+                f"回收站超期 {int(data['recycled']['overdue'])}")
+        if int(data.get("pending_over_days") or 0):
+            attention.append(
+                f"待归类超期 {int(data['pending_over_days'])}")
+        data["attention"] = attention
+        data["healthy"] = not attention
+        return data
+
+    def materials_search(self, query: str, *, limit: int = 10) -> dict[str, Any]:
+        from writegraph import materials as mat
+        try:
+            data = mat.search(self.materials_root(), query, limit=limit)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+        # 与 search_materials / writing_research 的字段对齐，调用方不用记两套。
+        data["count"] = len(data.get("hits") or [])
+        return data
+
+    def _books_db_path(self) -> Path:
+        return Path(getattr(
+            self.config, "books_db_path",
+            Path(self.config.project_dir) / "data" / "books.db"))
+
+    def materials_intake(
+            self, *, excerpt: str = "", title: str = "",
+            category: str = "待归类", tags: Any = "",
+            description: str = "", source: str = "author",
+            book_title: str = "", book_id: str = "",
+            chapter_index: int | None = None,
+            chunk_index: int | None = None, chunk_id: str = "",
+            para_start: int | None = None, para_end: int | None = None,
+            url: str = "", origin: str = "", work_id: str = "",
+            session_id: str = "", instruction: str = "",
+    ) -> dict[str, Any]:
+        """收一张素材卡；能给 chunk 引用就取逐字原文，拿不到才用传入摘录。
+
+        ``para_start`` / ``para_end`` 是块内段落序号（1-based，含两端）：
+        阅读工具按 chunk 取原文，但索引粒度到段——作者要的是块里那封信，
+        不是整块连带的后文。原文字符串永远从库里切，不接受模型转述。
+        """
+        from writegraph import materials as mat
+        source = str(source or "author").strip() or "author"
+        title = str(title or "").strip()
+        description = str(description or "").strip()
+        book_ref = bool(chunk_id or book_id)
+        para_span = ""
+        para_total = 0
+        if source == "book" or book_ref:
+            chunk = mat.read_book_chunk(
+                self._books_db_path(), chunk_id=str(chunk_id or ""),
+                book_id=str(book_id or ""), chapter_index=chapter_index,
+                chunk_index=chunk_index)
+            content = str(chunk.get("content") or "") if chunk else ""
+            if chunk:
+                excerpt = content or excerpt
+                book_id = str(chunk.get("book_id") or book_id)
+                book_title = str(chunk.get("book_title") or book_title)
+                if chunk.get("chapter_index") is not None:
+                    chapter_index = int(chunk["chapter_index"])
+                if chunk.get("chunk_index") is not None:
+                    chunk_index = int(chunk["chunk_index"])
+            if para_start or para_end:
+                if not content:
+                    raise WritingError(
+                        "找不到这块原文，没法按段落取；先确认 book_id / 章 / 块")
+                try:
+                    excerpt, first, last, para_total = mat.paragraph_span(
+                        content, para_start, para_end)
+                except mat.MaterialError as exc:
+                    raise WritingError(str(exc)) from exc
+                para_span = (f"第 {first} 段" if first == last
+                             else f"第 {first}–{last} 段")
+            source_line = f"书《{book_title or '未知'}》"
+            if chapter_index is not None:
+                source_line += f"第 {int(chapter_index)} 章"
+            if chunk_index is not None:
+                source_line += f" · 块 #{int(chunk_index)}"
+            source_ref = source_line
+            if para_span:
+                source_line += f" · {para_span}"
+        elif source == "web":
+            source_line = f"网页 · {url}" if url else "网页"
+            source_ref = source_line
+        else:
+            source_line = "作者自述"
+            source_ref = source_line
+        if not origin and work_id:
+            work = self.db.get_work(str(work_id))
+            if work:
+                origin = f"作品《{work.get('title') or work_id}》"
+        try:
+            row = mat.intake(
+                self.materials_root(), excerpt=excerpt, title=title,
+                category=category or "待归类", tags=tags,
+                description=description, source_line=source_line,
+                source_ref=source_ref, origin=origin,
+                session_id=session_id or self.recorder_session,
+                instruction=instruction)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+        if para_total:
+            row["para_span"] = para_span
+            row["para_count"] = para_total
+        return row
+
+    def materials_intake_raw(
+            self, *, excerpt: str = "", book_id: str = "",
+            book_title: str = "", chapter_index: int | None = None,
+            chunk_index: int | None = None, cfi: str = "",
+            instruction: str = "") -> dict[str, Any]:
+        """阅读页「收录为素材」：待归类卡直接落 ``待归类/《书名》-时间戳.md``。
+
+        摘录就是选中的那段逐字文字，**不拿 chunk 原文覆盖**（那是 intake 的
+        加工语义）；章/块只进来源行，方便以后回查。
+        """
+        from writegraph import materials as mat
+        text = str(excerpt or "").strip()
+        if not text:
+            raise WritingError("摘录不能为空")
+        title = str(book_title or "").strip()
+        if not title and book_id:
+            title = mat.book_title(self._books_db_path(), str(book_id))
+        title = title or "未知书籍"
+        chapter = None
+        if chapter_index is not None:
+            try:
+                chapter = int(chapter_index)
+            except (TypeError, ValueError):
+                chapter = None
+        chunk = None
+        if chunk_index is not None:
+            try:
+                chunk = int(chunk_index)
+            except (TypeError, ValueError):
+                chunk = None
+        source_line = f"书《{title}》"
+        if chapter is not None:
+            source_line += f"第 {chapter} 章"
+        if chunk is not None:
+            source_line += f" · 块 #{chunk}"
+        try:
+            return mat.intake_raw(
+                self.materials_root(), excerpt=text, book_title=title,
+                source_line=source_line, location=cfi,
+                origin="阅读页收录", session_id=self.recorder_session,
+                instruction=instruction)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_pending(self, *, limit: int = 20) -> dict[str, Any]:
+        """待加工的待归类卡列表（最早收的在前）。"""
+        from writegraph import materials as mat
+        return mat.pending_cards(self.materials_root(), limit=limit)
+
+    def materials_cook(self, path: str = "", *, material_id: str = "",
+                       title: str = "", category: str = "待归类",
+                       tags: str = "", description: str = "") -> dict[str, Any]:
+        """待归类卡 → 已加工卡：补标题/分类/标签/说明，同一张卡换目录。
+
+        「加工这张」时作者常只给素材身份；path 为空也可以按 material_id 找。
+        """
+        from writegraph import materials as mat
+        rel = self._material_path_or_raise(path, material_id)
+        try:
+            return mat.cook(self.materials_root(), rel, title=title,
+                            category=category, tags=tags,
+                            description=description)
+        except mat.MaterialError as exc:
+            raise WritingError(str(exc)) from exc
+
+    def materials_read_chunk(
+            self, *, chunk_id: str = "", book_id: str = "",
+            chapter_index: int | None = None,
+            chunk_index: int | None = None) -> dict[str, Any]:
+        """按段落编号读回一块原文：模型抄编号，不数、不转述。"""
+        from writegraph import materials as mat
+        chunk = mat.read_book_chunk(
+            self._books_db_path(), chunk_id=str(chunk_id or ""),
+            book_id=str(book_id or ""), chapter_index=chapter_index,
+            chunk_index=chunk_index)
+        if not chunk:
+            cid = str(chunk_id or "").strip()
+            hint = ""
+            if cid:
+                try:
+                    rel = self._resolve_material_path("", cid)
+                except WritingError:
+                    rel = ""
+                if rel:
+                    hint = (f"；{cid} 是素材卡 id（{rel}），不是书块 id，"
+                            "读素材卡请用 action=read material_id=…")
+            raise WritingError(
+                "找不到这块原文；先确认 book_id / 章 / 块" + hint)
+        paras = mat.split_paragraphs(str(chunk.get("content") or ""))
+        return {
+            "chunk_id": chunk.get("id") or "",
+            "book_id": chunk.get("book_id") or "",
+            "book_title": chunk.get("book_title") or "",
+            "chapter_index": chunk.get("chapter_index"),
+            "chunk_index": chunk.get("chunk_index"),
+            "count": len(paras),
+            "paragraphs": [{"n": i, "text": text}
+                           for i, text in enumerate(paras, 1)],
+            "hint": "只要其中连续几段时，intake 传 para_start / para_end"
+                    "（含两端）；整块收录不传。",
+        }
+
+    def materials_record_use(
+            self, material_id: str, work_id: str, *, kind: str = "merge",
+            chapter_index: int | None = None, target_path: str = "",
+            note: str = "", session_id: str = "",
+    ) -> dict[str, Any]:
+        """记一条消费：kind 只认 shortlist / merge / inline。"""
+        kind = str(kind or "merge").strip()
+        if kind not in ("shortlist", "merge", "inline"):
+            raise WritingError("kind 只能是 shortlist / merge / inline")
+        material_id = str(material_id or "").strip()
+        if not material_id:
+            raise WritingError("缺少 material_id")
+        work = self._work_or_raise(str(work_id or ""))
+        chapter_id = None
+        if chapter_index is not None:
+            chapter = self.db.get_chapter(work["id"], int(chapter_index))
+            if chapter:
+                chapter_id = str(chapter.get("id") or "") or None
+        row = self.db.add_material_use(
+            material_id, work["id"], kind=kind, chapter_id=chapter_id,
+            target_path=str(target_path or ""), note=str(note or ""),
+            session_id=str(session_id or self.recorder_session or ""))
+        return {"use": row, "stats": self.db.material_use_stats(material_id)}
+
+    def materials_uses(self, *, material_id: str = "", work_id: str = "",
+                       limit: int = 100) -> dict[str, Any]:
+        return {"uses": self.db.list_material_uses(
+            material_id=str(material_id or ""), work_id=str(work_id or ""),
+            limit=limit)}
+
+    def materials_promote(self, material_id: str, work_id: str, *,
+                          target_path: str = "", note: str = "",
+                          chapter_index: int | None = None,
+                          session_id: str = "") -> dict[str, Any]:
+        """把库里的卡复制进作品 ``素材/``（作品自足，原件留在库里）。
+
+        复制而不是挂链接：库被清理或换机后，这本书的历史仍说得清出处。
+        """
+        from writegraph import materials as mat
+        material_id = str(material_id or "").strip()
+        if not material_id:
+            raise WritingError("缺少 material_id")
+        work = self._work_or_raise(str(work_id or ""))
+        root = self.materials_root()
+        source_path = mat.find_by_id(root, material_id)
+        if not source_path:
+            raise WritingError(f"素材库里找不到 {material_id}")
+        card = mat.read_card(root, source_path)
+        title = str(card.get("title") or "素材")
+        target = str(target_path or "").strip()
+        if not target:
+            name = re.sub(r'[\\/:*?"<>|\s]+', "-", title).strip("-")[:40] or "素材"
+            target = f"素材/{name}.md"
+        if not target.startswith("素材/"):
+            raise WritingError("提升的目标必须放在 素材/ 下")
+        from writegraph import docs as docs_mod
+        try:
+            target_file = docs_mod.resolve(self.docs_root(work["id"]), target)
+        except docs_mod.DocError as exc:
+            raise WritingError(str(exc)) from exc
+        if target_file.exists():
+            raise WritingError(f"作品里已有 {target}；换个名字或先处理旧的")
+        content = str(card.get("content") or "")
+        lines = content.splitlines()
+        # 出处行插在抬头块末尾，不是正文里最后一个引用块（原文通常也有 >）。
+        insert_at = 0
+        in_head = False
+        for idx, line in enumerate(lines):
+            if line.startswith(">"):
+                in_head = True
+                insert_at = idx + 1
+            elif in_head:
+                break
+        lines.insert(insert_at, f"> 取自素材库：{source_path}")
+        body = "\n".join(lines).rstrip() + "\n"
+        try:
+            written = self.docs_write(work["id"], target, body)
+        except Exception as exc:                     # noqa: BLE001
+            raise WritingError(str(exc)) from exc
+        use = self.materials_record_use(
+            material_id, work["id"], kind="shortlist", target_path=target,
+            note=note, chapter_index=chapter_index, session_id=session_id)
+        return {"path": written.get("path") or target,
+                "material_id": material_id, "source_path": source_path,
+                **use}
+
+    def search_materials(self, query: str, *, work_id: str = "",
+                         limit: int = 6) -> dict[str, Any]:
+        """搜素材：全局库 + 本书 ``素材/``。不扫别的作品（跨库要作者点名）。"""
+        from writegraph import materials as mat
+        limit = max(1, min(12, int(limit)))
+        lib = mat.search(self.materials_root(), query, limit=limit)
+        cards: list[dict[str, Any]] = []
+        for hit in lib.get("hits") or []:
+            cards.append({
+                "library": "global",
+                "path": hit.get("path"),
+                "material_id": hit.get("material_id"),
+                "title": hit.get("title"),
+                "category": hit.get("category"),
+                "tags": hit.get("tags") or [],
+                "excerpt": hit.get("excerpt"),
+                "description": hit.get("description"),
+                "source_line": hit.get("source_line"),
+            })
+        work_id = str(work_id or "").strip()
+        if work_id:
+            try:
+                found = self.docs_search(work_id, query, scope="素材",
+                                         limit=limit)
+            except Exception:                        # noqa: BLE001
+                found = {}
+            for hit in found.get("hits") or []:
+                path = str(hit.get("path") or "")
+                if not path:
+                    continue
+                try:
+                    row = self.docs_read(work_id, path)
+                    card = mat.parse_card(str(row.get("content") or ""), path)
+                except Exception:                    # noqa: BLE001
+                    card = {}
+                cards.append({
+                    "library": "work",
+                    "path": path,
+                    "material_id": card.get("material_id") or "",
+                    "title": card.get("title") or hit.get("first_line") or path,
+                    "category": mat.category_of(path),
+                    "tags": card.get("tags") or [],
+                    "excerpt": card.get("excerpt") or hit.get("snippet") or "",
+                    "description": card.get("description") or "",
+                    "source_line": card.get("source_line") or "",
+                })
+        # 同一张卡可能既在库里又被提升进作品：按 material_id 去重，库里优先。
+        seen: set[str] = set()
+        uniq: list[dict[str, Any]] = []
+        for card in cards:
+            key = str(card.get("material_id") or "")
+            key = key or f"{card.get('library')}:{card.get('path')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(card)
+        uniq = uniq[:limit]
+        return {
+            "source": "materials",
+            "recall": "keyword",
+            "terms": lib.get("terms") or [],
+            "cards": uniq,
+            "count": len(uniq),
+            "note": ("素材库与本书 素材/ 的结果；仍是候选，不自动进正文。"
+                     if uniq else
+                     "素材库里没有相关卡片；可以换词，或让作者/你收一段。"),
+        }
+
+    # ── 记忆维护（两段式：抽取 → 合并，决策 133）────────────────────
+
+    async def memory_extract(self, work_id: str, chapter_index: int, *,
+                             transcript: str = "", delta: Any = None,
+                             outcomes: Any = None) -> dict[str, Any]:
+        """Phase 1：从一章的现场抽候选，落进 work_memory_log（不碰文件）。"""
+        from writegraph import memory_write
+        if self.api_client is None:
+            raise WritingError("未配置模型，无法抽取记忆")
+        chapter = self.chapter(work_id, chapter_index)
+        contract = self.db.get_contract(chapter["id"]) or {}
+        # agent 不必回传结算结果：成功结算后 DB 里已有 state_delta 与
+        # outcomes。显式传入仍优先（比如从旧章补提取）。
+        if delta is None:
+            summary = self.db.get_summary(chapter["id"])
+            if summary and summary.get("state_delta"):
+                delta = summary["state_delta"]
+        if outcomes is None:
+            outcomes = contract.get("outcomes") or None
+        user = memory_write.build_extract_input(
+            chapter, contract, delta=delta, outcomes=outcomes,
+            transcript=transcript)
+        system = self._prompt("memory_extract.md")
+        data: dict[str, Any] = {}
+        for _attempt in range(2):
+            raw = await self._complete(system, user,
+                                       scenario="writing.memory.extract",
+                                       kind="memory_extract", work_id=work_id,
+                                       chapter_index=chapter_index)
+            data = memory_write.parse_extract(raw)
+            if data.get("error") != "parse_failed":
+                break
+        if data.get("error") == "parse_failed":
+            raise WritingError("记忆抽取输出无法解析")
+        status = "skipped" if data.get("no_op") else "pending"
+        log_id = self.db.add_memory_log(work_id, chapter_index, data,
+                                        status=status)
+        self._clear_dirty_chapter(work_id, chapter_index)
+        return {"ok": True, "log_id": log_id, "status": status,
+                "no_op": bool(data.get("no_op")), "extracted": data}
+
+    async def memory_consolidate(self, work_id: str, *,
+                                 force: bool = False) -> dict[str, Any]:
+        """Phase 2：把待合并记录并进 作品记忆 / 设定，机械闸门判过才落盘。"""
+        from writegraph import docs as docs_mod
+        from writegraph import memory_guard, memory_write
+        pending = self.db.list_memory_logs(work_id, status="pending")
+        if not pending and not force:
+            return {"ok": True, "status": "nothing_to_merge"}
+        root = self.docs_root(work_id)
+        state = self.db.get_memory_state(work_id)
+        try:
+            old = json.loads(str(state.get("manifest") or "{}"))
+        except (TypeError, ValueError):
+            old = {}
+        try:
+            old_baseline = json.loads(str(state.get("baseline") or "{}"))
+        except (TypeError, ValueError):
+            old_baseline = {}
+        if not isinstance(old_baseline, Mapping):
+            old_baseline = {}
+        current = memory_guard.snapshot(root)
+        changes = memory_guard.diff_manifest(old, memory_guard.manifest(root))
+        diff = memory_guard.diff_snapshot(old_baseline, current)
+        audit = memory_guard.audit_workspace(root)
+        last = max([int(row.get("chapter_index") or 0)
+                    for row in pending] or [0])
+        user = memory_write.build_consolidate_input(
+            bible=docs_mod.read_bible(root, max_chars=4000),
+            settings=docs_mod.dump_section(
+                root, docs_mod.DOCS_DIR, max_total=40000),
+            pending=pending, changes=changes, diff=diff, audit=audit)
+        system = self._prompt("memory_consolidate.md")
+        errors: list[str] = []
+        applied: dict[str, Any] | None = None
+        for _attempt in range(2):
+            prompt = user
+            if errors:
+                prompt += ("\n\n## 上一次的校验错误（必须修正）\n"
+                           + "\n".join(f"- {e}" for e in errors))
+            raw = await self._complete(
+                system, prompt, scenario="writing.memory.consolidate",
+                kind="memory_consolidate", work_id=work_id,
+                chapter_index=last)
+            parsed = memory_write.parse_consolidate(raw)
+            if parsed.get("notes") == "parse_failed":
+                errors = ["输出不是可解析的 JSON 对象"]
+                continue
+            checked = memory_guard.validate_ops(parsed, root)
+            if checked.ok:
+                applied = memory_guard.apply_ops(root, checked)
+                if applied.get("errors"):
+                    errors = [str(x) for x in applied["errors"]]
+                    applied = None
+                    continue
+                break
+            errors = checked.errors
+        if applied is None:
+            return {"ok": False, "status": "guard_failed", "errors": errors}
+        ids = [str(row.get("id") or "") for row in pending]
+        self.db.mark_memory_logs(ids, status="consolidated")
+        self.db.set_memory_state(work_id,
+                                 manifest=memory_guard.manifest(root),
+                                 last_chapter=last,
+                                 baseline=memory_guard.snapshot(root))
+        return {"ok": True, "status": "consolidated",
+                "merged": len(pending), "applied": applied}
+
+    async def maintain_memory(self, work_id: str, chapter_index: int, *,
+                              transcript: str = "", delta: Any = None,
+                              outcomes: Any = None, threshold: int = 3,
+                              force: bool = False) -> dict[str, Any]:
+        """先抽候选；pending 到阈值或 force 时才合并。失败只回报，不影响主流程。"""
+        try:
+            extracted = await self.memory_extract(
+                work_id, chapter_index, transcript=transcript,
+                delta=delta, outcomes=outcomes)
+            pending = len(self.db.list_memory_logs(work_id, status="pending"))
+            if force or pending >= max(1, int(threshold or 1)):
+                merged = await self.memory_consolidate(work_id)
+            else:
+                merged = {"ok": True, "status": "pending",
+                          "pending": pending, "threshold": threshold}
+            return {"ok": True, "extract": extracted,
+                    "consolidate": merged}
+        except Exception as exc:                     # noqa: BLE001
+            log.warning("writegraph: memory maintenance failed: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    def memory_note(self, work_id: str, *, target: str = "setting",
+                    path: str = "", section: str = "", op: str = "append",
+                    text: str = "", old: str = "", evidence: str = "",
+                    source: str = "author") -> dict[str, Any]:
+        """作者点名/纠正的即时留痕；零 LLM，等下一次 consolidate 合并。"""
+        from writegraph import docs as docs_mod
+        from writegraph import memory_guard
+        target = str(target or "setting").strip()
+        op = str(op or "append").strip()
+        source = str(source or "author").strip()
+        if target not in ("bible", "setting", "plan"):
+            raise WritingError("target 只能是 bible / setting / plan")
+        if op not in ("append", "replace", "delete"):
+            raise WritingError("op 只能是 append / replace / delete")
+        if source not in ("author", "agent"):
+            raise WritingError("source 只能是 author / agent")
+        if not str(text or "").strip() and op != "delete":
+            raise WritingError("note 缺少 text")
+        if op == "replace" and not str(old or "").strip():
+            raise WritingError("replace 需要 old（要改掉的原文）")
+        root = self.docs_root(work_id)
+        if target == "bible":
+            if str(path or "").strip():
+                raise WritingError("bible 不应带 path")
+            rel = docs_mod.BIBLE_NAME
+        else:
+            if not str(path or "").strip():
+                raise WritingError("setting/plan 需要 path")
+            try:
+                rel = docs_mod.normalize(path)
+            except docs_mod.DocError as exc:
+                raise WritingError(str(exc)) from exc
+            root_dir = docs_mod.DOCS_DIR if target == "setting" else docs_mod.PLANS_DIR
+            if not rel.startswith(root_dir + "/"):
+                raise WritingError(f"target={target} 只能写 {root_dir}/")
+        digest = memory_guard.note_hash(
+            target, section, text, evidence=evidence, old=old)
+        existing = self.db.find_memory_log_by_hash(
+            work_id, digest, status="pending")
+        if existing:
+            return {"ok": True, "duplicate": True,
+                    "note_id": existing.get("id"),
+                    "pending": len(self.db.list_memory_logs(
+                        work_id, status="pending"))}
+        payload = {"target": target, "path": rel, "section": section,
+                   "op": op, "text": text, "old": old,
+                   "evidence": evidence}
+        note_id = self.db.add_memory_log(
+            work_id, 0, payload, status="pending", kind="note",
+            source=source, target=target, path=rel, section=section,
+            op=op, content_hash=digest)
+        return {"ok": True, "duplicate": False, "note_id": note_id,
+                "pending": len(self.db.list_memory_logs(
+                    work_id, status="pending"))}
+
+    def memory_audit(self, work_id: str) -> dict[str, Any]:
+        """机械审计：重复文件/近重复/同主题/作品记忆重复 bullet/pending 重复。"""
+        from writegraph import memory_guard
+        root = self.docs_root(work_id)
+        audit = memory_guard.audit_workspace(root)
+        pending = self.db.list_memory_logs(work_id, status="pending",
+                                           limit=200)
+        by_hash: dict[str, list[str]] = {}
+        for row in pending:
+            digest = str(row.get("content_hash") or "")
+            if digest:
+                by_hash.setdefault(digest, []).append(str(row.get("id") or ""))
+        duplicates = [ids for ids in by_hash.values() if len(ids) > 1]
+        audit["pending"] = len(pending)
+        audit["pending_duplicates"] = duplicates
+        audit["ok"] = True
+        audit["work_id"] = work_id
+        return audit
+
+    def _dirty_chapters(self, work_id: str) -> list[int]:
+        state = self.db.get_memory_state(work_id)
+        raw = state.get("dirty_chapters") or "[]"
+        try:
+            rows = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            rows = []
+        if not isinstance(rows, list):
+            return []
+        return sorted({int(x) for x in rows if isinstance(x, (int, float))
+                       or str(x).lstrip("-").isdigit()})
+
+    def _mark_dirty_chapter(self, work_id: str, chapter_index: int) -> None:
+        chapters = self._dirty_chapters(work_id)
+        if int(chapter_index) not in chapters:
+            chapters.append(int(chapter_index))
+            self.db.set_dirty_chapters(work_id, chapters)
+
+    def _clear_dirty_chapter(self, work_id: str, chapter_index: int) -> None:
+        chapters = self._dirty_chapters(work_id)
+        if int(chapter_index) in chapters:
+            chapters.remove(int(chapter_index))
+            self.db.set_dirty_chapters(work_id, chapters)
+
+    def memory_reminder(self, work_id: str) -> str:
+        """下一轮 user 消息里的「结算了但没抽取」提醒；没有就返回空串。"""
+        chapters = self._dirty_chapters(work_id)
+        if not chapters:
+            return ""
+        labels = "、".join(f"第{n}章" for n in chapters[:6])
+        more = "（还有更多）" if len(chapters) > 6 else ""
+        first = chapters[0]
+        return ("<memory-pending>\n"
+                f"{labels}{more}已结算但还没抽取记忆。收尾前调 "
+                f"writing_memory(action=\"auto\", chapter_index={first}, "
+                "transcript=作者这轮原话)；pending≥3 或到章节/弧段边界时再 "
+                "consolidate。\n</memory-pending>")
+
+    def memory_status(self, work_id: str) -> dict[str, Any]:
+        state = self.db.get_memory_state(work_id)
+        pending = self.db.list_memory_logs(work_id, status="pending")
+        return {"ok": True, "work_id": work_id,
+                "pending": len(pending),
+                "last_chapter": int(state.get("last_chapter") or -1),
+                "last_consolidated_at": int(
+                    state.get("last_consolidated_at") or 0),
+                "dirty_chapters": self._dirty_chapters(work_id)}
+
+    def _workspace_section(self, work: Mapping[str, Any]) -> str:
+        """system prompt 里的工作区：作品记忆全文 + 分区索引（带未列出计数）。"""
+        from writegraph import docs as docs_mod
+        try:
+            root = self.docs_root(str(work["id"]))
+            bible = docs_mod.read_bible(root, max_chars=3000)
+            index = docs_mod.overview(root, material_limit=0, plan_limit=0)
+        except (WritingError, OSError):
+            return ""
+        lines = ["### 《" + str(work.get("title") or "未命名") + "》的工作区",
+                 "#### 作品记忆",
+                 bible.strip() or "（还是空的：用 writing_docs 写第一版）"]
+        lines.extend(index)
+        lines.append('要正文用 writing_docs(action="read")；找具体条目用 '
+                     'writing_docs(action="search")。计划稿与素材不自动进上下文。')
+        return "\n".join(lines)
+
+    def _work_docs_block(self, work: Mapping[str, Any], *,
+                         context_text: str = "") -> tuple[str, dict[str, Any]]:
+        """写作上下文：作品记忆 + 按本章现场选中的设定；空工作区返回空串。"""
+        from writegraph import docs as docs_mod
+        try:
+            root = self.docs_root(str(work["id"]))
+            bible = docs_mod.read_bible(root, max_chars=2000)
+            docs_text, manifest = docs_mod.select_for_chapter(
+                root, context_text=context_text)
+        except (WritingError, OSError):
+            return "", {}
+        parts = []
+        if bible:
+            parts.append("## 作品记忆\n" + bible)
+        if docs_text:
+            parts.append(docs_text)
+        return "\n\n".join(parts), manifest
 
     #: 这些来源只算「暂存稿」，不算保存点。
     DRAFT_REASONS = frozenset({"autosave", "flush", "park"})
@@ -353,7 +1421,7 @@ class WritingService:
         for c in self.db.list_commits(work_id, limit=5000):
             if c["id"].startswith(ref) or vcs.short_id(c["id"]) == ref:
                 return c
-        raise WritingError(f"找不到提交或分支：{ref}")
+        raise WritingError(f"找不到存档或分支：{ref}")
 
     def _commit_ref_or_raise(self, work_id: str,
                              ref: str) -> dict[str, Any]:
@@ -361,25 +1429,125 @@ class WritingService:
         try:
             commit = self._resolve_commit(work_id, ref)
         except WritingError as exc:
-            raise WritingError("提交不存在") from exc
+            raise WritingError("存档不存在") from exc
         if commit is None or commit.get("work_id") != work_id:
-            raise WritingError("提交不存在")
+            raise WritingError("存档不存在")
         return commit
 
     def _resolve_state(self, work_id: str, ref: str) -> dict[str, Any]:
         commit = self._resolve_commit(work_id, ref)
         if commit is None:
-            return {"tree": [], "ledger": {}, "commit": None}
+            # 空树（还没提交过 / EMPTY）：它不是工作区，读正文只能按「没有」。
+            return {"tree": [], "ledger": {}, "commit": None,
+                    "files": {}, "files_tracked": False, "worktree": False}
         try:
             tree = json.loads(commit.get("tree_json") or "[]")
             ledger = json.loads(commit.get("ledger_json") or "{}")
         except (json.JSONDecodeError, TypeError) as exc:
-            raise WritingError(f"提交内容损坏：{commit.get('id')}") from exc
-        return {"tree": tree, "ledger": ledger, "commit": commit}
+            raise WritingError(f"存档内容损坏：{commit.get('id')}") from exc
+        tracked = bool(commit.get("files_hash"))
+        return {"tree": tree, "ledger": ledger, "commit": commit,
+                "files": self.db.get_commit_files(str(commit["id"]))
+                if tracked else {},
+                "files_tracked": tracked, "worktree": False}
 
     def _current_state(self, work_id: str) -> dict[str, Any]:
+        files = self._workspace_files(work_id)
         return {"tree": self.db.current_tree(work_id),
-                "ledger": self.db.snapshot_ledger(work_id), "commit": None}
+                "ledger": self.db.snapshot_ledger(work_id), "commit": None,
+                "worktree": True,
+                "files": vcs.file_manifest(files), "files_tracked": True}
+
+    def _state_file_text(self, work_id: str, state: Mapping[str, Any],
+                         path: str) -> str:
+        """某个版本里一份文件的正文。工作区读磁盘，提交按 hash 取 blob。
+
+        空树（``commit is None`` 且不是工作区）没有正文：早先拿 ``commit is
+        None`` 当「工作区」，结果从 EMPTY 算差异时读的是磁盘，新旧一样，
+        新文件的逐行差异永远是空的。
+        """
+        if state.get("worktree"):
+            from writegraph import docs as docs_mod
+            try:
+                return docs_mod.read_file(self.docs_root(work_id),
+                                          path)["content"]
+            except (docs_mod.DocError, WritingError, OSError):
+                return ""
+        digest = (state.get("files") or {}).get(path)
+        if not digest:
+            return ""
+        return self.db.get_file_blob(work_id, str(digest)) or ""
+
+    # ── 工作区文件（作品记忆 / 设定 / 计划稿 / 素材）──────────────────────
+    # 它们是普通文件，但和正文同属一本书：提交时一起进图，回滚/切分支时一起
+    # 跟着走。状态比较只比 hash 清单，回放时才把正文写回磁盘。
+
+    def _workspace_files(self, work_id: str) -> dict[str, str]:
+        """工作区当前内容：``{路径: 正文}``。工作区不可用时按空处理。"""
+        from writegraph import docs as docs_mod
+        try:
+            root = self.docs_root(work_id)
+        except (WritingError, OSError):
+            return {}
+        out: dict[str, str] = {}
+        for row in docs_mod.list_files(root):
+            try:
+                out[str(row["path"])] = docs_mod.read_file(
+                    root, str(row["path"]))["content"]
+            except docs_mod.DocError:
+                continue
+        return out
+
+    @staticmethod
+    def _file_label(path: str) -> str:
+        """版本面板上的名字：不带 .md。"""
+        from writegraph import docs as docs_mod
+        return docs_mod.label(str(path))
+
+    def _file_change_rows(self, paths: Sequence[str], op: str = ""
+                          ) -> list[dict[str, Any]]:
+        """文件行。给了 ``op``（status 而不是 diff）就带上状态字母。"""
+        letter, label = self.FILE_STATUS.get(op, ("", ""))
+        rows = [{"path": p, "label": self._file_label(p), "kind": "file"}
+                for p in paths]
+        if letter:
+            for row in rows:
+                row["status"] = letter
+                row["status_label"] = label
+        return rows
+
+    @staticmethod
+    def _files_changed(state: Mapping[str, Any],
+                       files: Mapping[str, str] | None) -> bool:
+        """合并/回滚后判断文件有没有变化（用于「不会产生新内容」的拦截）。"""
+        if files is None:
+            return False
+        return vcs.file_manifest(files) != state.get("files", {})
+
+    def _materialize_files(self, work_id: str,
+                           files: Mapping[str, str]) -> None:
+        """把提交里的文件回放到磁盘：写回旧内容，删掉这个版本里没有的。"""
+        from writegraph import docs as docs_mod
+        root = self.docs_root(work_id)
+        current = {str(row["path"]) for row in docs_mod.list_files(root)}
+        for path, text in sorted(files.items()):
+            old = None
+            if path in current:
+                try:
+                    old = docs_mod.read_file(root, path)["content"]
+                except docs_mod.DocError:
+                    old = None
+            if old != text:
+                docs_mod.write_file(root, path, text)
+        for path in sorted(current - set(files)):
+            try:
+                docs_mod.delete_file(root, path)
+            except docs_mod.DocError:
+                continue
+
+    @staticmethod
+    def _commit_tracks_files(commit: Mapping[str, Any] | None) -> bool:
+        return bool(commit and commit.get("files_hash"))
 
     @staticmethod
     def _commit_brief(commit: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -496,8 +1664,10 @@ class WritingService:
         head_ledger_hash = (commit.get("ledger_hash") if commit
                             else vcs.ledger_hash({}))
         ledger_dirty = vcs.ledger_hash(current["ledger"]) != head_ledger_hash
+        file_diff = vcs.diff_files(base["files"], current["files"])
+        files_dirty = any(file_diff.values())
         clean = not (changes["added"] or changes["removed"]
-                     or changes["changed"] or ledger_dirty)
+                     or changes["changed"] or ledger_dirty or files_dirty)
 
         commits = self._commit_map(work_id)
         here = head.get("commit_id")
@@ -519,10 +1689,36 @@ class WritingService:
             "tags": tags,
             "stash_count": len(stashes),
             "changes": changes,
-            "counts": {k: len(v) for k, v in changes.items()},
+            "chapter_counts": {k: len(v) for k, v in changes.items()},
+            "file_changes": {
+                op: self._file_change_rows(paths, op)
+                for op, paths in file_diff.items()},
+            "file_counts": {k: len(v) for k, v in file_diff.items()},
+            "files_dirty": files_dirty,
             "ledger_dirty": ledger_dirty,
             "clean": clean,
         }
+
+    #: 版本习惯的中文一行（决策 182）。提示词与工具返回共用同一份措辞。
+    GIT_HABIT_LABELS = {"chapter": "每章结算后自动留一版",
+                        "manual": "只在作者要求时存档"}
+
+    def git_habit(self, work_id: str) -> str:
+        """这本书的版本习惯。旧库/脏值一律退回默认 ``chapter``。"""
+        work = self.db.get_work(work_id) or {}
+        value = str(work.get("git_habit") or "chapter")
+        return value if value in GIT_HABITS else "chapter"
+
+    def set_git_habit(self, work_id: str, habit: str) -> dict[str, Any]:
+        """改版本习惯。只应由作者明确要求触发，agent 不自行判断。"""
+        self._work_or_raise(work_id)
+        try:
+            self.db.set_work_git_habit(work_id, habit)
+        except ValueError as exc:
+            raise WritingError(str(exc)) from exc
+        value = self.git_habit(work_id)
+        return {"ok": True, "git_habit": value,
+                "label": self.GIT_HABIT_LABELS.get(value, value)}
 
     def vcs_log(self, work_id: str, *, branch: str = "",
                 all_branches: bool = False, chapter_id: str = "",
@@ -572,6 +1768,69 @@ class WritingService:
                 item["touches"] = touches.get(c["id"], False)
             out.append(item)
         return out
+
+    def vcs_file_timeline(self, work_id: str, path: str, *,
+                          limit: int = 50) -> dict[str, Any]:
+        """一份工作区文件的 git 历史（VS Code 式「时间线」）。
+
+        每个提交只与第一父节点比较，等价于 ``git log -- <path>``。未提交的
+        改动作为最上面一条 ``WORK`` 出现，刚改完也能在时间线里看到。
+        """
+        from writegraph import docs as docs_mod
+        self._work_or_raise(work_id)
+        try:
+            rel = docs_mod.normalize(path)
+        except docs_mod.DocError as exc:
+            raise WritingError(str(exc)) from exc
+        head = self.db.get_head(work_id)
+        tip = head.get("commit_id") or ""
+        commits = self._commit_map(work_id)
+        reachable = vcs.ancestor_ids(commits, tip)
+        rows = sorted((commits[cid] for cid in reachable
+                       if cid in commits
+                       and commits[cid].get("kind") != "stash"),
+                      key=lambda c: (int(c.get("time_created") or 0),
+                                     str(c.get("id"))),
+                      reverse=True)
+        entries: list[dict[str, Any]] = []
+        for commit in rows:
+            if not commit.get("files_hash"):
+                continue
+            cur = self.db.get_commit_files(str(commit["id"])).get(rel)
+            parent = (self.db.get_commit(str(commit.get("parent_id")))
+                      if commit.get("parent_id") else None)
+            old = None
+            if parent and parent.get("files_hash"):
+                old = self.db.get_commit_files(str(parent["id"])).get(rel)
+            if cur == old:
+                continue
+            op = "added" if old is None else (
+                "removed" if cur is None else "changed")
+            item = self._commit_brief(commit) or {}
+            item["op"] = op
+            entries.append(item)
+            if len(entries) >= limit:
+                break
+        head_files = self.db.get_commit_files(tip) if tip else {}
+        disk_hash = None
+        try:
+            disk = docs_mod.read_file(self.docs_root(work_id), rel)["content"]
+            disk_hash = vcs.file_manifest({rel: disk})[rel]
+        except (WritingError, docs_mod.DocError, OSError):
+            disk_hash = None
+        if disk_hash != head_files.get(rel):
+            op = ("added" if rel not in head_files
+                  else ("removed" if disk_hash is None else "changed"))
+            entries.insert(0, {
+                "id": "WORK", "short": "WORK", "parent_id": tip,
+                "branch": head.get("branch_name") or "main",
+                "kind": "work", "author": "user", "message": "未存档的更改",
+                "chapter_index": 0,
+                "time_created": int(time.time() * 1000),
+                "tree_hash": "", "ledger_hash": "",
+                "op": op, "is_work": True,
+            })
+        return {"path": rel, "tracked": bool(tip), "entries": entries}
 
     def _chapter_touch_map(self, rows: Sequence[Mapping[str, Any]],
                            commits: Mapping[str, Mapping[str, Any]],
@@ -627,7 +1886,7 @@ class WritingService:
         self._work_or_raise(work_id)
         status = self.vcs_status(work_id)
         if status["clean"] and not allow_empty:
-            raise WritingError("没有需要提交的改动")
+            raise WritingError("没有需要存档的改动")
         head = self.db.get_head(work_id)
         current = self._current_state(work_id)
         tree = current["tree"]
@@ -647,13 +1906,22 @@ class WritingService:
             picked = vcs.diff_trees(base["tree"], tree)
             if not (picked["added"] or picked["removed"] or picked["changed"]):
                 raise WritingError("选中的章节没有改动")
+        # 整次提交带上工作区文件；「只提交几章」等于 git 只 add 了正文，
+        # 文件沿用 HEAD 的清单（旧提交没跟踪就继续不跟踪）。
+        if wanted:
+            base_commit = base.get("commit")
+            files = (self.db.get_commit_file_contents(
+                str(base_commit["id"]))
+                if self._commit_tracks_files(base_commit) else None)
+        else:
+            files = self._workspace_files(work_id)
         branch = head.get("branch_name") or "main"
         commit = self.db.create_commit(
             work_id, tree=tree, ledger=current["ledger"],
             parent_id=head.get("commit_id"), branch_name=branch,
             kind=kind, author=author,
-            message=(message or "").strip() or "未命名提交",
-            chapter_index=self._max_index(tree))
+            message=(message or "").strip() or "未命名存档",
+            chapter_index=self._max_index(tree), files=files)
         return self._commit_brief(commit) or {}
 
     def vcs_amend(self, work_id: str, message: str = "") -> dict[str, Any]:
@@ -666,7 +1934,7 @@ class WritingService:
         commit = (self.db.get_commit(head["commit_id"])
                   if head.get("commit_id") else None)
         if commit is None:
-            raise WritingError("还没有提交可以修正")
+            raise WritingError("还没有存档可以修正")
         current = self._current_state(work_id)
         new_message = ((message or "").strip()
                        or str(commit.get("message") or ""))
@@ -678,7 +1946,7 @@ class WritingService:
             branch_name=branch, kind="amend", author="user",
             message=new_message,
             chapter_index=self._max_index(current["tree"]),
-            log_from=commit["id"])
+            log_from=commit["id"], files=self._workspace_files(work_id))
         return self._commit_brief(amended) or {}
 
     def _auto_commit(self, work_id: str, message: str, *,
@@ -708,7 +1976,7 @@ class WritingService:
         name = self._check_branch_name(name, work_id=work_id)
         target = self._resolve_commit(work_id, from_ref)
         if target is None:
-            raise WritingError("还没有可以分支的提交")
+            raise WritingError("还没有可以分支的存档")
         self.db.upsert_ref(work_id, name, target["id"])
         return {"name": name, "commit_id": target["id"],
                 "short": vcs.short_id(target["id"])}
@@ -731,16 +1999,16 @@ class WritingService:
             raise WritingError(f"{branch} 不是分支")
         target = self.db.get_commit(ref["commit_id"])
         if target is None:
-            raise WritingError("分支指向的提交不存在")
+            raise WritingError("分支指向的存档不存在")
         head = self.db.get_head(work_id)
         current_branch = head.get("branch_name") or "main"
         if head.get("commit_id") != target["id"]:
             if not self.vcs_status(work_id)["clean"]:
                 if not checkpoint:
-                    raise WritingError("工作区有未提交的改动，先提交或允许自动提交")
+                    raise WritingError("工作区有未存档的改动，先存档或允许自动存档")
                 self.vcs_commit(
                     work_id,
-                    f"切换分支前自动提交（{current_branch}）",
+                    f"切换分支前自动存档（{current_branch}）",
                     author="system", kind="checkpoint")
                 head = self.db.get_head(work_id)
             self._apply_state(work_id, target, reason="branch")
@@ -781,7 +2049,7 @@ class WritingService:
             merged = vcs.ancestor_ids(commits, head.get("commit_id"))
             if str(ref.get("commit_id")) not in merged:
                 raise WritingError(
-                    f"{name} 上还有没合并的提交；确认放弃请用强制删除")
+                    f"{name} 上还有没合并的存档；确认放弃请用强制删除")
         # 切换分支时的自动检查点只挂在这个分支上：force 删掉会让「切走前的
         # 未提交改动」失去唯一引用，而作者以为它还在。删除前先留一个
         # lost-* 标签，至少还能从标签恢复（自测 fb-d5416a5c7fa44c72）。
@@ -835,7 +2103,7 @@ class WritingService:
             raise WritingError(f"标签或分支已存在：{name}")
         target = self._resolve_commit(work_id, ref or "HEAD")
         if target is None:
-            raise WritingError("还没有可以打标签的提交")
+            raise WritingError("还没有可以打标签的存档")
         self.db.upsert_ref(work_id, name, target["id"], kind="tag")
         return {"name": name, "commit_id": target["id"],
                 "short": vcs.short_id(target["id"])}
@@ -896,7 +2164,7 @@ class WritingService:
         self._work_or_raise(work_id)
         head = self.db.get_head(work_id)
         if not head.get("commit_id"):
-            raise WritingError("先提交一次，才能暂存改动")
+            raise WritingError("先存档一次，才能暂存改动")
         if self.vcs_status(work_id)["clean"]:
             raise WritingError("工作区没有改动")
         current = self._current_state(work_id)
@@ -907,7 +2175,7 @@ class WritingService:
             kind="stash", author="user",
             message=(message or "").strip() or "暂存",
             chapter_index=self._max_index(current["tree"]),
-            move_head=False)
+            move_head=False, files=self._workspace_files(work_id))
         self.db.upsert_ref(work_id, f"stash/{snapshot['id']}",
                            snapshot["id"], kind="stash")
         base = self.db.get_commit(head["commit_id"])
@@ -927,7 +2195,7 @@ class WritingService:
         self._work_or_raise(work_id)
         ref = self._resolve_stash_ref(work_id, name)
         if not self.vcs_status(work_id)["clean"]:
-            raise WritingError("工作区有未提交的改动，先提交或丢弃再恢复暂存")
+            raise WritingError("工作区有未存档的改动，先存档或丢弃再恢复暂存")
         snapshot = self.db.get_commit(ref["commit_id"])
         if snapshot is None:
             raise WritingError("暂存内容已损坏")
@@ -963,7 +2231,7 @@ class WritingService:
         entry = next((e for e in state["tree"]
                       if str(e.get("chapter_id")) == str(chapter_id)), None)
         if entry is None:
-            raise WritingError("这一章还不在上次提交里，先把整篇提交或删除")
+            raise WritingError("这一章还不在上次存档里，先把整篇存档或删除")
         chapter = self.db.get_chapter_by_id(chapter_id)
         if chapter is None or chapter.get("work_id") != work_id:
             raise WritingError("章节不存在")
@@ -1043,6 +2311,10 @@ class WritingService:
                 status=entry.get("status") or "planned",
                 volume_id=volume_id)
         self.db.replace_ledger(work_id, target["ledger"])
+        # 旧提交没有文件清单：不动磁盘，避免把作者的工作区清空。
+        if target["files_tracked"]:
+            self._materialize_files(
+                work_id, self.db.get_commit_file_contents(str(commit.get("id"))))
         return target
 
     def vcs_restore(self, work_id: str, commit_id: str, *,
@@ -1058,13 +2330,15 @@ class WritingService:
                                            target_state["tree"]).values())
         same_ledger = (vcs.ledger_hash(head_state["ledger"])
                        == vcs.ledger_hash(target_state["ledger"]))
-        if status["clean"] and same_tree and same_ledger:
+        same_files = (not target_state["files_tracked"]
+                      or head_state["files"] == target_state["files"])
+        if status["clean"] and same_tree and same_ledger and same_files:
             raise WritingError("已经在目标状态上")
         # 脏工作区先检查点；即使目标是 HEAD，也走同一条路——否则检查点
         # 成了 HEAD，回滚完工作区反而显示「有未提交改动」。
         parent = head.get("commit_id")
         if not status["clean"]:
-            checkpoint = self.vcs_commit(work_id, "回滚前自动提交",
+            checkpoint = self.vcs_commit(work_id, "回滚前自动存档",
                                          author="system", kind="checkpoint")
             parent = checkpoint["id"]
         self._apply_state(work_id, target, reason="restore")
@@ -1076,7 +2350,8 @@ class WritingService:
             message=(message or "").strip()
             or f"回滚到 {vcs.short_id(target['id'])}",
             chapter_index=max((int(c.get("chapter_index") or 0)
-                               for c in current["tree"]), default=0))
+                               for c in current["tree"]), default=0),
+            files=self._workspace_files(work_id))
         return {"commit": self._commit_brief(created),
                 "status": self.vcs_status(work_id)}
 
@@ -1201,6 +2476,63 @@ class WritingService:
             return (None, None)
         return (dict(o or t or {}), merged_text)
 
+    def _merge_files(self, work_id: str, base: Mapping[str, Any],
+                     ours: Mapping[str, Any], theirs: Mapping[str, Any],
+                     resolutions: Mapping[str, Any]
+                     ) -> tuple[dict[str, str], list[dict[str, Any]]]:
+        """按路径三路合并工作区文件（作品记忆 / 设定 / 计划稿 / 素材）。
+
+        两边都改了同一份：先看裁决，再试正文级三路合并；仍不行报冲突。
+        一侧删除、另一侧改动也按冲突处理，和 git 的 modify/delete 一样。
+        """
+        def content(state: Mapping[str, Any], path: str) -> str | None:
+            digest = state["files"].get(path)
+            if digest is None:
+                return None
+            return self.db.get_file_blob(work_id, str(digest))
+
+        def conflict(path: str) -> dict[str, Any]:
+            return {"kind": "file", "key": f"file:{path}", "path": path,
+                    "label": self._file_label(path),
+                    "ours_preview": (content(ours, path) or "")[:160],
+                    "theirs_preview": (content(theirs, path) or "")[:160]}
+
+        merged: dict[str, str] = {}
+        conflicts: list[dict[str, Any]] = []
+        paths = set(base["files"]) | set(ours["files"]) | set(theirs["files"])
+        for path in sorted(paths):
+            b, o, t = (base["files"].get(path), ours["files"].get(path),
+                       theirs["files"].get(path))
+            if o == t:
+                pick: str | None = o
+            elif o == b:
+                pick = t
+            elif t == b:
+                pick = o
+            elif o is None or t is None:
+                pick = None
+                conflicts.append(conflict(path))
+            else:
+                choice = resolutions.get(f"file:{path}")
+                if choice in ("ours", "theirs", "base"):
+                    pick = {"ours": o, "theirs": t, "base": b}[choice]
+                else:
+                    text, ok = vcs.merge3_text(
+                        content(base, path) or "",
+                        content(ours, path) or "",
+                        content(theirs, path) or "")
+                    if ok:
+                        merged[path] = text
+                        continue
+                    pick = None
+                    conflicts.append(conflict(path))
+            if pick is None:
+                continue
+            text = self.db.get_file_blob(work_id, str(pick))
+            if text is not None:
+                merged[path] = text
+        return merged, conflicts
+
     def _merge_ledger(self, base: Mapping[str, Any], ours: Mapping[str, Any],
                       theirs: Mapping[str, Any],
                       resolutions: Mapping[str, Any]
@@ -1247,6 +2579,7 @@ class WritingService:
     def _apply_merged(self, work_id: str, merged_tree: Sequence[Mapping],
                       texts: Mapping[str, str],
                       merged_ledger: Mapping[str, Any], *,
+                      files: Mapping[str, str] | None = None,
                       reason: str) -> list[dict[str, Any]]:
         """把合并结果落到工作区。返回最终树（带新的 version_id）。"""
         chapters = {c["id"]: c for c in self.db.list_chapters(work_id)}
@@ -1276,6 +2609,8 @@ class WritingService:
                 status=entry.get("status") or "planned", volume_id=volume_id)
             final.append(dict(entry))
         self.db.replace_ledger(work_id, merged_ledger)
+        if files is not None:
+            self._materialize_files(work_id, files)
         return final
 
     def _three_way(self, work_id: str, *, base_ref: str, theirs_ref: str,
@@ -1288,16 +2623,27 @@ class WritingService:
             base, ours, theirs, resolutions)
         merged_ledger, ledger_conflicts = self._merge_ledger(
             base, ours, theirs, resolutions)
-        conflicts = tree_conflicts + ledger_conflicts
+        # 三边都跟踪文件才做文件级合并；有旧提交（未跟踪）时保留当前磁盘内容，
+        # 不拿一份空清单去覆盖作者刚写的设定。
+        if (base["files_tracked"] and ours["files_tracked"]
+                and theirs["files_tracked"]):
+            merged_files, file_conflicts = self._merge_files(
+                work_id, base, ours, theirs, resolutions)
+        else:
+            merged_files, file_conflicts = (
+                self.db.get_file_contents(work_id, ours["files"])
+                if ours["files_tracked"] else self._workspace_files(work_id)), []
+        conflicts = tree_conflicts + ledger_conflicts + file_conflicts
         if conflicts:
             return {"applied": False, "conflicts": conflicts,
                     "base": self._commit_brief(base.get("commit")) or {},
                     "ours": self._commit_brief(ours.get("commit")) or {},
                     "theirs": self._commit_brief(theirs.get("commit")) or {}}
         final_tree = self._apply_merged(
-            work_id, merged_tree, texts, merged_ledger, reason=reason)
+            work_id, merged_tree, texts, merged_ledger,
+            files=merged_files, reason=reason)
         return {"applied": True, "tree": final_tree, "ledger": merged_ledger,
-                "text_count": len(texts)}
+                "files": merged_files, "text_count": len(texts)}
 
     def _dirty_checkpoint(self, work_id: str, message: str) -> None:
         """合并/回滚/摘取前先把手头改动保住——和切分支同一策略。"""
@@ -1319,7 +2665,7 @@ class WritingService:
             raise WritingError("不能把分支合并到它自己")
         theirs = self.db.get_commit(ref["commit_id"])
         if theirs is None:
-            raise WritingError("分支指向的提交不存在")
+            raise WritingError("分支指向的存档不存在")
 
         ours_id = head.get("commit_id")
         if not ours_id:
@@ -1337,7 +2683,7 @@ class WritingService:
         if base_id == theirs["id"]:
             raise WritingError(f"{branch} 的改动已经都在当前分支里了")
         if base_id == ours_id:
-            self._dirty_checkpoint(work_id, f"合并 {branch} 前自动提交")
+            self._dirty_checkpoint(work_id, f"合并 {branch} 前自动存档")
             self._apply_state(work_id, theirs, reason="merge")
             self.db.upsert_ref(work_id, current, theirs["id"])
             self.db.set_head(work_id, current, theirs["id"])
@@ -1347,7 +2693,7 @@ class WritingService:
             return {"fast_forward": True, "commit": None,
                     "status": self.vcs_status(work_id)}
 
-        self._dirty_checkpoint(work_id, f"合并 {branch} 前自动提交")
+        self._dirty_checkpoint(work_id, f"合并 {branch} 前自动存档")
         head = self.db.get_head(work_id)
         ours_id = head.get("commit_id")
         result = self._three_way(
@@ -1362,14 +2708,16 @@ class WritingService:
         changes = vcs.diff_trees(ours_state["tree"], result["tree"])
         if (not any(changes.values())
                 and vcs.ledger_hash(ours_state["ledger"])
-                == vcs.ledger_hash(result["ledger"])):
+                == vcs.ledger_hash(result["ledger"])
+                and not self._files_changed(ours_state, result.get("files"))):
             raise WritingError(f"{branch} 的改动当前分支已经有了，合并不会产生新内容")
         created = self.db.create_commit(
             work_id, tree=result["tree"], ledger=result["ledger"],
             parent_id=ours_id, parent2_id=theirs["id"], branch_name=current,
             kind="merge", author="user",
             message=(message or "").strip() or f"合并 {branch} 到 {current}",
-            chapter_index=self._max_index(result["tree"]))
+            chapter_index=self._max_index(result["tree"]),
+            files=result.get("files"))
         return {"fast_forward": False,
                 "commit": self._commit_brief(created) or {},
                 "status": self.vcs_status(work_id)}
@@ -1383,14 +2731,14 @@ class WritingService:
         parent = (self.db.get_commit(target.get("parent_id"))
                   if target.get("parent_id") else None)
         if mode == "revert" and parent is None:
-            raise WritingError("根提交没有可撤销的父状态")
+            raise WritingError("根存档没有可撤销的父状态")
         self._dirty_checkpoint(
             work_id, f"{'撤销' if mode == 'revert' else '摘取'}"
-                     f" {vcs.short_id(target['id'])} 前自动提交")
+                     f" {vcs.short_id(target['id'])} 前自动存档")
         head = self.db.get_head(work_id)
         ours_id = head.get("commit_id")
         if not ours_id:
-            raise WritingError("当前分支还没有提交")
+            raise WritingError("当前分支还没有存档")
         if mode == "revert":
             base_ref, theirs_ref = target_id, parent["id"]
         else:
@@ -1406,11 +2754,12 @@ class WritingService:
         changes = vcs.diff_trees(ours_state["tree"], result["tree"])
         noop = (not any(changes.values())
                 and vcs.ledger_hash(ours_state["ledger"])
-                == vcs.ledger_hash(result["ledger"]))
+                == vcs.ledger_hash(result["ledger"])
+                and not self._files_changed(ours_state, result.get("files")))
         if noop:
             raise WritingError(
-                "这次提交已经撤销过了" if mode == "revert"
-                else "这次提交的改动已经在当前分支上了")
+                "这次存档已经撤销过了" if mode == "revert"
+                else "这次存档的改动已经在当前分支上了")
         branch = head.get("branch_name") or "main"
         created = self.db.create_commit(
             work_id, tree=result["tree"], ledger=result["ledger"],
@@ -1419,7 +2768,8 @@ class WritingService:
                 f"撤销 {vcs.short_id(target['id'])}"
                 if mode == "revert"
                 else f"摘取 {vcs.short_id(target['id'])}"),
-            chapter_index=self._max_index(result["tree"]))
+            chapter_index=self._max_index(result["tree"]),
+            files=result.get("files"))
         return {"commit": self._commit_brief(created) or {},
                 "status": self.vcs_status(work_id)}
 
@@ -1445,9 +2795,19 @@ class WritingService:
 
     def vcs_diff(self, work_id: str, *, from_ref: str = "HEAD",
                  to_ref: str = "WORK", chapter_id: str = "",
-                 text: bool = False) -> dict[str, Any]:
-        """差异。``from='main...岔路A'`` 按 git 的三点语义：从合并基算起。"""
+                 file_path: str = "", text: bool = False) -> dict[str, Any]:
+        """差异。``from='main...岔路A'`` 按 git 的三点语义：从合并基算起。
+
+        ``file_path`` 给定时只算这一份工作区文件的逐行差异（时间线点击用）。
+        """
         self._work_or_raise(work_id)
+        file_path = str(file_path or "").strip()
+        if file_path:
+            from writegraph import docs as docs_mod
+            try:
+                file_path = docs_mod.normalize(file_path)
+            except docs_mod.DocError as exc:
+                raise WritingError(str(exc)) from exc
         if "..." in (from_ref or ""):
             left, _, right = (from_ref or "").partition("...")
             commits = self._commit_map(work_id)
@@ -1470,7 +2830,11 @@ class WritingService:
             "to": self._commit_brief(target["commit"]) or {
                 "id": "WORK", "short": "WORK", "message": "工作区"},
             "changes": changes,
-            "counts": {k: len(v) for k, v in changes.items()},
+            "chapter_counts": {k: len(v) for k, v in changes.items()},
+            "files": {
+                op: self._file_change_rows(paths)
+                for op, paths in vcs.diff_files(
+                    base["files"], target["files"]).items()},
             "ledger": vcs.diff_ledger(base["ledger"], target["ledger"]),
         }
         # 目标侧（A→B 的 B）改动章的首尾预览：核对差异方向不用再切分支/
@@ -1498,6 +2862,15 @@ class WritingService:
             result["text_diff"] = vcs.unified_text_diff(
                 old, new, from_label=from_label, to_label=to_label)
             result["changed"] = old != new
+        if file_path:
+            old = self._state_file_text(work_id, base, file_path)
+            new = self._state_file_text(work_id, target, file_path)
+            from_label = (result["from"] or {}).get("short") or "before"
+            to_label = (result["to"] or {}).get("short") or "after"
+            result["file_path"] = file_path
+            result["text_diff"] = vcs.unified_text_diff(
+                old, new, from_label=from_label, to_label=to_label)
+            result["changed"] = old != new
         return result
 
     # ── git 自测：固定的种子作品 ──────────────────────────────────────────
@@ -1505,12 +2878,12 @@ class WritingService:
     #: 正文与锚点都写死，agent 才能用「把 X 换成 Y」精确制造差异。
     SELFTEST_CHAPTERS = (
         ("第一章 码头", "甲行：风从码头来。\n乙行：他数着潮声。\n丙行：远处灯灭了。"),
-        ("第二章 船期", "丁行：船期写在木牌上。\n戊行：老周没有抬头。"),
+        ("第二章 船期", "丁行：船期写在木牌上。\n戊行：配角没有抬头。"),
         ("第三章 雨", "己行：雨落在篷布上。\n庚行：他把信折好。"),
     )
     SELFTEST_ANCHORS = {
         "甲": "风从码头来", "乙": "他数着潮声", "丙": "远处灯灭了",
-        "丁": "船期写在木牌上", "戊": "老周没有抬头",
+        "丁": "船期写在木牌上", "戊": "配角没有抬头",
         "己": "雨落在篷布上", "庚": "他把信折好",
     }
 
@@ -1611,11 +2984,14 @@ class WritingService:
         except Exception:
             return []
         head = status.get("head") or {}
+        habit = self.git_habit(work_id)
         lines = [
+            f"- 版本习惯：{self.GIT_HABIT_LABELS.get(habit, habit)}"
+            f"（{habit}；只有作者明确要求时才改）",
             f"- 分支 {status.get('branch') or 'main'}"
             f"｜HEAD {head.get('short') or '-'}"
             f"「{str(head.get('message') or '')[:36]}」"
-            f"｜{'干净' if status.get('clean') else '有未提交改动'}"
+            f"｜{'干净' if status.get('clean') else '有未存档改动'}"
             f"｜暂存 {status.get('stash_count', 0)} 条"
         ]
         dirty: list[str] = []
@@ -1625,48 +3001,161 @@ class WritingService:
             for entry in changes.get(key) or []:
                 dirty.append(f"第{entry.get('chapter_index')}章{label}")
         if dirty:
-            lines.append("- 未提交：" + "、".join(dirty[:6]))
+            lines.append("- 未存档：" + "、".join(dirty[:6]))
+        # 工作区文件也带状态字母（与前端文件区的 M/U/D 同一份）：
+        # agent 一眼就知道哪份设定没提交，不必先花一轮 list。
+        files = [f"{row.get('status') or ''} {row.get('path')}"
+                 for key in ("changed", "added", "removed")
+                 for row in (status.get("file_changes") or {}).get(key) or []]
+        if files:
+            lines.append("- 未存档文件：" + "、".join(files[:6]))
         try:
             commits = self.vcs_log(work_id, limit=commit_limit)
         except Exception:
             commits = []
         if commits:
-            lines.append("- 最近提交：")
+            lines.append("- 最近存档：")
             for c in commits:
                 lines.append(
                     f"  - {c.get('short') or ''} {c.get('kind') or ''}"
                     f"「{str(c.get('message') or '')[:36]}」")
         return lines
 
+    def _previous_contract_misses(self, work_id: str,
+                                  chapter_index: int) -> list[str]:
+        """上一章结清时没兑现（或少申报）的条目。
+
+        结清不等于做完：未兑现的条目必须有个去处，否则这份合同只是被扔掉了。
+        这一行把去处摆到 agent 面前，让它写进本章合同或变成承诺。
+        """
+        if int(chapter_index or 0) <= 1:
+            return []
+        prev = self.db.get_chapter(work_id, int(chapter_index) - 1)
+        if not prev:
+            return []
+        contract = self.db.get_contract(prev["id"])
+        if not contract or str(contract.get("status") or "active") != "closed":
+            return []
+        missed = [str(row.get("item") or "")
+                  for row in (contract.get("outcomes") or [])
+                  if isinstance(row, Mapping)
+                  and str(row.get("verdict") or "") in ("miss", "partial")]
+        missed.extend(contract_stats(contract)["missing"])
+        return [item for item in missed if item]
+
     def agent_prompt(self, work_id: str = "",
-                     chapter_index: int = 0) -> str:
+                     chapter_index: int = 0,
+                     mode: str = "standard") -> str:
         """对话模式的 system prompt：身份规则 + **当前写作现场**。
 
         现场信息由服务端给，不让模型先调工具查一遍——与扮演模式
         「你在哪本书里是事实」同一条。
+
+        ``mode`` 是会话级写作子模式；当前章若在 ``chapters.writing_mode``
+        上有单章覆盖，以覆盖为准（决策 161）。
         """
-        parts = [self._prompt("agent.md")]
         works = self.list_works()
+        mode = self._effective_mode(work_id, chapter_index, mode)
+        parts = [self._prompt("agent.md")]
+        if mode == "detail":
+            parts.append(self._prompt("mode_detail.md"))
         if not works:
-            parts.append("## 当前写作现场\n还没有任何作品。等作者说书名。")
+            parts.append("## 当前写作现场\n还没有任何作品。等作者说书名。"
+                         f"\n写作模式：{_mode_label(mode)}")
             return "\n\n".join(parts)
 
-        lines = [f"- {w['title']}（{w.get('chapter_count', 0)} 章）"
-                 f"　id={w['id']}" for w in works[:12]]
-        parts.append("## 当前写作现场\n### 作品\n" + "\n".join(lines))
+        # 作品目录只报数量，不注入书名与 id：空项目会话里列出别人的书名，
+        # 等于把无关作品的第一印象塞进系统提示，模型会自己挑一本代入。
+        # 需要清单时由模型调 writing_status（它本来就返回全部作品）。
+        parts.append(
+            "## 当前写作现场\n"
+            f"作品目录不在这里展开（已建 {len(works)} 本，书名与 id 要看时调 "
+            "writing_status）。")
 
         work = self.db.get_work(work_id) if work_id else None
         if work is None:
-            work = works[0]
+            # 空项目：作者显式选了「不绑定作品」时，不代入任何一本的现场。
+            # 以前这里回退到 works[0]，等于把最近一本的设定偷偷注入，
+            # 作者只能靠「新建一本书」才拿到干净的上下文。
+            parts.append(
+                "### 空项目\n"
+                "没有绑定作品：不代入任何一本的书名、设定、章节、工作区或"
+                "版本现场。先和作者把想法聊清楚；要落成作品时用 "
+                "writing_create_work 建书，或请作者在左栏选一本"
+                "（已有作品用 writing_status 看）。")
+        else:
+            parts.extend(self._work_scene_parts(work, int(chapter_index or 0)))
+        parts.append(
+            "### 写作模式\n" + _mode_label(mode)
+            + "（会话级；单章覆盖见章行）。"
+            + ("动笔前要交 research_brief。" if mode == "detail" else ""))
+        # 不再单独注入「最近的自测作品」：自测现场（分支 / HEAD / 提交 /
+        # 锚点）本来就能用 writing_git(status) 现查，只有作者本人和 Claude
+        # 跑自测，把别人的作品现场塞进系统提示没有收益，反而带书名污染。
+        return "\n\n".join(parts)
+
+    def memory_delta(self, work_id: str) -> str:
+        """上次 consolidate 之后的工作区增删改；没有就返回空串。"""
+        from writegraph import memory_guard
+        state = self.db.get_memory_state(work_id)
+        try:
+            old = json.loads(str(state.get("manifest") or "{}"))
+        except (TypeError, ValueError):
+            old = {}
+        if not old:
+            return ""
+        root = self.docs_root(work_id)
+        changes = memory_guard.diff_manifest(old, memory_guard.manifest(root))
+        if not any(changes.values()):
+            return ""
+        lines = ["<workspace-changes>",
+                 "上次合并后的工作区有改动："]
+        for label, key in (("新增", "added"), ("修改", "changed"),
+                           ("删除", "removed")):
+            rows = changes.get(key) or []
+            if rows:
+                lines.append(f"- {label}：" + "、".join(rows[:8])
+                             + ("…" if len(rows) > 8 else ""))
+        try:
+            baseline = json.loads(str(state.get("baseline") or "{}"))
+        except (TypeError, ValueError):
+            baseline = {}
+        if isinstance(baseline, Mapping) and baseline:
+            diff = memory_guard.diff_snapshot(
+                baseline, memory_guard.snapshot(root), max_chars=800)
+            if diff:
+                lines.append("改动摘要：\n" + diff[:800])
+        lines.append("要看全文用 writing_docs(action=\"read\", path=…)。")
+        lines.append("</workspace-changes>")
+        return "\n".join(lines)
+
+    def _work_scene_parts(self, work: dict[str, Any],
+                          chapter_index: int) -> list[str]:
+        """一本书的现场块：章节、当前章合同、工作区、版本现场。
+
+        只在有绑定作品时调用。空项目（``work_id`` 为空）走
+        ``agent_prompt`` 的空项目分支，**绝不回退到「最近一本」**——
+        回退就是把别人的设定偷偷注入，作者只能靠新建一本书才得到干净上下文。
+        """
+        parts: list[str] = []
         chapters = self.db.list_chapters(work["id"])
+        situation = self._situation_lines(work, chapters, chapter_index)
+        if situation:
+            parts.append("### 现在在哪\n" + "\n".join(situation))
         if chapters:
             rows = []
             for c in chapters[-12:]:
                 contract = self.db.get_contract(c["id"])
+                if not contract:
+                    mark = "缺合同"
+                elif str(contract.get("status") or "active") == "closed":
+                    mark = "已结清"
+                else:
+                    mark = "有合同"
                 rows.append(
                     f"- 第{c['chapter_index']}章 {c.get('title') or '未命名'}"
                     f"｜{c.get('status')}｜{c.get('word_count', 0)} 字"
-                    f"｜{'有合同' if contract else '缺合同'}")
+                    f"｜{mark}")
             parts.append(f"### 《{work['title']}》的章节\n" + "\n".join(rows))
         else:
             parts.append(f"### 《{work['title']}》\n还没有章节。")
@@ -1674,38 +3163,219 @@ class WritingService:
         target = next((c for c in chapters
                        if c["chapter_index"] == int(chapter_index or 0)), None)
         if target is not None:
-            contract = self.db.get_contract(target["id"]) or {}
-            parts.append(
-                f"### 作者当前打开\n第{target['chapter_index']}章"
-                f" {target.get('title') or '未命名'}｜"
-                f"{target.get('status')}｜{target.get('word_count', 0)} 字\n"
-                f"合同：{_contract_text(contract, target['chapter_index'])}")
+            contract = self.db.get_contract(target["id"])
+            lines = [f"第{target['chapter_index']}章"
+                     f" {target.get('title') or '未命名'}｜"
+                     f"{target.get('status')}｜{target.get('word_count', 0)} 字"]
+            if contract is None:
+                lines.append("合同：还没有。写正文前先给这一章立合同。")
+            elif str(contract.get("status") or "active") == "closed":
+                lines.append("合同：" + _contract_summary(
+                    contract, target["chapter_index"]))
+            else:
+                lines.append("合同：" + _contract_text(
+                    contract, target["chapter_index"]))
+            missed = self._previous_contract_misses(
+                work["id"], target["chapter_index"])
+            if missed:
+                lines.append("上一章合同未兑现：" + "、".join(missed[:3])
+                             + "（要么写进本章合同，要么转成承诺）")
+            open_promises = [p for p in self.db.get_promises(work["id"])
+                             if p.get("status") not in ("resolved", "abandoned")]
+            if open_promises:
+                lines.append("未回收承诺：" + "；".join(
+                    str(p.get("title") or p.get("id") or "")
+                    for p in open_promises[:5]))
+            parts.append("### 作者当前打开\n" + "\n".join(lines))
+
+        workspace = self._workspace_section(work)
+        if workspace:
+            parts.append(workspace)
 
         scene = self._git_scene(work["id"])
         if scene:
             parts.append(f"### 《{work['title']}》的版本现场\n"
                          + "\n".join(scene))
+        return parts
 
-        # 自测作品通常不是前端当前打开的那本（前端选的是作者的书）。
-        # 单独列出最近两个「版本自测-」作品，续做清单时不必先 status。
-        selftests = [w for w in works
-                     if str(w.get("title") or "").startswith("版本自测-")
-                     and w["id"] != work["id"]][:2]
-        if selftests:
-            blocks = []
-            for w in selftests:
-                scene = self._git_scene(w["id"], commit_limit=5)
-                if scene:
-                    blocks.append(f"#### {w['title']}　id={w['id']}\n"
-                                  + "\n".join(scene))
-            if blocks:
-                anchors = "，".join(
-                    f"{k}={v}" for k, v in self.SELFTEST_ANCHORS.items())
-                parts.append(
-                    "### 最近的自测作品\n" + "\n\n".join(blocks)
-                    + "\n\n初始锚点（只对还没被改过的行有效；被改过的行以"
-                      "最新提交/上一步预览为准）：" + anchors)
-        return "\n\n".join(parts)
+    def _situation_lines(self, work: Mapping[str, Any],
+                         chapters: Sequence[Mapping[str, Any]],
+                         chapter_index: int) -> list[str]:
+        """「现在在哪」：已有 / 缺 / 可做 / 建议。
+
+        只给事实与可选行为，不强制下一步（决策 142）。作者可能写了两章才
+        回头补世界，也可能一直聊不落库——这个块只回答「现在手上有什么、
+        下一步缺什么」，不替作者排流水线。
+        """
+        from writegraph import docs as docs_mod
+
+        pos = int(chapter_index or 0)
+        if pos <= 0:
+            pos = (int(chapters[-1].get("chapter_index") or 0) + 1
+                   if chapters else 1)
+
+        # 工作区计数。读不到就当没有，不阻断现场。
+        root = None
+        bible_chars = docs_n = plans_n = mats_n = 0
+        facets: list[dict[str, Any]] = []
+        try:
+            root = self.docs_root(str(work["id"]))
+            bible_chars = len(docs_mod.read_bible(root, max_chars=1_000_000))
+            docs_n = len(docs_mod.section_files(root, docs_mod.DOCS_DIR))
+            plans_n = len(docs_mod.section_files(root, docs_mod.PLANS_DIR))
+            mats_n = len(docs_mod.section_files(root, docs_mod.MATERIALS_DIR))
+            facets = docs_mod.world_facets(root)
+        except (WritingError, OSError):
+            pass
+        world_exists = bool(
+            root is not None
+            and (root / docs_mod.DOCS_DIR / docs_mod.WORLD_NAME).is_file())
+
+        by_name = {str(f.get("name")): f for f in facets}
+        unwritten = [name for name in docs_mod.WORLD_FACETS
+                     if name not in by_name
+                     or (not by_name[name].get("has_content")
+                         and not by_name[name].get("status"))]
+        decided = sum(1 for f in facets if f.get("status") == "定")
+        open_facets = sum(1 for f in facets if f.get("status") == "悬")
+        hidden = sum(1 for f in facets if f.get("status") == "隐")
+        author_only = sum(1 for f in facets
+                          if f.get("visibility") == "仅作者")
+
+        # 章节与合同：一次取齐，后面对 target / prev 直接查表。
+        rows = [(c, self.db.get_contract(str(c.get("id") or "")))
+                for c in chapters]
+        by_index = {int(c.get("chapter_index") or 0): ct for c, ct in rows}
+        drafted = [c for c, _ in rows
+                   if int(c.get("word_count") or 0) > 0]
+        active = [c for c, ct in rows
+                  if ct is not None
+                  and str(ct.get("status") or "active") != "closed"]
+        closed = [c for c, ct in rows
+                  if ct is not None
+                  and str(ct.get("status") or "") == "closed"]
+
+        promises = [p for p in self.db.get_promises(work["id"])
+                    if p.get("status") not in ("resolved", "abandoned")]
+        overdue = [p for p in promises
+                   if p.get("planned_payoff_chapter")
+                   and int(p["planned_payoff_chapter"]) < pos]
+
+        target = next((c for c in chapters
+                       if int(c.get("chapter_index") or 0) == pos), None)
+        prev = next((c for c in chapters
+                     if int(c.get("chapter_index") or 0) == pos - 1), None)
+        target_ct = by_index.get(pos)
+        prev_ct = by_index.get(pos - 1)
+        prev_unsettled = (
+            prev is not None
+            and int(prev.get("word_count") or 0) > 0
+            and (prev_ct is None
+                 or str(prev_ct.get("status") or "active") != "closed"))
+
+        lines: list[str] = []
+        lines.append(
+            f"- 已有：作品记忆 {bible_chars} 字；设定 {docs_n} 份；"
+            f"计划稿 {plans_n}；素材 {mats_n}")
+        unwritten_txt = "、".join(unwritten[:3])
+        if len(unwritten) > 3:
+            unwritten_txt += f" 等 {len(unwritten)} 项"
+        if not world_exists:
+            world_txt = "还没有 `设定/世界.md`"
+        else:
+            bits = [f"定 {decided} / 悬 {open_facets} / 隐 {hidden}"]
+            if author_only:
+                bits.append(f"仅作者 {author_only}")
+            if unwritten:
+                bits.append("未写：" + unwritten_txt)
+            world_txt = "；".join(bits)
+        lines.append("- 世界层：" + world_txt)
+        ledger = (f"- 账本：章节 {len(chapters)}（正文 {len(drafted)}）；"
+                  f"合同 {len(active)} 在写 / {len(closed)} 已结；"
+                  f"承诺 {len(promises)} 未回收")
+        if overdue:
+            ledger += f"（逾期 {len(overdue)}）"
+        lines.append(ledger)
+
+        # 上一章的「读者新知道」：优先从摘要第二句取，退回合同 close_note。
+        # 这是减法唯一的跨章依据（决策 142），没有就不硬凑。
+        reader_known = ""
+        prev_summary = ""
+        if prev is not None:
+            try:
+                recent = self.db.recent_summaries(work["id"], pos, limit=1)
+            except Exception:                        # noqa: BLE001
+                recent = []
+            if recent and int(recent[-1].get("chapter_index") or 0) == pos - 1:
+                prev_summary = str(recent[-1].get("summary") or "")
+        if prev_summary and "读者新知道：" in prev_summary:
+            reader_known = prev_summary.split("读者新知道：", 1)[1].strip()
+        if not reader_known:
+            note = str((prev_ct or {}).get("close_note") or "").strip()
+            if note:
+                reader_known = note.split("读者新知道：", 1)[-1].strip()
+        if reader_known:
+            reader_known = reader_known.splitlines()[0].strip()
+            if len(reader_known) > 120:
+                reader_known = reader_known[:117].rstrip() + "…"
+            lines.append("- 读者已知：" + reader_known)
+
+        missing: list[str] = []
+        if prev_unsettled:
+            missing.append(f"第{pos - 1}章结算")
+        if target is not None:
+            if target_ct is None:
+                missing.append(f"第{pos}章合同")
+            elif int(target.get("word_count") or 0) == 0:
+                missing.append(f"第{pos}章正文")
+            elif str(target_ct.get("status") or "active") != "closed":
+                missing.append(f"第{pos}章结算")
+        elif chapters:
+            missing.append(f"第{pos}章（还没建）")
+        else:
+            missing.append(f"第{pos}章合同")
+        if unwritten:
+            missing.append("世界层 " + unwritten_txt)
+        if len(missing) > 3:
+            missing = missing[:3] + [f"等 {len(missing)} 项"]
+        lines.append("- 缺：" + ("；".join(missing) if missing
+                                 else "没有明显缺口"))
+
+        can = ["立世界", "立人", "定调", "搭骨", "落章", "找素材"]
+        if target is not None:
+            if target_ct is None:
+                can.append("立合同")
+            elif int(target.get("word_count") or 0) == 0:
+                can.append("写")
+            elif str(target_ct.get("status") or "active") != "closed":
+                can.append("结算")
+        if drafted:
+            can.append("回看")
+        lines.append("- 可做：" + " / ".join(dict.fromkeys(can)))
+
+        if prev_unsettled:
+            advice = f"第{pos - 1}章还没结算；先结算再写下一章"
+        elif target is not None and target_ct is None:
+            advice = (f"第{pos}章还没合同；先问三件事"
+                      "（结局 / 必须发生 / 不点破），再立合同")
+        elif target is not None and int(target.get("word_count") or 0) == 0:
+            advice = "合同已立；可以直接写，写前确认「不点破」清单"
+        elif (target is not None
+              and str(target_ct.get("status") or "active") != "closed"):
+            advice = f"第{pos}章还没结算；先结算再写下一章"
+        elif not chapters:
+            advice = "还没有章节；先和作者定这一章要改变什么，再立合同"
+        elif overdue:
+            advice = "有承诺逾期；先决定回收、推迟还是放弃"
+        elif unwritten:
+            advice = (f"世界层还有「{unwritten[0]}」没写；写下一章前补"
+                      "最相关的一条，其余边写边长")
+        elif promises:
+            advice = "按作者当前意图继续；写下一章前看一眼未回收承诺"
+        else:
+            advice = "按作者当前意图继续；不要为了补全世界层停下来"
+        lines.append("- 建议：" + advice)
+        return lines
 
     def replace_text(self, work_id: str, chapter_index: int,
                      anchor_quote: str, replacement: str) -> dict[str, Any]:
@@ -1752,15 +3422,15 @@ class WritingService:
         try:
             path = (Path(self.config.project_dir) / "data" / "writing"
                     / "reference_cards" / "diagnostics.jsonl")
-            path.parent.mkdir(parents=True, exist_ok=True)
             record = {
                 "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "work_id": str(work.get("id") or ""),
                 "chapter": int(chapter.get("chapter_index") or 0),
                 **{k: v for k, v in (diag or {}).items() if k != "card"},
             }
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            from log_lifecycle import append_jsonl
+            append_jsonl(path, record, max_bytes=2 * 1024 * 1024,
+                         backup_count=2)
         except Exception as exc:                     # noqa: BLE001
             log.warning("writegraph: reference diag log failed: %s", exc)
 
@@ -1930,7 +3600,10 @@ class WritingService:
     def set_reference_books(self, work_id: str,
                             books: Sequence[Mapping[str, Any]], *,
                             mode: str = "card") -> dict[str, Any]:
-        """作品选定的参考书（别的书，不是本书正典）。最多 4 本。"""
+        """作品的参考书架：只定检索范围，不在写稿时自动注入。
+
+        不按本数截断。``mode`` 只为兼容旧调用保留，已不参与写作路径。
+        """
         work = self._work_or_raise(work_id)
         profile = self._profile_of(work)
         clean: list[dict[str, Any]] = []
@@ -1944,7 +3617,7 @@ class WritingService:
                           "book_id": str(item.get("book_id") or ""),
                           "label": str(item.get("label") or ""),
                           "enabled": bool(item.get("enabled", True))})
-        profile["reference_books"] = clean[:4]
+        profile["reference_books"] = clean
         profile["reference_mode"] = mode if mode in ("card", "raw") else "card"
         self.db.update_work_style_profile(work_id, profile)
         return {"reference_books": profile["reference_books"],
@@ -1995,132 +3668,353 @@ class WritingService:
         return [dict(b) for b in (profile.get("reference_books") or [])
                 if isinstance(b, Mapping) and b.get("enabled", True)]
 
-    def _reference_cache_path(self, work_id: str, chapter_index: int,
-                              terms: Sequence[str],
-                              books: Sequence[Mapping[str, Any]]) -> Path:
-        import hashlib
+    def web_research_enabled(self, work_id: str) -> bool:
+        """联网开关（存 ``style_profile``，默认关）。"""
+        if not work_id:
+            return False
+        work = self.db.get_work(work_id)
+        if work is None:
+            return False
+        return bool(self._profile_of(work).get("web_research_enabled", False))
 
-        key = "|".join(sorted(str(b.get("stable_book_id") or "")
-                              for b in books)) + "||" + "|".join(terms)
-        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
-        # 卡模板换了就不能复用旧卡。
-        shape = "v2"
-        return (Path(self.config.project_dir) / "data" / "writing"
-                / "reference_cards" / work_id
-                / f"{chapter_index}-{shape}-{digest}.txt")
+    def set_web_research(self, work_id: str, enabled: bool) -> dict[str, Any]:
+        """按作品开关联网；这是作者授权，不是 agent 自己开的。"""
+        self._work_or_raise(work_id)
+        work = self.db.get_work(work_id) or {}
+        profile = self._profile_of(work)
+        profile["web_research_enabled"] = bool(enabled)
+        self.db.update_work_style_profile(work_id, profile)
+        return {"work_id": work_id, "web_research_enabled": bool(enabled)}
 
-    async def distill_reference(self, work: Mapping[str, Any],
-                                contract: Mapping[str, Any],
-                                chapter: Mapping[str, Any],
-                                facts_rows: Sequence[Mapping[str, Any]]
-                                ) -> tuple[str, dict[str, Any]]:
-        """把候选素材蒸馏成「写法卡」。失败返回空串，调用方退回原文渲染。"""
+    def _web_config(self) -> Any:
+        """联网走 DeepSeek：当前主模型是它就用它，否则从控制台连接里找一条。
+
+        写作链路的主模型可能是别家（控制台按调用点绑定），联网不该因此失效；
+        但也**不静默换供应商**——找不到 DeepSeek 连接就原样返回，让调用方
+        报「当前端点不是 deepseek.com」。
+        """
+        from services import web_research_service as web_mod
+
+        base = getattr(self.api_client, "config", None) or self.config
+        if web_mod.deepseek_endpoint(base) is not None:
+            return base
+        try:
+            from provider_store import get_active_store
+
+            store = get_active_store(self.config)
+            if store is not None:
+                for provider in store.list_providers():
+                    url = str(provider.get("base_url") or "").strip()
+                    if "deepseek.com" not in url:
+                        continue
+                    cfg = SimpleNamespace(
+                        api_base=url,
+                        api_key=store.reveal_key(
+                            str(provider.get("id") or "")))
+                    if web_mod.deepseek_endpoint(cfg) is not None:
+                        return cfg
+        except Exception as exc:                     # noqa: BLE001
+            log.warning("writegraph: web provider lookup failed: %s", exc)
+        return base
+
+    def _save_web_cards(self, work_id: str, query: str,
+                        cards: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """联网卡落盘：有作品进作品 ``素材/网络/``，空项目进全局素材库。"""
+        from services import web_research_service as web_mod
+        from writegraph import docs as docs_mod
+
+        if not work_id:
+            # 空项目没有作品工作区，但素材库是全局的：正好收在这里。
+            from writegraph import materials as mat
+            return mat.save_web_cards(self.materials_root(), query, cards)
+        name = re.sub(r'[\\/:*?"<>|\s]+', "-", (query or "").strip())
+        name = name.strip("-")[:40] or "检索"
+        path = f"素材/网络/{time.strftime('%Y-%m-%d')}-{name}.md"
+        root = self.docs_root(work_id)
+        target = root / path
+        body = web_mod.cards_markdown(query, [dict(c) for c in cards])
+        if target.exists():
+            body = "\n" + body
+        docs_mod.write_file(root, path, body, append=target.exists())
+        return {"saved": path, "saved_paths": [path]}
+
+    def resolve_book_ids(self, names: Sequence[str]) -> list[str]:
+        """书名 → 书库 id（先精确再子串）；找不到直接报错，不猜。"""
+        from storage.db import BookDB
+
+        wanted = [str(name or "").strip() for name in names]
+        wanted = [name for name in wanted if name]
+        if not wanted:
+            return []
+        db = BookDB(self._books_db_path())
+        rows = list(db.list_books(limit=500))
+        ids: list[str] = []
+        for name in wanted:
+            row = next((b for b in rows
+                        if str(b.title or "").strip() == name), None)
+            row = row or next((b for b in rows
+                               if name in str(b.title or "")), None)
+            if row is None:
+                raise WritingError(f"书库里找不到《{name}》")
+            ids.append(str(row.id))
+        return ids
+
+    async def research_material(
+            self, work_id: str, query: str = "", *,
+            source: str = "library", limit: int = 6, url: str = "",
+            enable_web: bool = False, save: bool = False,
+            remember_web: bool = False, book: str = "",
+    ) -> dict[str, Any]:
+        """找书外素材：书库跨书检索（关键词 / 语义）+（可选）DeepSeek 联网（决策 142 / 148）。
+
+        与 ``writing_references`` 的分工：这里查「一条细节」，不绑定参考书；
+        那边只是书架范围。``book`` 把检索限定在一本或几本书里（书名，
+        逗号分隔），用于「照《X》的写法」。检索键是需求词，不是本作人名。
+
+        ``source``：``library`` 关键词查书库；``semantic`` 语义近邻查书库；
+        ``web`` 只联网；``auto`` 先关键词书库，空了且联网开关已开才走网。
+        ``url`` 直接抓页（也受联网开关约束）。联网是作者授权，agent 不能
+        自己开——``enable_web`` 只在作者本轮明确要求时传，作品开关存
+        ``style_profile.web_research_enabled``。
+        """
+        from services import web_research_service as web_mod
         from writegraph import reference as reference_mod
 
-        books = self.reference_books(work)
-        diag: dict[str, Any] = {"enabled": bool(books), "mode": "card"}
-        if not books or self.api_client is None:
-            diag["code"] = "no_books" if not books else "no_client"
-            return "", diag
-        try:
-            exclude = {str(f.get("subject_ref") or "") for f in facts_rows}
-            exclude |= {str(work.get("title") or ""),
-                        str(chapter.get("title") or "")}
-            parts = [str(contract.get("purpose") or ""),
-                     str(work.get("premise") or "")]
-            for key in ("must_hit_now", "must_preserve", "forbidden_cross"):
-                parts.extend(str(x) for x in (contract.get(key) or []))
-            terms = reference_mod.query_terms("\n".join(parts),
-                                              exclude=exclude)
-            path = self._reference_cache_path(
-                str(work.get("id") or ""), int(chapter.get("chapter_index") or 0),
-                terms, books)
-            if path.exists():
-                diag.update({"cached": True, "chars": len(
-                    path.read_text(encoding="utf-8"))})
-                return path.read_text(encoding="utf-8"), diag
-            pack = reference_mod.recall(self.config, books, terms)
-            rel = pack.get("relevance") or {}
-            diag["relevance"] = rel
-            if not rel.get("ok"):
-                diag["code"] = "low_relevance"
-                return "", diag
-            # 只给观察与细节：写法/信息给法建议会和合同抢戏，
-            # 基准里两处合同违规都来自这类建议。
-            card = await self._complete(
-                REFERENCE_DISTILL, reference_mod.skeleton(pack),
-                scenario="writing.reference", kind="reference",
-                work_id=str(work.get("id") or ""),
-                chapter_index=int(chapter.get("chapter_index") or 0))
-            card = strip_think(card).strip()
-            if card:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(card, encoding="utf-8")
-            diag["chars"] = len(card)
-            return card, diag
-        except Exception as exc:                     # noqa: BLE001
-            log.warning("writegraph: reference distill failed: %s", exc)
-            diag["code"] = "error"
-            diag["warnings"] = [str(exc)]
-            return "", diag
+        if source not in ("auto", "library", "semantic", "web", "materials"):
+            raise WritingError(
+                "source 只能是 materials / library / semantic / web / auto")
+        query = str(query or "").strip()
+        url = str(url or "").strip()
+        if not query and not url:
+            raise WritingError("检索词不能为空")
+        book_names = [name.strip() for name in
+                      str(book or "").replace("，", ",").split(",")
+                      if name.strip()]
+        book_ids = self.resolve_book_ids(book_names) if book_names else []
+        # 空项目（没绑定作品）也能查书库与素材库；联网落盘进全局素材库。
+        work = self._work_or_raise(work_id) if work_id else None
+        if remember_web and enable_web and work is not None:
+            # 两个信号都要：单次授权不落库，remember 单独传也不算授权。
+            self.set_web_research(str(work["id"]), True)
+        allowed = bool(enable_web) or (
+            work is not None and self.web_research_enabled(str(work["id"])))
+        limit = max(1, min(12, int(limit)))
+        books_db = Path(getattr(
+            self.config, "books_db_path",
+            Path(self.config.project_dir) / "data" / "books.db"))
 
-    def _build_reference(self, work: Mapping[str, Any],
-                         contract: Mapping[str, Any],
-                         chapter: Mapping[str, Any],
-                         facts_rows: Sequence[Mapping[str, Any]],
-                         override: Mapping[str, Any] | None = None
-                         ) -> tuple[str, dict[str, Any]]:
-        """召回别的书的写法与细节。失败只降级，绝不阻塞写作。"""
-        from writegraph import reference as reference_mod
+        if source == "materials":
+            if save:
+                raise WritingError(
+                    "save 只用于联网结果；素材库的结果已经在库里了")
+            return self.search_materials(
+                query, work_id=str(work["id"]) if work else "",
+                limit=limit)
 
-        cfg = dict(override or {})
-        books = list(cfg.get("books") or self.reference_books(work))
-        diag: dict[str, Any] = {"enabled": bool(books), "books":
-                                [b.get("label") or b.get("stable_book_id", "")
-                                 for b in books]}
-        if not books:
-            diag["code"] = "no_books"
-            return "", diag
-        try:
-            exclude = {str(f.get("subject_ref") or "") for f in facts_rows}
-            exclude |= {str(work.get("title") or ""),
-                        str(chapter.get("title") or "")}
-            parts = [str(contract.get("purpose") or ""),
-                     str(work.get("premise") or "")]
-            for key in ("must_hit_now", "must_preserve", "forbidden_cross"):
-                parts.extend(str(x) for x in (contract.get(key) or []))
-            terms = list(cfg.get("terms") or reference_mod.query_terms(
-                "\n".join(parts), exclude=exclude))
-            pack = reference_mod.recall(self.config, books, terms)
-            rel = pack.get("relevance") or {}
-            diag.update({"terms": terms, "relevance": rel})
-            if not rel.get("ok"):
-                diag["code"] = "low_relevance"
-                return "", diag
-            card = str(cfg.get("card") or "")
-            mode = str(cfg.get("mode")
-                       or self._profile_of(work).get("reference_mode")
-                       or "card")
-            if card:
-                text = reference_mod.render_distilled(card, diag["books"])
-            elif mode == "raw":
-                text = reference_mod.render(
-                    pack, max_chars=int(cfg.get("max_chars") or 1100))
-            else:
-                # 预览时还没有蒸馏卡：不要先展示原文，否则预览与实际
-                # 生成用的素材不是同一份。生成路径会显式传 card。
-                diag["code"] = "card_pending"
-                return "", diag
-            diag["chars"] = len(text)
-            diag["leak_terms"] = reference_mod.leak_terms(pack)[:80]
-            if not text:
-                diag["code"] = "empty"
-            return text, diag
-        except Exception as exc:                     # noqa: BLE001
-            log.warning("writegraph: reference recall failed: %s", exc)
-            diag["code"] = "error"
-            diag["warnings"] = [str(exc)]
-            return "", diag
+        if source == "auto" and not url and not book_ids:
+            # 素材库最便宜，且是作者已经挑过一遍的：先看它。
+            # 给了具体网址就跳过：作者要的是抓这一页。
+            # 限定了书就不先翻素材库：作者要的是那一本。
+            mine = self.search_materials(
+                query, work_id=str(work["id"]) if work else "",
+                limit=limit)
+            if mine.get("count"):
+                mine["note"] = ("素材库里已有结果，未查书库，也未联网。"
+                                + str(mine.get("note") or ""))
+                return mine
+
+        if source == "semantic":
+            if save:
+                raise WritingError(
+                    "save 只用于联网结果；语义近邻来自已入库的书，"
+                    "记下书名与章号即可")
+            from writegraph import semantic as semantic_mod
+            result = await semantic_mod.search(
+                self.config, query, limit=limit, books_db=books_db,
+                book_ids=book_ids or None)
+            if book_names:
+                result["book_scope"] = book_names
+            return result
+
+        def finish_web(result: dict[str, Any]) -> dict[str, Any]:
+            cards = result.get("cards") or []
+            if save and cards:
+                label = query or str(
+                    (cards[0] or {}).get("title") or url)
+                saved = self._save_web_cards(
+                    str(work["id"]) if work else "", label, cards)
+                result.update(saved)
+                result["saved_to"] = ("素材库" if work is None
+                                      else "作品 素材/网络/")
+            return result
+
+        if url:
+            if not allowed:
+                raise WritingError(
+                    "联网抓页需要作者同意：先问作者，或打开作品的联网开关")
+            return finish_web(await web_mod.fetch(self._web_config(), url))
+
+        if source == "web":
+            if not allowed:
+                raise WritingError(
+                    "联网需要作者同意：先问作者，或打开作品的联网开关")
+            return finish_web(await web_mod.search(
+                self._web_config(), query, count=limit))
+
+        exclude: set[str] = set()
+        if work is not None:
+            facts = self.db.get_facts(str(work["id"]))
+            exclude |= {str(f.get("subject_ref") or "") for f in facts}
+            exclude |= {str(work.get("title") or "")}
+        terms = reference_mod.query_terms(query, exclude=exclude, limit=8)
+        cards = (reference_mod.search_library(
+            books_db, terms, limit=limit, book_ids=book_ids or None)
+            if terms else [])
+        lib = {
+            "source": "library", "recall": "keyword",
+            "terms": terms, "cards": cards, "count": len(cards),
+            "note": ("只借写法与细节，不搬专名、设定、情节；引文以出处为准。"
+                     if cards else
+                     "书库里没有足够相关的段落；换词，或请作者把资料放进 素材/。"),
+        }
+        if book_names:
+            lib["book_scope"] = book_names
+        if source == "library":
+            return lib
+
+        # auto：书库优先；书库空且联网已授权才走网。
+        if cards:
+            lib["note"] += "书库已有结果，未联网；要联网可再调 source=web。"
+            return lib
+        if not allowed:
+            lib["note"] = ("书库里没有足够相关的段落。联网需要作者同意："
+                           "先问作者，或打开作品的联网开关。")
+            return lib
+        result = await web_mod.search(self._web_config(), query, count=limit)
+        result["note"] += "书库无结果，已改查联网。"
+        return finish_web(result)
+
+    def resolve_refs(self, refs: Sequence[Mapping[str, Any]] | None,
+                     work_id: str = ""
+                     ) -> tuple[list[dict[str, Any]], list[str]]:
+        """把 agent 给的素材坐标读回逐字原文。
+
+        读工具语义：agent 指位置（书块坐标 / 素材卡身份 / 作品素材路径），
+        服务端负责读文件并渲染；不接受转述、不蒸馏、不跨条合并。读不到的
+        坐标原样报回去，让 agent 自己改，不当成静默降级。
+
+        ``material_id`` 只查全局素材库；``path`` 先查全局库，再查**本书**
+        ``素材/``（``library=work`` 的检索结果就是这种卡，身份不在全局库里）。
+        """
+        from writegraph import materials as mat
+
+        root = self.materials_root()
+        books_db = self._books_db_path()
+        out: list[dict[str, Any]] = []
+        errors: list[str] = []
+        seen: set[tuple[Any, ...]] = set()
+        for raw in refs or []:
+            if not isinstance(raw, Mapping):
+                errors.append("refs 里的每一条都要是对象")
+                continue
+            note = str(raw.get("note") or "")
+            mid = str(raw.get("material_id") or "").strip()
+            path = str(raw.get("path") or "").strip()
+            if mid or path:
+                card: dict[str, Any] | None = None
+                rel = ""
+                origin = "素材库"
+                problem = ""
+                if mid:
+                    rel = mat.find_by_id(root, mid)
+                    if rel:
+                        try:
+                            card = mat.read_card(root, rel)
+                        except mat.MaterialError as exc:
+                            problem = str(exc)
+                if card is None and path:
+                    try:
+                        card = mat.read_card(root, path)
+                        rel = path
+                    except mat.MaterialError as exc:
+                        problem = problem or str(exc)
+                if card is None and path and work_id:
+                    # 本书 素材/：作品工作区里的卡没有全局素材库身份。
+                    try:
+                        row = self.docs_read(work_id, path)
+                    except WritingError:
+                        row = None
+                    if row is not None:
+                        card = mat.parse_card(
+                            str(row.get("content") or ""), path)
+                        card["excerpt"] = (card.get("excerpt")
+                                           or str(row.get("content") or ""))
+                        rel = path
+                        origin = "作品素材"
+                if card is None:
+                    errors.append(problem or f"素材库里找不到 {mid or path}")
+                    continue
+                key = ("material", str(card.get("material_id") or rel))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({
+                    "kind": "material",
+                    "material_id": str(card.get("material_id") or ""),
+                    "label": origin + " · " + (
+                        str(card.get("source_line") or "")
+                        or str(card.get("title") or rel)),
+                    "text": str(card.get("excerpt") or ""),
+                    "note": note,
+                })
+                continue
+            chunk_id = str(raw.get("chunk_id") or "").strip()
+            book_id = str(raw.get("book_id") or "").strip()
+            chapter_index = raw.get("chapter_index")
+            chunk_index = raw.get("chunk_index")
+            if not chunk_id and not (book_id and chapter_index is not None
+                                     and chunk_index is not None):
+                errors.append("每条 ref 要给 material_id / path，"
+                              "或 chunk_id / book_id + 章 + 块")
+                continue
+            row = mat.read_book_chunk(
+                books_db, chunk_id=chunk_id, book_id=book_id,
+                chapter_index=chapter_index, chunk_index=chunk_index)
+            if not row:
+                errors.append("找不到原文块：" + (
+                    chunk_id or f"{book_id}#{chapter_index}/{chunk_index}"))
+                continue
+            text = str(row.get("content") or "")
+            label = (f"书《{row.get('book_title') or '未知'}》"
+                     f"第 {int(row.get('chapter_index') or 0)} 章"
+                     f" · 块 #{int(row.get('chunk_index') or 0)}")
+            para_start = raw.get("para_start")
+            para_end = raw.get("para_end")
+            if para_start or para_end:
+                try:
+                    text, first, last, _total = mat.paragraph_span(
+                        text, para_start, para_end)
+                except mat.MaterialError as exc:
+                    errors.append(str(exc))
+                    continue
+                label += (f" · 第 {first} 段" if first == last
+                          else f" · 第 {first}–{last} 段")
+            key = ("book", str(row.get("id") or ""),
+                   int(para_start or 0), int(para_end or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "kind": "book",
+                "label": label,
+                "text": text,
+                "note": note,
+                "book_id": str(row.get("book_id") or ""),
+                "chapter_index": row.get("chapter_index"),
+                "chunk_index": row.get("chunk_index"),
+                "chunk_id": str(row.get("id") or ""),
+            })
+        return out, errors
 
     # ── 上下文装配 ────────────────────────────────────────────────────────
 
@@ -2128,8 +4022,8 @@ class WritingService:
                  focus_refs: Sequence[str] | None = None,
                  budget: int | None = None,
                  style_ref: Mapping[str, Any] | None = None,
-                 reference: Mapping[str, Any] | None = None,
-                 reference_card: str = ""
+                 refs: Sequence[Mapping[str, Any]] | None = None,
+                 mode: str = "standard"
                  ) -> dict[str, Any]:
         work = self.db.get_work(work_id)
         if work is None:
@@ -2140,7 +4034,7 @@ class WritingService:
             raise WritingError("本章还没有合同，先写合同再生成")
 
         # 覆盖草稿前留检查点：生成失败/不满意时可以回到原稿。
-        self._auto_commit(work_id, f"生成第{chapter_index}章前的自动提交")
+        self._auto_commit(work_id, f"生成第{chapter_index}章前的自动存档")
 
         prev = self.db.get_chapter(work_id, chapter_index - 1)
         prev_tail = (prev or {}).get("content", "")[-700:]
@@ -2169,20 +4063,42 @@ class WritingService:
         ranked = lens_mod.rank(raw, chapter=chapter_index,
                                entity_names=tuple(focus_refs or ()))
 
+        terms = lens_mod.query_terms(query)
+        material_evidence = lens_mod.material_evidence(ranked, terms)
         blocks = {
             "chapter_contract": _contract_text(contract, chapter_index),
             "facts_current": _facts_text(current),
             "prev_tail": prev_tail,
             "context_card": card["text"],
-            "reference_material": lens_mod.render_material(ranked),
+            "reference_material": material_evidence["text"],
         }
-        ref_cfg = dict(reference or {})
-        if reference_card:
-            ref_cfg["card"] = reference_card
-        ref_text, ref_diag = self._build_reference(
-            work, contract, chapter, facts_rows, ref_cfg)
+        ref_items, ref_errors = self.resolve_refs(refs, work_id=work_id)
+        if ref_errors:
+            raise WritingError("有些素材引用读不到：" + "；".join(ref_errors[:6]))
+        ref_text = reference_mod.render_refs(ref_items)
         if ref_text:
             blocks["external_reference"] = ref_text
+        ref_diag: dict[str, Any] = {
+            "mode": "refs",
+            "count": len(ref_items),
+            "chars": len(ref_text),
+            "items": [{"kind": item.get("kind"), "label": item.get("label")}
+                      for item in ref_items],
+        }
+
+        # 作者的工作区（作品记忆 + 设定）。放不进预算时整块退让：
+        # 合同与账本是正典，设定是补充。设定只带这一章用得上的。
+        docs_context = "\n".join([
+            str(chapter.get("title") or ""),
+            _contract_text(contract, chapter_index),
+            str(blocks.get("facts_current") or ""),
+            str(blocks.get("prev_tail") or ""),
+            str(blocks.get("context_card") or ""),
+        ])
+        docs_text, docs_manifest = self._work_docs_block(
+            work, context_text=docs_context)
+        if docs_text:
+            blocks["work_docs"] = docs_text
 
         style_info: dict[str, Any] | None = None
         style = self._resolve_style_ref(work, style_ref)
@@ -2191,16 +4107,21 @@ class WritingService:
                 work, contract, style)
             if voice_text:
                 blocks["author_voice"] = voice_text
+        profile = budget_mod.profile_for(mode)
         compiled = budget_mod.compile_blocks(
-            blocks, budget=budget or budget_mod.DEFAULT_TOTAL_BUDGET)
+            blocks, budget=budget or profile["total"],
+            specs=profile["specs"])
         result = {
             "chapter_index": chapter_index,
             "text": compiled["text"],
             "tokens": compiled["tokens"],
             "manifest": compiled["manifest"],
+            "decision": compiled["decision"],
             "card": card,
             "references": ranked[:10],
+            "material_evidence": material_evidence,
             "reference": ref_diag,
+            "work_docs": docs_manifest,
         }
         if style_info is not None:
             result["style"] = style_info
@@ -2211,34 +4132,36 @@ class WritingService:
     async def stream_chapter(self, work_id: str, chapter_index: int, *,
                              extra_instruction: str = "",
                              style_ref: Mapping[str, Any] | None = None,
+                             refs: Sequence[Mapping[str, Any]] | None = None,
+                             mode: str = "standard",
+                             research_brief: Mapping[str, Any] | None = None,
+                             plan_first: bool = False,
                              cancel_event=None) -> AsyncIterator[dict[str, Any]]:
-        """流式写一章。事件：``stage`` / ``delta`` / ``done`` / ``error``。"""
+        """流式写一章。事件：``stage`` / ``delta`` / ``done`` / ``error``。
+
+        ``refs`` 是 agent 本轮选定的素材坐标；服务端只按坐标读回逐字
+        原文。不再在这里替 agent 召回或蒸馏——找素材是 agent 的事。
+
+        ``mode`` 是本次动笔的有效模式（会话模式 + 单章覆盖，由调用方算好）。
+        细致模式要求 ``research_brief``：只验形状，不验质量（决策 161）。
+        """
         if self.api_client is None:
             raise WritingError("未配置模型，无法生成正文")
+        mode = normalize_writing_mode(mode)
+        brief = validate_research_brief(research_brief, refs, mode)
         chapter = self.chapter(work_id, chapter_index)
         contract = self.db.get_contract(chapter["id"])
         work = self.db.get_work(work_id) or {}
-        profile = self._profile_of(work)
-        ref_mode = str(profile.get("reference_mode") or "card")
-        reference_card = ""
-        ref_diag: dict[str, Any] = {}
-        if ref_mode == "card":
-            facts_rows = self.db.get_facts(work_id,
-                                           up_to_chapter=chapter_index - 1)
-            reference_card, ref_diag = await self.distill_reference(
-                work, contract or {}, chapter, facts_rows)
+        profile = self._profile_of(work)          # auto_repair 等作品开关
         assembled = self.assemble(
-            work_id, chapter_index, style_ref=style_ref,
-            reference={"mode": ref_mode, "card": reference_card},
-            reference_card=reference_card)
-        ref_info = dict(assembled.get("reference") or {})
-        if ref_diag:
-            ref_info["distill"] = ref_diag
-        assembled["reference"] = ref_info
-        self._log_reference_diag(work, chapter, ref_info)
+            work_id, chapter_index, style_ref=style_ref, refs=refs,
+            mode=mode)
+        self._log_reference_diag(work, chapter,
+                                 assembled.get("reference") or {})
         yield {"event": "stage",
                "data": {"stage": "assembled", "tokens": assembled["tokens"],
                         "manifest": assembled["manifest"],
+                        "decision": assembled.get("decision"),
                         "style": assembled.get("style"),
                         "reference": assembled.get("reference")}}
 
@@ -2251,25 +4174,63 @@ class WritingService:
         system += LENGTH_PROMPT.format(target=target,
                                        floor=int(target * 0.8))
         user_content = assembled["text"]
+        if plan_first:
+            # 决策 176：只排计划，不写正文。细纲失败就整轮失败，
+            # 不静默跳过、不假装按细纲生成。
+            yield {"event": "stage", "data": {"stage": "outline"}}
+            try:
+                outline_text = await self._complete(
+                    outline_mod.INSTRUCTION, assembled["text"],
+                    scenario="writing.outline", kind="outline",
+                    work_id=work_id, chapter_index=chapter_index,
+                    max_tokens=1200)
+            except Exception as exc:                 # noqa: BLE001
+                raise WritingError(f"短细纲生成失败：{exc}") from exc
+            outline_text = outline_text.strip()
+            if not outline_text:
+                raise WritingError("短细纲为空，未继续写正文")
+            user_content += "\n\n" + outline_mod.render_block(outline_text)
+            yield {"event": "stage",
+                   "data": {"stage": "outlined", "chars": len(outline_text)}}
         if extra_instruction.strip():
             # 作者本轮的额外要求不是合同，放在最后、标明优先级低于正典。
             user_content += ("\n\n## 作者本轮要求（不覆盖正典与合同）\n"
                              + extra_instruction.strip())
         messages = [{"role": "user", "content": user_content}]
 
+        # 输出预算：目标字数 ×1.8 + 推理开销。撞上限时翻倍重来——
+        # 同样的预算再问一遍只会再撞一次（决策 62 的截断判据）。
+        budget = max(_DRAFT_MIN_TOKENS, int(target * 1.8) + 1200)
         buf: list[str] = []
         visible = ThinkStreamFilter()
-        yield {"event": "stage", "data": {"stage": "writing"}}
-        with usage_log.source_scope("writing"):
-            async for delta, _tools, _usage in self.api_client.stream(
-                    system, messages, [], scenario="writing.draft"):
-                if cancel_event is not None and cancel_event.is_set():
-                    break
-                if delta:
-                    buf.append(delta)      # 原始流（含思维链）留给飞行记录仪
-                    shown = visible.feed(delta)
-                    if shown:
-                        yield {"event": "delta", "data": {"text": shown}}
+        for attempt in range(_DRAFT_BUDGET_RETRIES + 1):
+            buf.clear()
+            visible = ThinkStreamFilter()
+            # 每次尝试都重发 writing：调用方据此把已收字数清零。
+            yield {"event": "stage",
+                   "data": {"stage": "writing", "attempt": attempt + 1,
+                            "budget": budget}}
+            try:
+                with usage_log.source_scope("writing"):
+                    async for delta, _tools, _usage in self.api_client.stream(
+                            system, messages, [], scenario="writing.draft",
+                            max_tokens=budget):
+                        if cancel_event is not None and cancel_event.is_set():
+                            break
+                        if delta:
+                            buf.append(delta)  # 原始流（含思维链）留给飞行记录仪
+                            shown = visible.feed(delta)
+                            if shown:
+                                yield {"event": "delta", "data": {"text": shown}}
+            except StreamTruncated as exc:
+                if attempt >= _DRAFT_BUDGET_RETRIES:
+                    raise WritingError(str(exc)) from exc
+                budget = min(_DRAFT_MAX_TOKENS, budget * 2)
+                log.warning("writegraph: draft truncated, retry with %d", budget)
+                yield {"event": "stage",
+                       "data": {"stage": "retrying", "budget": budget}}
+                continue
+            break
         tail = visible.flush()
         if tail:
             yield {"event": "delta", "data": {"text": tail}}
@@ -2303,12 +4264,52 @@ class WritingService:
                     log.warning("writegraph: auto repair failed: %s", exc)
         saved = self.db.save_draft(work_id, chapter["id"], content,
                                    reason="draft")
+        # 取舍说明跟这一稿一起存：审稿时看得到「声明要借什么、还缺什么」。
+        # 只入库，不进写作 git（过程元数据不是正典）。
+        payload = dict(brief)
+        payload["reference"] = assembled.get("reference") or {}
+        try:
+            self.db.add_chapter_brief(
+                work_id, chapter["id"], chapter_index, mode, payload,
+                ref_count=int((assembled.get("reference") or {}).get("count")
+                              or 0))
+        except Exception as exc:                     # noqa: BLE001
+            log.warning("writegraph: brief persist failed: %s", exc)
         yield {"event": "done",
-               "data": {"chapter_index": chapter_index,
+               "data": {"chapter_index": chapter_index, "mode": mode,
                         "content": content, **saved}}
 
-    async def settle(self, work_id: str, chapter_index: int) -> dict[str, Any]:
-        """结算：模型交 delta，宿主校验后落库。整份拒绝，不做部分接受。"""
+    def _subject_state_block(self, facts_rows: Sequence[Mapping[str, Any]],
+                             chapter_index: int) -> str:
+        """结算上下文里的「核心角色状态」。
+
+        与角色卡同一套求值（``facts.current`` + ``group_by_subject``），
+        但只列主体与字段值：模型要的是**能当 subject_ref 用的 id**，
+        不是叙事文本。空账本必须明说，否则模型只能自造 id。
+        """
+        current = facts_mod.current(facts_rows, chapter_index)
+        grouped = facts_mod.group_by_subject(current)
+        if not grouped:
+            return ("（还没有任何主体。本章新登场的人物/地点/物品一律放进 "
+                    "entity_ops 的 create，不要自造 subject_ref。）")
+        lines: list[str] = []
+        for ref in sorted(grouped)[:30]:
+            items = {str(r.get("field")): r for r in grouped[ref]}
+            kind = str(grouped[ref][0].get("subject_type") or "")
+            parts = [f"{name}：{facts_mod.describe(items[name])}"
+                     for name in facts_mod.CARD_FIELDS if name in items]
+            head = f"- {ref}" + (f"（{kind}）" if kind else "")
+            lines.append(head + (" —— " + "；".join(parts) if parts else ""))
+        return "\n".join(lines)
+
+    async def settle(self, work_id: str, chapter_index: int, *,
+                     outcomes: Sequence[Mapping[str, Any]] | None = None,
+                     note: str = "") -> dict[str, Any]:
+        """结算：模型交 delta，宿主校验后落库。整份拒绝，不做部分接受。
+
+        结算成功 = 这一章结束：合同一并结清（``outcomes`` 是 agent 申报的
+        逐条兑现结果），之后它只以一行状态留在系统提示词里。
+        """
         chapter = self.chapter(work_id, chapter_index)
         content = str(chapter.get("content") or "")
         if not content.strip():
@@ -2322,6 +4323,11 @@ class WritingService:
                       for p in existing_promises
                       if p.get("status") not in ("resolved", "abandoned")]
         user = content
+        # settle.md 要求 subject_ref 只能用「核心角色状态」里的 id，可这一段
+        # 以前根本没装配进来：模型看不到任何合法 id，只能自造（2026-10-29
+        # 18:55 的会话里它造了 tmp-char-1，校验必拒）。
+        user += "\n\n## 核心角色状态（subject_ref 只能用这里的 id）\n" \
+                + self._subject_state_block(existing_facts, chapter_index)
         if open_lines:
             user += "\n\n## 未回收承诺\n" + "\n".join(open_lines)
 
@@ -2354,10 +4360,23 @@ class WritingService:
             self.db.set_tension(work_id, chapter["id"],
                                 max(0, min(100, int(tension))),
                                 source="ai", note="结算时估算")
-        # 结算成功 = 正文与账本都稳定了，自动留一个可回滚的提交。
-        self._auto_commit(work_id, f"第{chapter_index}章结算",
-                          kind="auto", author="agent")
-        return {"ok": True, **applied, "delta": checked.delta}
+        # 结算成功 = 正文与账本都稳定了。是否顺手留一版由作品习惯决定
+        # （决策 182）：默认每章一版；作者说「我自己管版本」后不再自动提交。
+        habit = self.git_habit(work_id)
+        committed = None
+        if habit == "chapter":
+            committed = self._auto_commit(
+                work_id, f"第{chapter_index}章结算",
+                kind="auto", author="agent")
+        contract = self.db.close_contract(
+            chapter["id"], outcomes=outcomes, note=note)
+        self._mark_dirty_chapter(work_id, chapter_index)
+        return {"ok": True, **applied, "delta": checked.delta,
+                "git": {"habit": habit, "committed": committed is not None},
+                "contract": (None if contract is None else {
+                    "status": contract.get("status"),
+                    "summary": _contract_summary(contract, chapter_index),
+                    "stats": contract_stats(contract)})}
 
     # ── 审稿与修订（P2）──────────────────────────────────────────────────
 
@@ -2383,7 +4402,38 @@ class WritingService:
                 for p in promises))
         if prev.get("content"):
             parts.append("## 上一章结尾\n" + prev["content"][-600:])
+        brief = self.db.latest_chapter_brief(chapter["id"])
+        if brief:
+            payload = brief.get("payload") or {}
+            lines = []
+            if payload.get("questions"):
+                lines.append("问题：" + "；".join(payload["questions"]))
+            for row in payload.get("searched") or []:
+                lines.append(
+                    f"查过：{row.get('source') or '?'}｜{row.get('query') or ''}"
+                    f" → {row.get('result') or ''}")
+            if payload.get("gaps"):
+                lines.append("没找到 / 需作者定：" + "；".join(payload["gaps"]))
+            ref = payload.get("reference") or {}
+            if ref.get("count"):
+                labels = [str(i.get("label") or "")
+                          for i in (ref.get("items") or [])][:6]
+                lines.append(f"声明要借的素材（{ref.get('count')} 条）："
+                             + "；".join(x for x in labels if x))
+            if lines:
+                parts.append("## 本章素材取舍（动笔前声明）\n"
+                             + "\n".join(f"- {x}" for x in lines))
         return "\n\n".join(parts)
+
+    def _goal_author_sources(self, work_id: str) -> list[str]:
+        """审稿用的作者原文：作品记忆 + 全部设定，只用来找必现标记。"""
+        from writegraph import docs as docs_mod
+        try:
+            root = self.docs_root(work_id)
+            return [docs_mod.read_bible(root, max_chars=6000),
+                    docs_mod.dump_section(root, "设定", max_total=40000)]
+        except (WritingError, OSError, docs_mod.DocError):
+            return []
 
     async def review_chapter(self, work_id: str,
                              chapter_index: int) -> dict[str, Any]:
@@ -2392,15 +4442,27 @@ class WritingService:
         if not content.strip():
             raise WritingError("正文为空，无法审稿")
         context = self._review_context(work_id, chapter_index)
+        contract = self.db.get_contract(chapter["id"])
+        goals = goals_mod.freeze_goals(
+            contract, chapter_index,
+            author_sources=self._goal_author_sources(work_id))
+        goal_block = goals_mod.render_prompt_block(goals)
+        user_message = "\n\n".join(
+            part for part in (context, goal_block, f"## 本章正文\n{content}")
+            if part)
         raw = await self._complete(
-            self._prompt("review.md"),
-            f"{context}\n\n## 本章正文\n{content}",
+            self._prompt("review.md"), user_message,
             scenario="writing.review", kind="review",
             work_id=work_id, chapter_index=chapter_index)
         parsed = loads_tolerant(raw, expect=dict)
         if not isinstance(parsed, dict):
             raise WritingError("审稿输出不是 JSON 对象")
         result = review_mod.normalize_review(parsed, content)
+        goal_review = goals_mod.normalize_goal_reviews(
+            parsed.get("goalReviews", parsed.get("goal_reviews")), goals,
+            content)
+        result["goal_review"] = goal_review
+        result["goal_summary"] = goals_mod.summary_line(goal_review)
         run_id = self.db.save_review(
             chapter["id"], str(chapter.get("content_hash") or ""),
             model=self._model_name(), result=result)
@@ -2587,7 +4649,7 @@ class WritingService:
                        expected_hash: str | None = None) -> dict[str, Any]:
         chapter = self.chapter(work_id, chapter_index)
         # 应用修订前留检查点：改坏了可以回到改前。
-        self._auto_commit(work_id, f"第{chapter_index}章修订前自动提交")
+        self._auto_commit(work_id, f"第{chapter_index}章修订前自动存档")
         try:
             result = self.db.apply_revision(revision_id,
                                             expected_hash=expected_hash)
@@ -2632,14 +4694,18 @@ class WritingService:
 
     async def _complete(self, system: str, user: str, *,
                         scenario: str = "", kind: str = "complete",
-                        work_id: str = "", chapter_index: int = 0) -> str:
+                        work_id: str = "", chapter_index: int = 0,
+                        max_tokens: int | None = None) -> str:
         if self.api_client is None:
             raise WritingError("未配置模型，无法结算")
         buf: list[str] = []
+        kwargs: dict[str, Any] = {"scenario": scenario}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         with usage_log.source_scope("writing"):
             async for delta, _tools, _usage in self.api_client.stream(
                     system, [{"role": "user", "content": user}], [],
-                    scenario=scenario):
+                    **kwargs):
                 if delta:
                     buf.append(delta)
         raw = "".join(buf)
@@ -2650,8 +4716,52 @@ class WritingService:
         return strip_think(raw)
 
 
+def contract_stats(contract: Mapping[str, Any] | None) -> dict[str, Any]:
+    """合同的兑现盘点：申报了几条、几条兑现/勉强/未兑现、哪几条没申报。
+
+    只数 ``outcomes`` 里的行，不核对证据是否真在正文里——那是之后校验器的事，
+    这里先让「做了什么」可读。
+    """
+    rows = list((contract or {}).get("outcomes") or [])
+    items = [str(x) for x in ((contract or {}).get("must_hit_now") or [])]
+    counts = {"hit": 0, "partial": 0, "miss": 0}
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        verdict = str(row.get("verdict") or "")
+        if verdict in counts:
+            counts[verdict] += 1
+        item = str(row.get("item") or "").strip()
+        if item:
+            seen.add(item)
+    return {"total": len(items), **counts, "declared": len(rows),
+            "missing": [item for item in items if item not in seen]}
+
+
+def _contract_summary(contract: Mapping[str, Any], chapter_index: int) -> str:
+    """已结清合同在系统提示词里的一行摘要。全文不再进来——写完了就不该占现场。"""
+    stats = contract_stats(contract)
+    head = f"第{chapter_index}章合同已结清"
+    if stats["total"]:
+        head += f"｜兑现 {stats['hit']}/{stats['total']}"
+        if stats["partial"]:
+            head += f"｜勉强 {stats['partial']}"
+        if stats["miss"]:
+            head += f"｜未兑现 {stats['miss']}"
+        if stats["missing"]:
+            head += f"｜未申报 {len(stats['missing'])}"
+    note = str(contract.get("close_note") or "").strip()
+    if note:
+        head += "｜" + note[:40]
+    return head
+
+
 def _contract_text(contract: Mapping[str, Any], chapter_index: int) -> str:
     lines = [f"第{chapter_index}章合同"]
+    arc = str(contract.get("arc_ref") or "").strip()
+    if arc:
+        lines.append(f"- 弧线：{arc}")
     fields = (("目的", "purpose"), ("独占事件", "exclusive_event"),
               ("章末状态", "ending_state"),
               ("下场可承接", "next_entry_state"))
@@ -2660,7 +4770,8 @@ def _contract_text(contract: Mapping[str, Any], chapter_index: int) -> str:
             lines.append(f"- {label}：{contract[key]}")
     for label, key in (("必须兑现", "must_hit_now"),
                        ("必须保留", "must_preserve"),
-                       ("禁止触碰", "forbidden_cross")):
+                       ("禁止触碰", "forbidden_cross"),
+                       ("不点破", "withhold")):
         values = contract.get(key) or []
         if values:
             lines.append(f"- {label}：" + "；".join(str(v) for v in values))

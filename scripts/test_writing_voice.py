@@ -47,7 +47,7 @@ SAMPLE_A = ("两腿初废时，我曾暗下决心：这辈子就在屋里看书�
             "母亲把书摞在窗台上，一本一本擦干净。她说，先别想那么远。")
 SAMPLE_B = ("是呀，这五十七年我都干了些什么？扶轮问路，扶轮问路啊。"
             "院子里那棵老树还在，树皮裂开，像有人反复写过又擦掉的字。")
-SAMPLE_C = ("雨落在铁皮棚上，声音很密。老周没有抬头，只把烟按灭在鞋底。"
+SAMPLE_C = ("雨落在铁皮棚上，声音很密。配角没有抬头，只把烟按灭在鞋底。"
             "他说船期改到后天，说完就走进雨里，再没回头。")
 PARATEXT = ("序跋里我常被问起为什么要写这些。其实答案很简单："
             "活着这件事，本身就需要一个说法。")
@@ -206,8 +206,8 @@ def test_service(tmp: Path) -> None:
     svc = WritingService(SimpleNamespace(project_dir=tmp), db=db)
     w = svc.create_work("透镜之书", narrative_pov="first")
     ch = svc.create_chapter(w, title="雨夜")
-    svc.set_contract(ch["id"], purpose="雨中告别，老周离开",
-                     must_hit_now=["老周离开"],
+    svc.set_contract(ch["id"], purpose="雨中告别，配角离开",
+                     must_hit_now=["配角离开"],
                      forbidden_cross=["雨落在铁皮棚"])
 
     relaxed = select_for_scene(adb, aid, {"scene_type": "landscape"},

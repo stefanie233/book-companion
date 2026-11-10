@@ -56,12 +56,27 @@ MODULE_TESTS = ["test_model_profiles.py", "test_provider_store.py",
                 "test_graph_llm_budget.py", "test_graph_e2e.py",
                 "test_author_graph.py", "test_author_enrich_e2e.py",
                 "test_author_sources.py", "test_author_voice.py",
-                "test_author_dossier.py",
+                "test_author_dossier.py", "test_author_details.py",
+                "test_author_jobs.py",
                 "test_web_search_service.py",
-                "test_writegraph.py", "test_writegraph_vcs.py",
+                "test_writegraph.py", "test_writing_docs.py",
+                "test_writing_refs.py", "test_writing_mode.py",
+                "test_writing_tool_exposure.py",
+                "test_materials_library.py", "test_materials_cook.py",
+                "test_materials_empty.py",
+                "test_embedding_recall.py",
+                "test_writing_memory.py",
+                "test_writegraph_vcs.py",
                 "test_writegraph_git_ops.py", "test_writing_voice.py",
-                "test_writing_git_tools.py", "test_chat_mode_context.py",
-                "test_chat_context.py"]
+                "test_writing_git_tools.py", "test_writing_guard.py",
+                "test_chat_mode_context.py",
+                "test_chat_context.py",
+                "test_library_event_log.py",
+                "test_annotation_event_log.py",
+                "test_session_lines.py",
+                "test_context_compaction.py",
+                "test_reading_session.py",
+                "test_self_knowledge.py"]
 
 
 @dataclass
@@ -89,10 +104,16 @@ def _run(cmd: list[str], timeout: float = 180,
 def check_module_tests() -> CheckResult:
     t0 = time.monotonic()
     fails: list[str] = []
-    for name in MODULE_TESTS:
-        code, out = _run([sys.executable, str(ROOT / "scripts" / name)])
-        if code != 0:
-            fails.append(f"{name}:\n{out}")
+    # usage_log 是进程级单例，测试忘了 init_for_tests 就会把 fake 调用写进
+    # 生产 data/sessions.db（用量分析把它们当真调用）。整批指到临时库，
+    # 一处开关兜住所有模块测试（决策 147）。
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        env = {"BOOK_COMPANION_USAGE_DB": str(Path(tmp) / "sessions.db")}
+        for name in MODULE_TESTS:
+            code, out = _run([sys.executable, str(ROOT / "scripts" / name)],
+                             extra_env=env)
+            if code != 0:
+                fails.append(f"{name}:\n{out}")
     detail = "\n".join(fails)
     return CheckResult("module-tests", "FAIL" if fails else "PASS",
                        detail, time.monotonic() - t0)

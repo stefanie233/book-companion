@@ -118,6 +118,27 @@ def build_fixture(tmp: Path) -> tuple[AuthorsDB, BookDB, dict]:
                         confidence=0.6, status="provisional", revision="rev1",
                         evidence_ids=(c3,))
 
+    adb.add_observation(
+        aid, stable_book_id="sb-1", book_id="bk-1", chunk_id="ck-1",
+        chapter_index=1, chunk_index=1, topic="habit",
+        statement="清晨四点起床写作", quote="第一段正文。",
+        basis="author_statement", speaker="author",
+        use="roleplay_texture", status="accepted", confidence="high")
+    adb.add_observation(
+        aid, stable_book_id="sb-1", book_id="bk-1", chunk_id="ck-3",
+        chapter_index=5, chunk_index=1, topic="motif",
+        statement="反复写同一扇窗", quote="第五段正文。",
+        basis="autobiographical_projection", basis_quote="",
+        speaker="author", use="dossier", status="accepted",
+        confidence="low")
+    adb.add_hook(aid, stable_book_id="sb-1", book_id="bk-1",
+                 chunk_id="ck-1", chapter_index=1, topic="relation",
+                 quote="第一段正文。", known="提到一位故人",
+                 missing="这位故人是谁", why="可能连到青年经历")
+    adb.add_hook(aid, stable_book_id="sb-1", book_id="bk-1",
+                 chunk_id="ck-3", chapter_index=5, topic="other",
+                 quote="第五段正文。", missing="第五段才提到的事")
+
     cl1 = adb.add_claim(aid, "theme", "记忆是这本书的母题", theme_key="记忆",
                         year=1935, confidence=0.7, status="active")
     adb.add_claim(aid, "reception", "出版后引起讨论", year=1950,
@@ -173,6 +194,13 @@ def test_dossier(adb: AuthorsDB, bdb: BookDB, f: dict) -> None:
     check("年谱：无年", d["timeline"]["undated"]["life"], 1)
     check("年谱：证据已核", d["timeline"]["life"][0]["verified"], True)
 
+    ok("细节：区块存在", "details" in d["sections"])
+    check("细节：观察两条", d["details"]["counts"]["observations"], 2)
+    check("细节：钩子两条", d["details"]["counts"]["hooks"], 2)
+    habit = next(o for o in d["details"]["items"]
+                 if o["statement"] == "清晨四点起床写作")
+    check("细节：观察带依据", habit["basis"], "author_statement")
+
     check("作品：本地 2 本", d["works_meta"]["counts"]["local"], 2)
     check("作品：书目 1 条", d["works_meta"]["counts"]["bibliography"], 1)
     check("作品：总数 3", len(d["works"]), 3)
@@ -226,11 +254,16 @@ def test_gate(adb: AuthorsDB, bdb: BookDB, f: dict) -> None:
                   if x["source_id"] == f["legacy"])
     check("门：来源引文被挡", legacy["hidden_quotes"], 1)
     check("门：来源可见引文 0", legacy["evidence_count"], 0)
+    check("门：细节只留第 1 章", d["details"]["counts"]["observations"], 1)
+    check("门：钩子只留第 1 章", d["details"]["counts"]["hooks"], 1)
+    ok("门：细节被挡有说明", "挡住" in (d["details"]["note"] or ""))
 
     d2 = build_dossier(adb, author_id=aid, book_id="bk-1",
                        books_db=bdb, use_cache=False)
     check("门：有书无章 = 显式全集", d2["gate"]["mode"], "no_gate")
     check("门：全集不挡", len(d2["voice"]["samples"]), 3)
+    check("门：全集细节不挡", d2["details"]["counts"]["observations"], 2)
+    check("门：全集钩子不挡", d2["details"]["counts"]["hooks"], 2)
 
     d3 = build_dossier(adb, author_id=aid, book_id="bk-unknown",
                        max_chapter=1, books_db=bdb, use_cache=False)

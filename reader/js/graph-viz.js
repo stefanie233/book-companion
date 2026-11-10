@@ -1,4 +1,4 @@
-/* Book Companion — knowledge graph visualization (Cytoscape.js).
+/* Liubai — knowledge graph visualization (Cytoscape.js).
 
  * Provides: interactive graph canvas, type-wheel filter, node detail panel.
  * Activated by the "图谱" sidebar tab.

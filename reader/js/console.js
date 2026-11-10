@@ -7,6 +7,7 @@
 // carries its own kind ({id, kind}), and slots bind to (provider, model).
 
 import { refreshOnboardingState } from './onboarding.js';
+import { S } from './state.js';
 
 const SLOT_META = {
   main_llm:  { label: '主模型 LLM', short: '主模型', kind: 'llm', desc: '对话 + 全部后台管线（图谱/记忆/清洗）', modelOptional: false },
@@ -653,7 +654,7 @@ async function previewTts() {
   }
   try {
     const r = await api('POST', '/api/tts', {
-      text: '你好，我是书伴。这是当前语音驱动的试听。',
+      text: `你好，我是${S.agentName || '留白'}。这是当前语音驱动的试听。`,
       voice: '茉莉', speed: 1.0,
     });
     if (ttsAudio) ttsAudio.pause();

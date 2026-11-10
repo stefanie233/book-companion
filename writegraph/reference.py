@@ -187,6 +187,43 @@ def _clean(value: Any, limit: int) -> str:
     return text[: max(1, limit - 1)].rstrip("，。；、 ") + "…"
 
 
+def _match_window(text: Any, terms: Sequence[str], limit: int = 240) -> str:
+    """取命中窗口，而不是块头：片段要让模型看见它命中的那句。
+
+    关键词检索的 LIKE 分支拿不到 FTS 的 snippet；如果直接截块头，命中点
+    在块后半段时模型会以为书里没有。这里选包含最多不同检索词的窗口，
+    并在命中点前留一点上下文。
+    """
+    blob = " ".join(str(text or "").split())
+    if not blob:
+        return ""
+    if len(blob) <= limit:
+        return blob
+    joined = [str(t or "").strip() for t in terms if str(t or "").strip()]
+    best_start = -1
+    best_score = -1
+    for term in joined:
+        pos = blob.find(term)
+        while pos >= 0:
+            window = blob[pos:pos + limit]
+            score = sum(1 for t in joined if t in window)
+            if score > best_score:
+                best_score = score
+                best_start = pos
+            pos = blob.find(term, pos + 1)
+    if best_start < 0:
+        best_start = 0
+    pad = min(60, limit // 4)
+    start = max(0, best_start - pad)
+    end = min(len(blob), start + limit)
+    out = blob[start:end]
+    if start > 0:
+        out = "…" + out
+    if end < len(blob):
+        out += "…"
+    return out
+
+
 def _take(items: Sequence[Mapping[str, Any]], n: int) -> list[Mapping[str, Any]]:
     seen: set[str] = set()
     out: list[Mapping[str, Any]] = []
@@ -198,6 +235,119 @@ def _take(items: Sequence[Mapping[str, Any]], n: int) -> list[Mapping[str, Any]]
         seen.add(key)
         out.append(item)
         if len(out) >= n:
+            break
+    return out
+
+
+def search_library(books_db: Path, terms: Sequence[str], *,
+                   limit: int = 6, per_term: int = 40,
+                   per_book: int = 2,
+                   book_ids: Iterable[str] | None = None
+                   ) -> list[dict[str, Any]]:
+    """跨书库找原文块：不预设参考书，先按词检索再合并打分。
+
+    与 ``recall_book`` 的区别：这里不绑定某一本参考书，用于「我现在需要
+    一个码头夜班的细节」这类一次性检索。``book_ids`` 只缩小检索范围
+    （作者说「照《X》」），不改变排序。返回的 ``excerpt`` 是命中窗口，
+    不是块头；专名纪律仍由调用方负责（只借写法与细节，不搬设定）。
+    """
+    if not Path(books_db).exists() or not terms:
+        return []
+    scope = [str(b) for b in (book_ids or []) if str(b or "").strip()]
+    scope_sql, scope_args = "", ()
+    if scope:
+        scope_sql = " AND ck.book_id IN (" + ",".join("?" for _ in scope) + ")"
+        scope_args = tuple(scope)
+    conn = _ro(Path(books_db))
+    found: dict[tuple[str, int, int], dict[str, Any]] = {}
+    try:
+        for term in list(terms)[:8]:
+            term = str(term or "").strip()
+            if len(term) < 2:
+                continue
+            rows = []
+            if len(term) >= 3:
+                # trigram 只索引 >=3 字的片段；短词直接走 LIKE。
+                try:
+                    match = '"' + term.replace('"', '""') + '"'
+                    rows = conn.execute(
+                        "SELECT ck.id, ck.book_id, b.title AS book_title,"
+                        " ck.chapter_index, ch.title AS chapter_title,"
+                        " ck.chunk_index, ck.content AS full_text"
+                        " FROM book_fts"
+                        " JOIN book_chunks ck ON book_fts.rowid = ck.rowid"
+                        " JOIN books b ON b.id = ck.book_id"
+                        " LEFT JOIN book_chapters ch"
+                        "   ON ch.book_id = ck.book_id"
+                        "  AND ch.chapter_index = ck.chapter_index"
+                        " WHERE book_fts MATCH ? AND ck.char_count >= 120"
+                        + scope_sql +
+                        " ORDER BY rank LIMIT ?",
+                        (match, *scope_args, per_term)).fetchall()
+                except sqlite3.Error:
+                    rows = []
+            if not rows:
+                rows = conn.execute(
+                    "SELECT ck.id, ck.book_id, b.title AS book_title,"
+                    " ck.chapter_index, ch.title AS chapter_title,"
+                    " ck.chunk_index, ck.content AS full_text"
+                    " FROM book_chunks ck"
+                    " JOIN books b ON b.id = ck.book_id"
+                    " LEFT JOIN book_chapters ch"
+                    "   ON ch.book_id = ck.book_id"
+                    "  AND ch.chapter_index = ck.chapter_index"
+                    " WHERE ck.char_count >= 120 AND ck.content LIKE ?"
+                    + scope_sql +
+                    " LIMIT ?",
+                    (f"%{term}%", *scope_args, per_term)).fetchall()
+            for row in rows:
+                item = dict(row)
+                key = (str(item.get("book_id") or ""),
+                       int(item.get("chapter_index") or 0),
+                       int(item.get("chunk_index") or 0))
+                old = found.get(key)
+                full = str(item.get("full_text") or "")
+                if old is None or len(full) > len(str(old.get("full_text") or "")):
+                    found[key] = item
+    finally:
+        conn.close()
+
+    scored = []
+    for item in found.values():
+        blob = str(item.get("full_text") or "")
+        item["hits"] = sum(1 for t in terms if t and t in blob)
+        scored.append(item)
+    # 候选多时要求至少命中两个词；只有一个词时保留，避免把有效结果滤光。
+    if len(scored) > 3:
+        scored = [x for x in scored if x["hits"] >= 2] or scored
+    scored.sort(key=lambda x: (-x["hits"],
+                               -len(str(x.get("full_text") or "")),
+                               str(x.get("book_title") or ""),
+                               int(x.get("chapter_index") or 0)))
+
+    out: list[dict[str, Any]] = []
+    seen: dict[str, int] = {}
+    for item in scored:
+        book_id = str(item.get("book_id") or "")
+        if seen.get(book_id, 0) >= per_book:
+            continue
+        seen[book_id] = seen.get(book_id, 0) + 1
+        full = str(item.get("full_text") or "")
+        matched = [str(t) for t in terms if t and str(t) in full]
+        out.append({
+            "chunk_id": str(item.get("id") or ""),
+            "book_id": book_id,
+            "book_title": str(item.get("book_title") or ""),
+            "chapter_index": int(item.get("chapter_index") or 0),
+            "chapter_title": str(item.get("chapter_title") or ""),
+            "chunk_index": int(item.get("chunk_index") or 0),
+            "excerpt": _match_window(full, terms, 240),
+            "hits": int(item.get("hits") or 0),
+            "matched_terms": matched,
+            "kind": "原文片段",
+            "caution": "只借写法与细节；不搬专名、设定、情节",
+        })
+        if len(out) >= max(1, int(limit)):
             break
     return out
 
@@ -243,6 +393,30 @@ def skeleton(pack: Mapping[str, Any], *, max_chars: int = 2400) -> str:
     return render(pack, max_chars=max_chars)
 
 
+def render_refs(items: Sequence[Mapping[str, Any]]) -> str:
+    """把 agent 选定的素材按**逐字原文**排成块，每条带出处。
+
+    与 ``render`` 的区别：这里不替模型挑，也不跨书合并——条目就是
+    agent 自己从检索结果里点的坐标，服务端只负责读回原文。
+    """
+    rows = [item for item in items or []
+            if str(item.get("text") or "").strip()]
+    if not rows:
+        return ""
+    lines = ["## 参考素材（逐字原文；只借观察与细节，"
+             "不得搬用设定、人名、地名、作品名）"]
+    for item in rows:
+        label = str(item.get("label") or "参考素材").strip()
+        lines.append(f"### {label}")
+        for line in str(item.get("text") or "").rstrip().splitlines():
+            lines.append("> " + line if line.strip() else ">")
+        note = str(item.get("note") or "").strip()
+        if note:
+            lines.append(f"（怎么用：{note}）")
+    body = "\n".join(lines)
+    return body if len(body) > 60 else ""
+
+
 def render_distilled(card: str, labels: Sequence[str]) -> str:
     body = (card or "").strip()
     if not body:
@@ -273,5 +447,6 @@ def leak_terms(pack: Mapping[str, Any], *, min_len: int = 2) -> list[str]:
     return sorted(out)
 
 
-__all__ = ["query_terms", "recall", "recall_book", "relevance", "render",
-           "render_distilled", "skeleton", "leak_terms"]
+__all__ = ["query_terms", "recall", "recall_book", "search_library",
+           "relevance", "render", "render_refs", "render_distilled",
+           "skeleton", "leak_terms"]

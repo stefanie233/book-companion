@@ -8,7 +8,7 @@ from aiohttp import web
 
 from api.book_helpers import _find_next_chunk, _find_prev_chunk, _get_stable_id
 from api.routes.graph import _enrich_book_metadata_async
-from services.library_service import get_book_context
+from services.library_service import _hash_file, cover_thumb_path, get_book_context, make_cover_thumb
 
 
 
@@ -225,18 +225,34 @@ async def handle_cover(request: web.Request) -> web.Response:
             break
 
     if cover_file:
+        # 书架只要 ~400px 宽的缩略图：原图动辄 1500px+/800KB，快速下滑时
+        # 下载和解码都跟不上。缩略图缺失时现生成一份（首次请求付一次
+        # 代价），生成失败就退回原图 —— 任何情况下都不能少一张封面。
+        if request.query.get("thumb") in ("1", "true", "yes"):
+            thumb = cover_thumb_path(cover_file)
+            if not thumb.exists():
+                thumb = await asyncio.to_thread(make_cover_thumb, cover_file)
+            if thumb and thumb.exists():
+                cover_file = thumb
         content_type = {
             "jpg": "image/jpeg", "jpeg": "image/jpeg",
             "png": "image/png", "gif": "image/gif",
             "webp": "image/webp", "svg": "image/svg+xml",
         }.get(cover_file.suffix.lstrip("."), "image/jpeg")
-        return web.Response(
-            body=cover_file.read_bytes(),
-            content_type=content_type,
-            # Covers are immutable per book_id — cache them so shelf
-            # re-renders (sorting, row regrouping on resize) don't
-            # re-download every image.
-            headers={"Cache-Control": "private, max-age=86400"},
+        # Covers are immutable per book_id — cache them so shelf
+        # re-renders (sorting, row regrouping on resize) don't
+        # re-download every image.
+        st = cover_file.stat()
+        # 与 FileResponse 内部生成的 etag 同格式，否则 304 协商永远对不上
+        etag = f'"{st.st_mtime_ns:x}-{st.st_size:x}"'
+        headers = {"Cache-Control": "private, max-age=604800"}
+        if request.headers.get("If-None-Match") == etag:
+            return web.Response(status=304, headers={**headers, "ETag": etag})
+        # FileResponse 把读取交给事件循环外的线程，不会在同步 read_bytes
+        # 上卡住并发的其余封面请求。
+        return web.FileResponse(
+            path=cover_file,
+            headers={"Content-Type": content_type, **headers},
         )
 
     # Fallback: generate a placeholder SVG cover
@@ -384,26 +400,40 @@ async def handle_scan_folder(request: web.Request) -> web.Response:
     mobi_files = list(folder_path.glob("*.mobi"))
     all_files = epub_files + mobi_files
 
-    # Get already-imported source paths
-    imported_paths: set[str] = set()
-    for book in db.list_books(limit=10000):
-        if book.source_path:
-            imported_paths.add(book.source_path.replace("\\", "/"))
+    # 去重键必须是文件内容指纹（book_id 就是原文件字节的 MD5），不能看
+    # source_path —— 它指向 bookbank/ 里的副本，用户扫描目录里的原路径
+    # 永远匹配不上，所以已入库的书会一直出现在待导入列表里。同名不同出版
+    # 社/译本的书内容不同 → 指纹不同 → 仍会列出，符合「不同指纹不去重」。
+    imported_ids = {b.id for b in db.list_books(limit=10000)}
 
-    # Filter to unimported only
-    unimported: list[dict] = []
-    for fp in all_files:
-        fp_str = str(fp).replace("\\", "/")
-        if fp_str in imported_paths:
-            continue
-        stat = fp.stat()
-        unimported.append({
-            "path": str(fp),
-            "name": fp.stem,
-            "format": fp.suffix.lower().lstrip("."),
-            "size_mb": round(stat.st_size / (1024 * 1024), 1),
-            "modified_at": int(stat.st_mtime),
-        })
+    def _scan_candidates() -> list[dict]:
+        """hashing 是阻塞 IO，放到线程里跑，别冻住事件循环。"""
+        rows: list[dict] = []
+        for fp in all_files:
+            if not fp.is_file():
+                continue
+            try:
+                stat = fp.stat()
+                fingerprint = _hash_file(fp)
+            except OSError:
+                # 读不了的文件仍列出，让 import 阶段给出明确报错
+                try:
+                    stat = fp.stat()
+                except OSError:
+                    continue
+                fingerprint = ""
+            if fingerprint and fingerprint in imported_ids:
+                continue
+            rows.append({
+                "path": str(fp),
+                "name": fp.stem,
+                "format": fp.suffix.lower().lstrip("."),
+                "size_mb": round(stat.st_size / (1024 * 1024), 1),
+                "modified_at": int(stat.st_mtime),
+            })
+        return rows
+
+    unimported = await asyncio.to_thread(_scan_candidates)
 
     # Sort by name
     unimported.sort(key=lambda f: f["name"].lower())
@@ -450,8 +480,9 @@ async def handle_upload_book(request: web.Request) -> web.Response:
             status=400,
         )
 
-    # Save uploaded file to a temp location in data/watch/
-    watch_dir = Path(__file__).parent / "data" / "watch"
+    # Save uploaded file to a temp location in <user>/data/watch/
+    from runtime_paths import data_path
+    watch_dir = data_path("watch")
     watch_dir.mkdir(parents=True, exist_ok=True)
 
     import uuid

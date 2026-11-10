@@ -3,3 +3,9 @@ watchdog>=3.0
 prompt_toolkit>=3.0
 rank-bm25>=0.2
 jieba>=0.42
+# 书架封面缩略图（可选：缺失时端点退回原图，只是没有提速）
+Pillow>=9.0
+
+# 桌面版原生窗口（可选：只给 packaging/ 与 desktop.py 用，Web/CLI 运行不需要）
+# pywebview>=5.0
+# pythonnet>=3.0

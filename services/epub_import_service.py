@@ -32,6 +32,7 @@ from services.library_service import (
     _now_ms,
     _paragraph_offsets,
     _title_match_score,
+    record_import_event,
     reuse_chunk_ids,
 )
 from storage.db import BookDB
@@ -439,7 +440,11 @@ def import_epub_with_split(
                     label, index=ch_idx, total=len(chapters_raw),
                     structural_type=spine_type,
                 ),
-                spine_index=spine_idx,
+                # 落库坐标必须与渲染器一致：epub.js 的 sectionIndex 是 OPF
+                # itemref 的原始序号（封面/目录也计数），而 reader 内部的
+                # spine_idx 跳过了那些项。直接用 spine_idx 会让 sync 的
+                # 结构定章整体错位（决策 145）。
+                spine_index=reader.opf_spine_index(spine_idx),
                 level=depth,
                 parent_index=parent_index,
                 heading_tag=heading_tag,
@@ -514,6 +519,21 @@ def import_epub_with_split(
         db.insert_book(book_row)
         db.insert_chapters(chapter_rows)
         db.insert_chunks(chunk_rows)
+
+        # 生命周期日志：结构化切分是第二个入库路径（主 agent 的 epub_import /
+        # 重导脚本），不记一笔的话，从这条路径进来的书在日志里完全缺席。
+        record_import_event(
+            db, book_row,
+            source_filename=source.name,
+            metadata={
+                "title": title,
+                "author": author,
+                "publisher": metadata.get("publisher"),
+                "publish_year": metadata.get("date"),
+                "isbn": metadata.get("identifier"),
+            },
+            chapters_raw=[(ch.title or "", ch.content or "") for ch in chapter_rows],
+        )
 
         return book_row, True
 

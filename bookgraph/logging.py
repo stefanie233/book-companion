@@ -16,7 +16,6 @@ extraction pipeline.
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
 from pathlib import Path
@@ -26,11 +25,15 @@ import usage_log
 
 log = logging.getLogger("bookgraph")
 
-# JSONL rotation threshold — rename to bookgraph-{ts}.jsonl when exceeded
-_JSONL_ROTATE_BYTES = 50 * 1024 * 1024
+# 轮转与保留：10MB x 3 份。这个文件只做「快速扫一眼 + 回填用量」，
+# 全文本来就在 graph.db 的 graph_llm_logs 里（决策 147）。
+_JSONL_ROTATE_BYTES = 10 * 1024 * 1024
+_JSONL_BACKUP_COUNT = 3
 
-_PROMPT_PREVIEW_CHARS = 2000
-_RESPONSE_PREVIEW_CHARS = 1000
+# 预览只是给 JSONL 一个肉眼可读的抓手，2000/1000 字符让每行平均 5.3KB，
+# 与 DB 全文重复；缩到 600/400 后整条审计链仍然可查（hash 齐全）。
+_PROMPT_PREVIEW_CHARS = 600
+_RESPONSE_PREVIEW_CHARS = 400
 
 
 def _sha256(text: str) -> str:
@@ -43,22 +46,12 @@ def _preview(text: str, n: int) -> str:
     return text[:n]
 
 
-def _rotate_if_needed(path: Path) -> None:
-    """Rename an oversized JSONL to bookgraph-{ts}.jsonl before appending."""
-    try:
-        if path.exists() and path.stat().st_size > _JSONL_ROTATE_BYTES:
-            ts = time.strftime("%Y%m%d-%H%M%S")
-            path.rename(path.with_name(f"bookgraph-{ts}.jsonl"))
-    except OSError:
-        pass  # rotation is best-effort
-
-
 def _append_jsonl(path: Path, obj: dict) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _rotate_if_needed(path)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        from log_lifecycle import append_jsonl
+        if not append_jsonl(path, obj, max_bytes=_JSONL_ROTATE_BYTES,
+                            backup_count=_JSONL_BACKUP_COUNT):
+            log.warning("bookgraph JSONL append failed")
     except Exception:
         log.warning("bookgraph JSONL append failed", exc_info=True)
 

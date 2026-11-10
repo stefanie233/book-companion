@@ -119,11 +119,11 @@ def render_conversation_tail(session, max_messages: int = 12) -> str:
         if msg.role == "user":
             text = _first_text_block(msg)
             if text:
-                lines.append(f"  书伴> {text}")
+                lines.append(f"  留白> {text}")
         elif msg.role == "assistant":
             text = _first_text_block(msg)
             if text:
-                lines.append(f"  书伴  >")
+                lines.append(f"  留白  >")
                 for p in text.split("\n"):
                     lines.append(f"    {p}")
         elif msg.role == "tool":

@@ -14,7 +14,33 @@
 """
 from __future__ import annotations
 
+import time
+from datetime import datetime
 from typing import Any
+
+_WEEKDAYS = "一二三四五六日"
+
+
+def format_input_time(ts_ms: int | float | None = None) -> str:
+    """毫秒时间戳 → 本地可读时间（周几 + UTC 偏移）。
+
+    换算交给代码做，模型不必再从 epoch 或 UTC 自己推当地日期——
+    跨天/跨时区判断最容易在这类换算上出错。
+    """
+    seconds = (float(ts_ms) / 1000.0) if ts_ms else time.time()
+    dt = datetime.fromtimestamp(seconds).astimezone()
+    offset = dt.strftime("%z")
+    tz = (f"UTC{offset[:3]}:{offset[3:]}" if len(offset) == 5 else "本地")
+    return (f"（输入时间：{dt:%Y-%m-%d %H:%M} "
+            f"周{_WEEKDAYS[dt.weekday()]} {tz}）")
+
+
+def with_input_time(text: str, ts_ms: int | float | None = None) -> str:
+    """把输入时间挂到这条 user 消息后面；空文本原样返回。"""
+    body = str(text or "").rstrip()
+    if not body:
+        return body
+    return f"{body}\n\n{format_input_time(ts_ms)}"
 
 # ── Budget ────────────────────────────────────────────────────────────
 # 历史默认最多 24K tokens；窗口更小时按窗口的 50% 收窄。
@@ -149,7 +175,12 @@ def session_messages_to_api(messages: list) -> list[dict]:
         if role == "user":
             text = "\n\n".join(notes + texts).strip()
             if text:
-                out.append({"role": "user", "content": text})
+                # 历史里的每条 user 消息也带发送时间：回看时模型能直接
+                # 读到「这句是几点说的」，不用自己换算。没有时间戳的
+                # 旧消息不补当前时间——那会把「没记录」伪装成「刚说的」。
+                ts = int(getattr(m, "time_created", 0) or 0)
+                content = with_input_time(text, ts) if ts else text
+                out.append({"role": "user", "content": content})
         elif role == "assistant":
             calls = [
                 {

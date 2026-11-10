@@ -177,12 +177,19 @@ def _post(url: str, payload: dict) -> None:
         r.read()
 
 
-async def _drive(base: str, db: BookDB, gdb: GraphDB) -> dict:
+async def _drive(base: str, db: BookDB, gdb: GraphDB, project_dir: Path) -> dict:
     from config import Config
     cfg = Config()
     cfg.api_base = base
     cfg.api_key = "fake"
     cfg.model = "fake-model"
+    # 测试绝不能写生产审计链（决策 147）：orchestrator 的 JSONL 路径、
+    # usage_log 的归属都从 project_dir 推导。config.project_dir 默认是
+    # cwd，而 check_all 从仓库根跑 —— 不隔离时 sb-e2e 会占掉
+    # data/logs/bookgraph.jsonl 的一半，fake-model 也会混进用量统计。
+    cfg.project_dir = project_dir
+    import usage_log
+    usage_log.init_for_tests(project_dir / "sessions.db")
     events: list[dict] = []
     orch = GraphOrchestrator(cfg, db, gdb, Path("x"))
     res = await orch.run(BOOK_ID, batch_size=5, progress_cb=events.append,
@@ -217,7 +224,7 @@ def main() -> int:
             gdb = GraphDB(Path(tmp) / "graph.db")
             _seed(db)
             try:
-                out = asyncio.run(_drive(base, db, gdb))
+                out = asyncio.run(_drive(base, db, gdb, Path(tmp)))
             except Exception:
                 import traceback
                 traceback.print_exc()
@@ -240,12 +247,20 @@ def main() -> int:
                 " AND NOT EXISTS(SELECT 1 FROM graph_observations o "
                 "                WHERE o.node_id=n.id)", (BOOK_ID,)).fetchone()[0], 0)
 
-            check("边的逐字原文落库", conn.execute(
-                "SELECT evidence_text FROM edges WHERE project_id=?",
-                (BOOK_ID,)).fetchone()[0], "她侍弄的那些花都死了")
-            check("观察的逐字原文落库", conn.execute(
-                "SELECT evidence_text FROM graph_observations WHERE project_id=?",
-                (BOOK_ID,)).fetchone()[0], "母亲喜欢花")
+            # 两批的落库顺序由异步完成顺序决定，fetchone() 不能假定 k1
+            # 先到；按锚点块取，顺带把两批的逐字原文都钉住。
+            edge_ev = {r[0]: r[1] for r in conn.execute(
+                "SELECT chunk_id, evidence_text FROM edges WHERE project_id=?",
+                (BOOK_ID,))}
+            check("边的逐字原文落库",
+                  (edge_ev.get("k1"), edge_ev.get("k2")),
+                  ("她侍弄的那些花都死了", "实际上就是地坛"))
+            obs_ev = {r[0]: r[1] for r in conn.execute(
+                "SELECT evidence, evidence_text FROM graph_observations "
+                "WHERE project_id=?", (BOOK_ID,))}
+            check("观察的逐字原文落库",
+                  (obs_ev.get("k1"), obs_ev.get("k2")),
+                  ("母亲喜欢花", "一座废弃的古园"))
 
             # 每条引文锚在**它自己**那一块 —— 两批各一块，不能都挤到 k1
             q = conn.execute("SELECT chunk_id, batch_id FROM graph_quotes "
@@ -284,7 +299,7 @@ def main() -> int:
             db.initialize()
             gdb = GraphDB(Path(tmp) / "graph.db")
             _seed(db)
-            out = asyncio.run(_drive(base, db, gdb))
+            out = asyncio.run(_drive(base, db, gdb, Path(tmp)))
             conn = gdb.get_conn()
             bad = [e for e in out["events"] if e.get("type") == "batch_unverified"]
             # **孤儿现在是提示项，不是阻塞项。** 落库层按构造丢弃孤儿

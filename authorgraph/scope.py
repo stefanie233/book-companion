@@ -32,6 +32,15 @@ CANDIDATE_TYPES = ("preface", "postscript")
 #: 不静默跳过 —— 报出来，让上游知道这本书**为什么**没采。
 MIN_CANDIDATE_CHARS = 200
 
+#: 标题里带这些词的章不是「正文叙事」，即使导入分析把它们标成了 body。
+#: 模型攻略可以用 ``#chapter:<标题原词>`` 单独点名，正文抽样则跳过，
+#: 免得把自序/年表当成小说正文均匀抽样。
+_MATTER_TITLES = ("自序", "代序", "译者序", "编者序", "序言", "前言",
+                  "后记", "附录", "年表", "致辞", "译后", "编者",
+                  "出版说明", "目录", "献词", "题记")
+#: 单独一个「序/跋」也算前置/后置材料；「序章」「序曲」是正文，不能误伤。
+_MATTER_EXACT = ("序", "跋")
+
 
 def book_identity(db: Any, book_id: str) -> dict[str, Any]:
     """这本书是谁署名的 —— 采集的输入之一。
@@ -115,6 +124,117 @@ def candidate_chunks(db: Any, book_id: str, *,
             f"序跋合计只有 {used} 字（< {MIN_CANDIDATE_CHARS}），"
             f"多半是书名页/版权页被误分类 —— 不值得跑一次调用"]
     return out, warnings
+
+
+def body_sample_chunks(db: Any, book_id: str, *, max_chars: int = 60_000,
+                       max_chapters: int = 8) -> tuple[list[dict[str, Any]],
+                                                       list[str]]:
+    """正文的**确定性抽样**（给自传体投射用）。
+
+    不扫整本：一本书几十万字，逐章找「现实投影」是针尖上找针，误报还多。
+    只跨章取样本，每章取第一块足够长的正文；**有没有料由模型判，取哪些
+    由结构定**（与声音抽样的纪律同一条）。
+
+    调用方必须先确认用户标记了 ``read_as=autobiographical`` 或身份/攻略
+    允许 —— 本函数只负责取样，不负责放行。
+    """
+    warnings: list[str] = []
+    conn = db.get_conn()
+    try:
+        chapters = conn.execute(
+            "SELECT chapter_index, title, chapter_type FROM book_chapters"
+            " WHERE book_id=? AND chapter_type NOT IN ('preface','postscript')"
+            " ORDER BY chapter_index", (book_id,)).fetchall()
+    except Exception as exc:                            # noqa: BLE001
+        return [], [f"读 book_chapters 失败：{exc}"]
+
+    def _is_matter(title: str) -> bool:
+        t = (title or "").strip()
+        return (t in _MATTER_EXACT
+                or any(k in t for k in _MATTER_TITLES))
+
+    chapters = [c for c in chapters if not _is_matter(c["title"])]
+    if not chapters:
+        return [], ["这本书没有可抽样的正文章"]
+    step = max(1, len(chapters) // max(1, max_chapters))
+    picked = list(chapters)[::step][:max_chapters]
+    out: list[dict[str, Any]] = []
+    used = 0
+    for ch in picked:
+        rows = conn.execute(
+            "SELECT id, chunk_index, content FROM book_chunks"
+            " WHERE book_id=? AND chapter_index=? ORDER BY chunk_index",
+            (book_id, ch["chapter_index"])).fetchall()
+        row = next((r for r in rows if len(r["content"] or "") >= 200),
+                   rows[0] if rows else None)
+        if row is None:
+            continue
+        text = row["content"] or ""
+        if used + len(text) > max_chars:
+            warnings.append(f"正文预算 {max_chars} 字用尽，后面的章未纳入")
+            break
+        used += len(text)
+        out.append({
+            "chunk_id": row["id"], "chapter_index": ch["chapter_index"],
+            "chunk_index": row["chunk_index"],
+            "chapter_title": ch["title"] or "",
+            "chapter_type": ch["chapter_type"] or "body", "text": text,
+        })
+    if not out:
+        warnings.append("正文抽样没有取到块")
+    return out, warnings
+
+
+def chunks_by_title(db: Any, book_id: str, keyword: str, *,
+                    max_chars: int = 60_000,
+                    max_chapters: int = 3) -> tuple[list[dict[str, Any]],
+                                                    list[str]]:
+    """按章标题取块 —— 给模型攻略点名的「美国版自序/附录/年表」。
+
+    为什么需要它：导入分析只按结构判 ``preface/body``，误分类很常见
+    （实测《局外人》的美国版自序、诺奖致辞都落在 ``body``）。模型看目录
+    能认出「这一章值得读」，但 ``#body`` 只会均匀抽样，正好跳过它。
+
+    只认标题里出现的原词；关键字为空或没有匹配就返回空 + 原因。
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return [], ["chapter 目标缺标题关键词"]
+    esc = (kw.replace("\\", "\\\\").replace("%", "\\%")
+           .replace("_", "\\_"))
+    conn = db.get_conn()
+    try:
+        chapters = conn.execute(
+            "SELECT chapter_index, title, chapter_type FROM book_chapters"
+            " WHERE book_id=? AND title LIKE ? ESCAPE '\\'"
+            " ORDER BY chapter_index", (book_id, f"%{esc}%")).fetchall()
+    except Exception as exc:                            # noqa: BLE001
+        return [], [f"按标题读 chapters 失败：{exc}"]
+    if not chapters:
+        return [], [f"没有标题含 {kw!r} 的章"]
+    out: list[dict[str, Any]] = []
+    used = 0
+    for ch in chapters[:max(1, max_chapters)]:
+        rows = conn.execute(
+            "SELECT id, chunk_index, content FROM book_chunks"
+            " WHERE book_id=? AND chapter_index=? ORDER BY chunk_index",
+            (book_id, ch["chapter_index"])).fetchall()
+        for row in rows:
+            text = row["content"] or ""
+            if not text:
+                continue
+            if used + len(text) > max_chars:
+                return out, [f"标题匹配章的字数超过预算 {max_chars}，后面截断"]
+            used += len(text)
+            out.append({
+                "chunk_id": row["id"], "chapter_index": ch["chapter_index"],
+                "chunk_index": row["chunk_index"],
+                "chapter_title": ch["title"] or "",
+                "chapter_type": ch["chapter_type"] or "body", "text": text,
+            })
+    if not out:
+        return [], [f"标题含 {kw!r} 的章没有正文块"]
+    return out, []
 
 
 def evidence_chunks(db: Any, book_id: str) -> dict[str, str]:

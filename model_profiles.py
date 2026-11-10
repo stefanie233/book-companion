@@ -212,9 +212,10 @@ def get_profiles_store(config: object = None) -> ModelProfileStore:
     if config is not None and hasattr(config, "model_profiles_path"):
         path = config.model_profiles_path
     if _store is None or (path is not None and _store.path != path):
-        _store = ModelProfileStore(path or (
-            Path(__file__).parent / "data" / "config" / "model_profiles.json"
-        ))
+        if path is None:
+            from runtime_paths import data_path
+            path = data_path("config", "model_profiles.json")
+        _store = ModelProfileStore(path)
     return _store
 
 

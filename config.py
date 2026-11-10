@@ -8,12 +8,25 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _default_user_root() -> Path:
+    from runtime_paths import user_root
+    return user_root()
+
+
 @dataclass
 class Config:
     """Typed configuration loaded from environment and settings file."""
     api_key: str = ""
     api_base: str = "https://api.openai.com/v1"
     model: str = "gpt-4o"
+    # Agent 对外称呼（主题页可改）。只影响界面与提示词里的“你叫 X”，
+    # 人格与文风仍由 SOUL.md 决定。
+    agent_name: str = "留白"
+    # 用户自己的称呼（设置页可改）。空 = 不注入提示词；头像单独存在 data/user。
+    user_name: str = ""
+    # 用户性别（设置页可改）："" 未设置 / "male" / "female"。
+    # 只决定第三人称用「他 / 她 / ta」，不影响人格与文风。
+    user_gender: str = ""
     refinement_model: str = ""  # Model for refinement pipeline (defaults to model if empty)
     search_api_key: str = ""
     # 原生联网搜索的 Anthropic 兼容端点（如 https://api.deepseek.com/anthropic）。
@@ -35,7 +48,11 @@ class Config:
     # 书源卸货区默认路径（为空 = 未配置，前端引导输入）。.env 的
     # BOOK_COMPANION_SCAN_FOLDER 优先于 settings.json 的 scan_folder。
     scan_folder: str = ""
-    project_dir: Path = field(default_factory=Path.cwd)
+    # 用户根（可写）：data/、SOUL.md、settings.json、.env。源码运行时是仓库根，
+    # 冻结后是 %LOCALAPPDATA%\LiuBai（或 BC_HOME / 便携目录）。
+    project_dir: Path = field(default_factory=_default_user_root)
+    # 程序根（只读）：skills/ prompts/ 等随安装包替换的资源。源码运行时 = 仓库根。
+    resource_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent)
     max_iterations: int = 50
     compact_preserve_recent: int = 4
     compact_max_tokens: int = 10_000
@@ -80,7 +97,8 @@ class Config:
 
     @property
     def skills_dir(self) -> Path:
-        return self.project_dir / "skills"
+        # 技能是随版本发布的资源（含 Python 模块），不是用户数据。
+        return self.resource_dir / "skills"
 
     @property
     def books_db_path(self) -> Path:
@@ -112,9 +130,21 @@ class Config:
 
 
 def _find_dotenv(project_dir: Path) -> Path | None:
-    """Find .env file, checking project dir then cwd."""
-    candidates = [project_dir / ".env", Path.cwd() / ".env"]
+    """Find .env file: 用户根 → cwd → 程序根（源码运行与安装后都覆盖）。"""
+    candidates = [
+        project_dir / ".env",
+        Path.cwd() / ".env",
+        Path(__file__).resolve().parent / ".env",
+    ]
+    seen: set[Path] = set()
     for p in candidates:
+        try:
+            key = p.resolve()
+        except OSError:
+            key = p
+        if key in seen:
+            continue
+        seen.add(key)
         if p.exists():
             return p
     return None
@@ -145,8 +175,16 @@ def _load_settings(path: Path) -> dict:
 
 
 def load_config(project_dir: Path | None = None) -> Config:
-    """Load configuration from .env and settings.json."""
-    project_dir = (project_dir or Path.cwd()).resolve()
+    """Load configuration from .env and settings.json.
+
+    ``project_dir`` 是**用户根**（可写数据）。不传时取 ``runtime_paths.user_root()``：
+    源码运行 = 仓库根（与旧的 cwd 行为一致，除非从别的目录启动）；冻结后 =
+    ``%LOCALAPPDATA%\\LiuBai``。程序根另行解析，技能等资源不受用户根影响。
+    测试仍可显式传临时目录。
+    """
+    from runtime_paths import code_root, user_root
+
+    project_dir = (project_dir or user_root()).resolve()
 
     # Load .env
     env_path = _find_dotenv(project_dir)
@@ -160,6 +198,9 @@ def load_config(project_dir: Path | None = None) -> Config:
         api_key=env.get("BOOK_COMPANION_API_KEY", env.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))),
         api_base=env.get("BOOK_COMPANION_API_BASE", env.get("OPENAI_API_BASE", "https://api.openai.com/v1")),
         model=env.get("BOOK_COMPANION_MODEL", settings.get("model", "gpt-4o")),
+        agent_name=str(settings.get("agent_name") or "留白").strip(),
+        user_name=str(settings.get("user_name") or "").strip(),
+        user_gender=str(settings.get("user_gender") or "").strip().lower(),
         refinement_model=env.get("REFINEMENT_MODEL", settings.get("refinement_model", "")),
         search_api_key=env.get("BOOK_COMPANION_SEARCH_API_KEY", ""),
         native_search_base=env.get("BOOK_COMPANION_NATIVE_SEARCH_BASE", ""),
@@ -170,6 +211,7 @@ def load_config(project_dir: Path | None = None) -> Config:
         tts_api_key=env.get("MIMO_API_KEY", ""),
         tts_api_base=env.get("MIMO_API_BASE", ""),
         project_dir=project_dir,
+        resource_dir=code_root(),
         max_iterations=settings.get("max_iterations", 50),
         compact_preserve_recent=settings.get("compact", {}).get("preserve_recent_messages", 4),
         compact_max_tokens=settings.get("compact", {}).get("max_estimated_tokens", 10_000),
@@ -182,10 +224,35 @@ def load_config(project_dir: Path | None = None) -> Config:
     )
 
 
+def _read_settings_dict(config: Config) -> dict:
+    """Read settings.json, preserving fields Config doesn't model."""
+    if not config.settings_path.exists():
+        return {}
+    try:
+        loaded = json.loads(config.settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _write_settings_dict(config: Config, settings: dict) -> None:
+    tmp = config.settings_path.with_name(config.settings_path.name + ".tmp")
+    tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(config.settings_path)
+
+
 def save_settings(config: Config) -> None:
-    """Persist mutable settings back to settings.json."""
-    settings = {
+    """Persist mutable settings back to settings.json.
+
+    在原文件上增量更新，不整份重写 —— settings.json 里还有 scan_folder /
+    refinement_model / graph 等不归 Config 管理的字段，整份重写会静默丢掉。
+    """
+    settings = _read_settings_dict(config)
+    settings.update({
         "model": config.model,
+        "agent_name": config.agent_name,
+        "user_name": config.user_name,
+        "user_gender": config.user_gender,
         "max_iterations": config.max_iterations,
         "compact": {
             "preserve_recent_messages": config.compact_preserve_recent,
@@ -196,5 +263,18 @@ def save_settings(config: Config) -> None:
             "char_limit": config.memory_char_limit,
             "user_char_limit": config.user_memory_char_limit,
         },
-    }
-    config.settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False), encoding="utf-8")
+    })
+    _write_settings_dict(config, settings)
+
+
+def update_settings(config: Config, /, **updates) -> None:
+    """Patch only the named keys — never re-persist environment-derived values.
+
+    ``save_settings`` writes ``config.model``, which may have come from
+    ``BOOK_COMPANION_MODEL`` rather than settings.json. A UI action that only
+    changes one field (e.g. the agent name) must not silently freeze that env
+    override into the file.
+    """
+    settings = _read_settings_dict(config)
+    settings.update(updates)
+    _write_settings_dict(config, settings)

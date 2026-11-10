@@ -160,7 +160,7 @@ def _register_graph_tools(registry: ToolRegistry) -> None:
     # ── BookGraph: context query (PRIMARY, DIRECT) ─────────────────────
     # Composes search + node + baked trace. One call gives the LLM a
     # focused subgraph so it doesn't need to chain graph_node/trace.
-    # Mirrors codegraph's context tool (always-loaded, bakes trace in).
+    # Always-loaded context tool that bakes the trace in.
 
     def _tool_graph_context(question: str) -> str:
         """Answer a natural-language question using the knowledge graph."""

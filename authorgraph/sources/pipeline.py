@@ -152,10 +152,26 @@ async def enrich_author(session: aiohttp.ClientSession, cfg: Any,
                         facets: list[str] | None = None,
                         max_queries: int = 6, max_pages: int = 12,
                         per_query: int = 8, force: bool = False,
+                        search_fn: Callable[..., Any] | None = None,
+                        fetch_fn: Callable[..., Any] | None = None,
                         log_cb: Callable[[dict], None] | None = None
                         ) -> dict[str, Any]:
-    """补一位作者。返回 manifest（含旧 ``enrich_life`` 的兼容键）。"""
+    """补一位作者。返回 manifest（含旧 ``enrich_life`` 的兼容键）。
+
+    联网通道可注入：不传时先 ``resolve()`` 一条 DeepSeek 连接（主模型可能
+    不是 DeepSeek），找到就走 Search/Fetch，否则回退原有的原生搜索 +
+    本地抓页。两条通道产出的 page 形状一致，验证层不变。
+    """
     m = _new_manifest(author)
+    if search_fn is None or fetch_fn is None:
+        from authorgraph.sources.web_deepseek import provider, resolve
+        prov = provider(resolve(cfg))
+        if prov:
+            search_fn, fetch_fn = prov
+            m["web_provider"] = "deepseek"
+        else:
+            search_fn, fetch_fn = web_search, fetch_page
+            m["web_provider"] = "native"
     aid = (author.get("author_id") or "").strip()
     if not aid:
         m["status"] = "error"
@@ -195,8 +211,8 @@ async def enrich_author(session: aiohttp.ClientSession, cfg: Any,
             m["budget_exhausted"] = True
             break
         try:
-            found = await web_search(session, cfg, q["query"],
-                                     max_results=per_query)
+            found = await search_fn(session, cfg, q["query"],
+                                    max_results=per_query)
         except Exception as exc:                      # noqa: BLE001
             m["failures"].append(f"search_failed:{q['facet']}:{exc}")
             continue
@@ -224,7 +240,7 @@ async def enrich_author(session: aiohttp.ClientSession, cfg: Any,
                 m["failures"].append(f"cached:{cu}")
                 continue
             m["fetch_attempts"] += 1
-            page = await fetch_page(session, url)
+            page = await fetch_fn(session, url)
             kind = source_kind_of(url)
             roles = roles_of(kind, tier)
             if page.get("status") != "ok":

@@ -6,7 +6,8 @@ share the same ``ToolRegistry`` — the difference is which toolsets are
 enabled for each.
 
 To add a new sub-agent type, add entries to ``SUBAGENT_TOOLSETS`` and
-``SUBAGENT_SYSTEM_PROMPT``.
+``SUBAGENT_SYSTEM_PROMPT``; if the type must see only a named subset of its
+toolsets, also add it to ``SUBAGENT_INCLUDE_TOOLS``.
 """
 
 from __future__ import annotations
@@ -69,6 +70,13 @@ SUBAGENT_TOOLSETS: dict[str, list[str]] = {
         "author_graph",
         "knowledge",
     ],
+    # 写作的**素材侦察兵**：主 agent 写某一章前，把「去书库/素材库找几条
+    # 能借的原文」这一趟丢给它，自己只拿回坐标。整个 writing toolset 里
+    # 只放行 writing_research —— 改稿、结算、交稿都不该发生在子代理里
+    # （见 SUBAGENT_INCLUDE_TOOLS）。
+    "writing_researcher": [
+        "writing",
+    ],
     # v2:
     # "analyst": [
     #     "file_reading", "library_query", "knowledge",
@@ -79,6 +87,14 @@ SUBAGENT_TOOLSETS: dict[str, list[str]] = {
     # "general": None,  # None = all non-context-creating tools
 }
 # fmt: on
+
+# Toolset 级白名单之外再收一刀：某些子代理只需要 toolset 里的一两个工具。
+# writing_researcher 尤其如此 —— 写作工具全部注册在同一个 toolset 下，
+# 按 toolset 过滤会把 writing_draft_chapter / writing_settle 一起带进去。
+# None = 不做名称白名单（沿用 toolset 结果）。
+SUBAGENT_INCLUDE_TOOLS: dict[str, set[str]] = {
+    "writing_researcher": {"writing_research"},
+}
 
 # Toolsets whose tools are DEFERRED for the **main** agent (hidden from the
 # per-turn tools payload, discoverable via tool_search) but must be DIRECT
@@ -114,6 +130,9 @@ SUBAGENT_MAX_ITERATIONS: dict[str, int] = {
     # 的结论会长得多（实测窄门 4994 → 20595 字符）。曾经给 16，第 2 轮用满
     # 预算还没吐结论就被截断，导致「假收敛」（见 import_analysis_service）。
     "book_verifier": 24,
+    # 每次检索 = 一次工具调用 + 一次判读。默认 8 够用，但「几条不同的素材
+    # 方向」常见 4–6 次检索，留出收尾轮。
+    "writing_researcher": 12,
 }
 SUBAGENT_DEFAULT_MAX_ITERATIONS = 8
 
@@ -173,6 +192,16 @@ SUBAGENT_SYSTEM_PROMPT: dict[str, str] = {
         "你在补一位作者的材料。先调 author_lookup 看台账里已经有什么，"
         "再用 web_search 补缺的部分。**每条要落库的条目必须带网址**，"
         "网址只能来自你这次真的搜到的结果。按 JSON 输出。\n\n任务：{description}",
+    ),
+    "writing_researcher": load_prompt(
+        "writing_researcher",
+        # 兜底：模板缺失时仍给出最小可用指令
+        "你在为一次写作检索参考素材。你只有一个工具 writing_research："
+        "按任务拆成几次检索，把结果里**真实出现过的坐标**（book_id + "
+        "chapter_index + chunk_index，或 material_id / path）收进 refs，"
+        "每条配一句 note 说明可以借什么。不要编坐标，不要写正文。"
+        "最后只输出一个 JSON 对象："
+        '{"refs": [...], "notes": "一句话"}。\n\n任务：{description}',
     ),
     # v2:
     # "analyst": (

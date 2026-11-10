@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Any
 from permissions import PermissionMode
 from tools.registry import ToolRegistry, ToolSpec, ToolExposure
@@ -504,6 +505,107 @@ def _register_library_tools(registry: ToolRegistry, db: Any, api_client: Any = N
         permission_mode=PermissionMode.READ_ONLY,
     ))
 
+    def _tool_library_event_log(event_type: str = "", book_id: str = "",
+                                 stable_book_id: str = "", q: str = "",
+                                 limit: int = 20, offset: int = 0) -> str:
+        """Read the book library lifecycle log (import/delete events)."""
+        try:
+            limit = max(1, min(int(limit), 200))
+            offset = max(int(offset), 0)
+            et = event_type.strip().lower()
+            if et not in ("", "import", "delete"):
+                return json.dumps({
+                    "error": "event_type must be 'import' or 'delete' (empty = all)",
+                })
+
+            rows, total = db.list_import_log_events(
+                event_type=et or None,
+                book_id=book_id.strip() or None,
+                stable_book_id=stable_book_id.strip() or None,
+                q=q.strip() or None,
+                limit=limit,
+                offset=offset,
+            )
+            in_library = len(db.list_books(limit=10000))
+
+            lines = [f"📚 书籍在库日志（共 {total} 条，当前在库 {in_library} 本）", ""]
+            if not rows:
+                lines.append("(没有匹配的入库/删除记录)")
+                return "\n".join(lines)
+
+            for r in rows:
+                when = datetime.fromtimestamp(
+                    r.time_created / 1000
+                ).strftime("%Y-%m-%d %H:%M")
+                action = {"import": "入库", "delete": "删除"}.get(
+                    r.event_type, r.event_type)
+                line = f"[{when}] {action} 《{r.title}》"
+                if r.author:
+                    line += f" — {r.author}"
+                line += f"  book_id={r.book_id or '?'}"
+                if r.stable_book_id:
+                    line += f"  stable={r.stable_book_id}"
+                if r.event_type == "delete" and r.import_count:
+                    line += f"  (删除前累计入库 {r.import_count} 次)"
+                elif r.event_type == "import" and r.import_count > 1:
+                    line += f"  (第 {r.import_count} 次入库)"
+                lines.append(line)
+
+            end = offset + len(rows)
+            if end < total:
+                lines.append(f"\n…还有 {total - end} 条，用 offset={end} 继续")
+            return "\n".join(lines)
+        except Exception as exc:
+            return json.dumps({"error": f"Read event log failed: {exc}"})
+
+    registry.register(ToolSpec(
+        name="library_event_log",
+        category="book",
+        toolset="library_query",
+        exposure=ToolExposure.DEFERRED,
+        description=(
+            "Read the book library lifecycle log — every import (including "
+            "re-imports) and delete, newest first. Use it to answer when a "
+            "book entered or was removed from the library, whether it was "
+            "re-imported, or which books were deleted. Filter by event_type, "
+            "book_id, stable_book_id, or q (title/author/filename). Entries "
+            "for deleted books keep their title and stable id even though the "
+            "book row is gone."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "event_type": {
+                    "type": "string",
+                    "enum": ["", "import", "delete"],
+                    "description": "Filter by action (default: all)",
+                },
+                "book_id": {
+                    "type": "string",
+                    "description": "Filter by book ID (content hash)",
+                },
+                "stable_book_id": {
+                    "type": "string",
+                    "description": "Filter by stable book identity (survives re-imports/deletes)",
+                },
+                "q": {
+                    "type": "string",
+                    "description": "Substring match on title, author, or source filename",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Page size (default 20, max 200)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Pagination offset (default 0)",
+                },
+            },
+        },
+        execute=_tool_library_event_log,
+        permission_mode=PermissionMode.READ_ONLY,
+    ))
+
     registry.register(ToolSpec(
         name="library_read",
         category="book",
@@ -642,6 +744,141 @@ def _register_library_tools(registry: ToolRegistry, db: Any, api_client: Any = N
             "required": ["query"],
         },
         execute=_tool_annotation_search,
+        permission_mode=PermissionMode.READ_ONLY,
+    ))
+
+    def _clip(text: str, n: int = 50) -> str:
+        flat = " ".join((text or "").split())
+        return flat[:n] + ("…" if len(flat) > n else "")
+
+    def _tool_annotation_event_log(event_type: str = "",
+                                    annotation_type: str = "",
+                                    book_id: str = "",
+                                    stable_book_id: str = "",
+                                    q: str = "", limit: int = 20,
+                                    offset: int = 0) -> str:
+        """Read the append-only note/highlight journal (create/update/delete)."""
+        try:
+            limit = max(1, min(int(limit), 200))
+            offset = max(int(offset), 0)
+            et = event_type.strip().lower()
+            if et not in ("", "create", "update", "delete"):
+                return json.dumps({
+                    "error": "event_type must be 'create', 'update' or 'delete'",
+                })
+            at = annotation_type.strip().lower()
+            if at not in ("", "highlight", "note", "both"):
+                return json.dumps({
+                    "error": "annotation_type must be 'highlight' or 'note'",
+                })
+
+            rows, total = db.list_annotation_events(
+                event_type=et or None,
+                annotation_type=at or None,
+                book_id=book_id.strip() or None,
+                stable_book_id=stable_book_id.strip() or None,
+                q=q.strip() or None,
+                limit=limit,
+                offset=offset,
+            )
+
+            lines = [f"📝 笔记/收藏变更日志（共 {total} 条）", ""]
+            if not rows:
+                lines.append("(没有匹配的变更记录)")
+                return "\n".join(lines)
+
+            action_label = {"create": "新建", "update": "修改", "delete": "删除"}
+            kind_label = {"highlight": "收藏", "note": "笔记", "both": "笔记+收藏"}
+            field_label = {
+                "note_text": "笔记正文", "note_format": "笔记格式",
+                "color": "颜色", "type": "类型", "style": "样式",
+                "cfi_range": "位置",
+            }
+
+            for r in rows:
+                when = datetime.fromtimestamp(
+                    r.time_created / 1000
+                ).strftime("%Y-%m-%d %H:%M")
+                action = action_label.get(r.event_type, r.event_type)
+                kind = kind_label.get(r.annotation_type, r.annotation_type or "批注")
+                title = r.book_title or r.book_id or "?"
+                line = f"[{when}] {action}{kind} 《{title}》"
+                if r.chapter_index is not None:
+                    line += f" 第 {r.chapter_index + 1} 章"
+                if r.chunk_index is not None:
+                    line += f" · 块 {r.chunk_index + 1}"
+
+                if r.event_type == "update":
+                    try:
+                        names = json.loads(r.changed_fields or "[]")
+                    except (ValueError, TypeError):
+                        names = []
+                    labels = [field_label.get(n, n) for n in names]
+                    line += ("  改动：" + "、".join(labels) if labels
+                             else "  （历史回填，改动字段未记录）")
+                if r.note_text:
+                    line += f"  笔记：{_clip(r.note_text)}"
+                if r.selected_text:
+                    line += f"  原文：“{_clip(r.selected_text)}”"
+                lines.append(line)
+
+            end = offset + len(rows)
+            if end < total:
+                lines.append(f"\n…还有 {total - end} 条，用 offset={end} 继续")
+            return "\n".join(lines)
+        except Exception as exc:
+            return json.dumps({"error": f"Read annotation event log failed: {exc}"})
+
+    registry.register(ToolSpec(
+        name="annotation_event_log",
+        category="book",
+        toolset="library_query",
+        exposure=ToolExposure.DEFERRED,
+        description=(
+            "Read the append-only journal of the user's note/highlight actions "
+            "— create, update and delete, newest first. Unlike "
+            "annotation_search (current rows only), deleted notes keep their "
+            "text snapshot, so you can tell what was removed. Use it when the "
+            "user asks what they recently changed/deleted, or which notes they "
+            "added. Filter by event_type, annotation_type, book_id, "
+            "stable_book_id, or q (selected text / note body / book title)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "event_type": {
+                    "type": "string",
+                    "enum": ["", "create", "update", "delete"],
+                    "description": "Filter by action (default: all)",
+                },
+                "annotation_type": {
+                    "type": "string",
+                    "enum": ["", "highlight", "note", "both"],
+                    "description": "Filter by kind: highlight=收藏 / note=笔记",
+                },
+                "book_id": {
+                    "type": "string",
+                    "description": "Filter by book ID",
+                },
+                "stable_book_id": {
+                    "type": "string",
+                    "description": "Filter by stable book identity (survives re-imports)",
+                },
+                "q": {
+                    "type": "string",
+                    "description": "Substring match on selected text, note body, or book title",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Page size (default 20, max 200)",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Pagination offset (default 0)",
+                },
+            },
+        },
+        execute=_tool_annotation_event_log,
         permission_mode=PermissionMode.READ_ONLY,
     ))
 

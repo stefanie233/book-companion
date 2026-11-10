@@ -304,13 +304,13 @@ def test_discard_chapter() -> None:
     ch1 = svc.chapter(work, 1)["id"]
     svc.save_content(work, 1, "乱改的第一章\n第二行\n第三行")
     svc.save_content(work, 2, "乱改的第二章")
-    check("丢弃：两章都脏", svc.vcs_status(work)["counts"]["changed"], 2)
+    check("丢弃：两章都脏", svc.vcs_status(work)["chapter_counts"]["changed"], 2)
     svc.vcs_discard_chapter(work, ch1)
     check("丢弃：第一章回到提交",
           svc.chapter(work, 1)["content"].startswith("第一行"), True)
     check("丢弃：第二章的改动还在",
           svc.chapter(work, 2)["content"], "乱改的第二章")
-    check("丢弃：只剩一章脏", svc.vcs_status(work)["counts"]["changed"], 1)
+    check("丢弃：只剩一章脏", svc.vcs_status(work)["chapter_counts"]["changed"], 1)
     raises("丢弃：没有改动时拒绝",
            WritingError, lambda: svc.vcs_discard_chapter(work, ch1))
 
@@ -379,7 +379,7 @@ def test_reflog_and_merge_base() -> None:
     check("merge-base：岔路领先 1", info["ahead"], 1)
     check("merge-base：主线没有额外提交", info["behind"], 0)
     diff = svc.vcs_diff(work, from_ref="main...岔路A", to_ref="岔路A")
-    check("三点差异：从分叉点算起", diff["counts"]["changed"], 1)
+    check("三点差异：从分叉点算起", diff["chapter_counts"]["changed"], 1)
 
 
 def main() -> int:

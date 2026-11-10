@@ -510,6 +510,9 @@ def main() -> int:
         _post(f"{base}/_mock/scenario", _rules())
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            # 声音采集会调 usage_log；与 enrich e2e 同一条（决策 147）。
+            from usage_log import init_for_tests
+            init_for_tests(Path(tmp) / "sessions.db")
             books_path = Path(tmp) / "books.db"
             _make_books(books_path)
             books_db = BookDB(books_path)

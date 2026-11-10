@@ -6,54 +6,54 @@
   "work": {
     "title": "渡口",
     "genre": "民国小说",
-    "premise": "沈砚回菱镇奔丧，追查父亲死前见的最后一个人。",
-    "narrative_pov": "第三人称限知（沈砚）",
+    "premise": "人物A回某镇奔丧，追查父亲死前见的最后一个人。",
+    "narrative_pov": "第三人称限知（人物A）",
     "target_chars": 2000,
-    "style_profile": {"hard_rules": ["视角只在沈砚身上", "不写解释性旁白"]}
+    "style_profile": {"hard_rules": ["视角只在人物A身上", "不写解释性旁白"]}
   },
   "chapter": {"index": 3, "title": "名字"},
-  "focus": ["沈砚", "老周"],
+  "focus": ["人物A", "配角"],
   "contract": {
-    "purpose": "沈砚再去渡口逼问老周；老周终于说出那个外地人叫顾长庚；沈砚决定去省城。",
+    "purpose": "人物A再去渡口逼问配角；配角终于说出那个外地人叫人物E；人物A决定去省城。",
     "must_hit_now": [
-      "沈砚再次到渡口",
-      "老周说出「顾长庚」这个名字",
-      "沈砚决定去省城"
+      "人物A再次到渡口",
+      "配角说出「人物E」这个名字",
+      "人物A决定去省城"
     ],
-    "must_preserve": ["沈砚是第一次听到「顾长庚」这个名字", "老周只给名字，不解释来历"],
+    "must_preserve": ["人物A是第一次听到「人物E」这个名字", "配角只给名字，不解释来历"],
     "forbidden_cross": [
-      "不揭示顾长庚与沈伯庸的关系",
-      "不解释老周为何隐瞒",
-      "不让阿棠在本章出场"
+      "不揭示人物E与人物F的关系",
+      "不解释配角为何隐瞒",
+      "不让人物C在本章出场"
     ],
-    "ending_state": "沈砚站在渡口，把去省城的船票攥在手里",
+    "ending_state": "人物A站在渡口，把去省城的船票攥在手里",
     "story_time": "次日清晨",
     "target_chars": 2000
   },
   "prior": [
     {"index": 1, "title": "归舟", "content_file": "seeds/c05_ch1.md",
-     "summary": "沈砚回菱镇奔丧，发现账簿缺一页，供桌上的茶是温的。"},
+     "summary": "人物A回某镇奔丧，发现账簿缺一页，供桌上的茶是温的。"},
     {"index": 2, "title": "渡口", "content_file": "seeds/c05_ch2.md",
-     "summary": "老周承认父亲死前见过一个外地人但不说名字；账簿缺页边缘留半个「周」字；阿棠欲言又止。"}
+     "summary": "配角承认父亲死前见过一个外地人但不说名字；账簿缺页边缘留半个「周」字；人物C欲言又止。"}
   ],
   "facts": [
-    {"subject_ref": "沈砚", "field": "location", "value": "菱镇沈家老宅", "from": 2},
-    {"subject_ref": "沈砚", "field": "goal", "value": "查清父亲死前见的最后一个人", "from": 2},
-    {"subject_ref": "沈砚", "field": "knowledge", "value": "父亲沈伯庸三日前夜里死于心疾；账簿被割去一页", "from": 2},
-    {"subject_ref": "沈砚", "field": "knowledge_of_name", "value": null, "unknown_reason": "unclaimed", "from": 2},
-    {"subject_ref": "老周", "field": "state", "value": "左腿残疾，走路一拐一拐；在菱镇渡口撑船", "from": 1},
-    {"subject_ref": "老周", "field": "knowledge", "value": "知道初三夜里那个外地人的姓名，但受沈伯庸嘱托不说", "from": 2},
-    {"subject_ref": "阿棠", "field": "state", "value": "已嫁给陈记米行的陈立", "from": 1},
-    {"subject_ref": "沈伯庸", "field": "state", "value": "三日前夜里因心疾去世", "from": 1}
+    {"subject_ref": "人物A", "field": "location", "value": "某镇某家老宅", "from": 2},
+    {"subject_ref": "人物A", "field": "goal", "value": "查清父亲死前见的最后一个人", "from": 2},
+    {"subject_ref": "人物A", "field": "knowledge", "value": "父亲人物F三日前夜里死于心疾；账簿被割去一页", "from": 2},
+    {"subject_ref": "人物A", "field": "knowledge_of_name", "value": null, "unknown_reason": "unclaimed", "from": 2},
+    {"subject_ref": "配角", "field": "state", "value": "左腿残疾，走路一拐一拐；在某镇渡口撑船", "from": 1},
+    {"subject_ref": "配角", "field": "knowledge", "value": "知道初三夜里那个外地人的姓名，但受人物F嘱托不说", "from": 2},
+    {"subject_ref": "人物C", "field": "state", "value": "已嫁给某米行的人物D", "from": 1},
+    {"subject_ref": "人物F", "field": "state", "value": "三日前夜里因心疾去世", "from": 1}
   ],
   "promises": [
     {"id": "P1", "title": "账簿缺页去了哪里", "kind": "foreshadow", "weight": 8,
      "status": "planted", "planned_plant_chapter": 2, "planted_chapter": 2,
      "earliest_reveal_chapter": 4, "planned_payoff_chapter": 5},
-    {"id": "P2", "title": "老周隐瞒的外地人姓名", "kind": "foreshadow", "weight": 9,
+    {"id": "P2", "title": "配角隐瞒的外地人姓名", "kind": "foreshadow", "weight": 9,
      "status": "planted", "planned_plant_chapter": 2, "planted_chapter": 2,
      "earliest_reveal_chapter": 3, "planned_payoff_chapter": 3},
-    {"id": "P3", "title": "阿棠没说完的话", "kind": "hook", "weight": 6,
+    {"id": "P3", "title": "人物C没说完的话", "kind": "hook", "weight": 6,
      "status": "planted", "planned_plant_chapter": 2, "planted_chapter": 2,
      "earliest_reveal_chapter": 5, "planned_payoff_chapter": 6}
   ],
@@ -63,8 +63,8 @@
     "books": [{"stable_book_id": "sb-b9344d7f711a4e47", "book_id": "6bcc15e2b631588c", "label": "窄门"}]
   },
   "check": {
-    "must_hit_keywords": [["渡口"], ["顾长庚"], ["省城"]],
-    "forbidden_keywords": ["阿棠推门", "阿棠走进"],
+    "must_hit_keywords": [["渡口"], ["人物E"], ["省城"]],
+    "forbidden_keywords": ["人物C推门", "人物C走进"],
     "leak_names": ["阿莉莎", "杰罗姆", "朱莉叶特", "纪德"]
   }
 }

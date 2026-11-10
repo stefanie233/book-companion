@@ -274,6 +274,12 @@ class EpubReader:
         self._opf_dir: str = ""
         self._item_map: dict[str, str] = {}       # item id → relative href
         self._spine_ids: list[str] = []            # ordered idrefs (content only)
+        # 与 _spine_ids 平行：每一项在 **OPF spine 原文**里的位置。导入时会
+        # 跳过封面/目录等非正文 item，_spine_ids 的下标因此被压缩过；而
+        # epub.js 渲染器用的是未压缩的 OPF 下标。落库的 chapter.spine_index
+        # 必须是后者，否则 sync 的「结构定章」会整体错位（实测《窄门》差 1：
+        # OPF spine[0]=titlepage 被跳过，之后每一项都前移一格）。
+        self._spine_opf_index: list[int] = []
         self._media_types: dict[str, str] = {}      # item id → media-type
         self._metadata: dict[str, str] = {}
         self._toc: list[dict] = []                 # [{"label": ..., "src": ...}, ...]
@@ -693,7 +699,10 @@ class EpubReader:
             r"(/(?:cover|title|copy|front|halftitle|colophon)[^/]*\.(?:x?html?|xml))",
             re.IGNORECASE,
         )
-        for m in re.finditer(r'<itemref\s([^>]*?)/?>', opf_xml):
+        # 注意 enumerate 计的是 OPF 里 **所有** itemref 的位置，包括下面被
+        # 跳过的封面/目录项——epub.js 的 sectionIndex 正是这个原始序号
+        # （parseSpine 对每个 itemref 编号，linear="no" 也不剔除）。
+        for opf_pos, m in enumerate(re.finditer(r'<itemref\s([^>]*?)/?>', opf_xml)):
             attrs = m.group(1)
             idref_m = re.search(r'idref="([^"]*)"', attrs)
             if not idref_m:
@@ -713,6 +722,7 @@ class EpubReader:
             if _NON_CONTENT_HREF_RE.search(href):
                 continue
             self._spine_ids.append(idref)
+            self._spine_opf_index.append(opf_pos)
 
         # Metadata: title, creator
         m_title = re.search(
@@ -993,6 +1003,18 @@ class EpubReader:
         """
         self._ensure_loaded()
         return self._spine_to_depth.get(spine_index, -1)
+
+    def opf_spine_index(self, spine_index: int) -> int:
+        """内容 spine 下标 → OPF spine 下标（= epub.js 的 sectionIndex）。
+
+        阅读器内部的 spine 下标用于 TOC / 深度 / 读原文，都是「跳掉封面
+        目录后」的压缩坐标；落库给前端用的 `chapter.spine_index` 必须换成
+        OPF 原始坐标，否则 sync 的结构定章整体错位。越界时原样返回。
+        """
+        self._ensure_loaded()
+        if 0 <= spine_index < len(self._spine_opf_index):
+            return self._spine_opf_index[spine_index]
+        return spine_index
 
     def get_chapter_label(self, spine_index: int) -> str:
         """Get the best label for a spine item.

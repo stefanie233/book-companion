@@ -36,6 +36,8 @@ CARD_FIELDS = ("location", "goal", "state", "knowledge")
 
 def is_visible(row: Mapping[str, Any], chapter: int) -> bool:
     """该事实在 ``chapter_after(chapter)`` 是否成立。"""
+    if int(row.get("superseded") or 0):
+        return False
     start = int(row.get("valid_from_chapter", 0))
     if start > chapter:
         return False

@@ -80,7 +80,10 @@ class Session:
             timestamp_ms=_monotonic_ms(),
             text=text,
         ))
-        self.push_message(ConversationMessage.user_text(text))
+        msg = ConversationMessage.user_text(text)
+        # 墙上时间：给模型看「这句是几点说的」；与 monotonic 的防碰撞号无关。
+        msg.time_created = int(time.time() * 1000)
+        self.push_message(msg)
 
     def record_compaction(self, summary: str, removed_count: int) -> None:
         self.touch()

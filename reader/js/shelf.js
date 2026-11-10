@@ -1,4 +1,4 @@
-/* Book Companion — bookshelf: loading, sorting, import, delete. */
+/* Liubai — bookshelf: loading, sorting, import, delete. */
 
 import { S } from './state.js';
 import { escapeHtml, escapeHtmlAttr, compareStringAsc } from './utils.js';
@@ -9,9 +9,9 @@ import { selectBook } from './reader.js';
 
 // 五种排序：导入时间 / 书名 / 作家 / 最近打开 / 自定义。
 // key 是持久化契约（localStorage 的 bc_shelf_sort），改名要同步白名单。
-const SORT_KEYS = ['time', 'title', 'author', 'recent', 'custom'];
+export const SORT_KEYS = ['time', 'title', 'author', 'recent', 'custom'];
 
-const SORT_LABELS = {
+export const SORT_LABELS = {
   time: '导入时间',
   title: '书名',
   author: '作家',
@@ -21,6 +21,7 @@ const SORT_LABELS = {
 
 // 切到一个新 key 时的默认方向。「最近打开」自然要最近在前，其余正序。
 // 「导入时间」保持 asc —— 这是改动前就有的默认观感，不动它。
+// 自定义是手工序列，只有 1→N 一种读法；它没有倒序，下面也不翻方向。
 const SORT_DEFAULT_DIR = {
   time: 'asc', title: 'asc', author: 'asc', recent: 'desc', custom: 'asc',
 };
@@ -31,7 +32,12 @@ export function loadShelfSort() {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (SORT_KEYS.includes(parsed.key) && ['asc', 'desc'].includes(parsed.dir)) {
-        S.shelfSort = { key: parsed.key, dir: parsed.dir };
+        // 自定义顺序是手工排的固定序列，没有倒序；旧 localStorage 若存了
+        // custom+desc，读入时就归正，避免重开页面后书架忽然倒过来。
+        S.shelfSort = {
+          key: parsed.key,
+          dir: parsed.key === 'custom' ? 'asc' : parsed.dir,
+        };
       }
     }
   } catch (e) {}
@@ -75,7 +81,8 @@ export function sortBooks(books) {
         if (ra !== rb) return ra ? -1 : 1;
         return (a.time_created || 0) - (b.time_created || 0);
       }
-      return sign * (ra - rb);
+      // 手工序列固定 1→N；方向不参与，避免 custom+desc 把书架倒过来。
+      return ra - rb;
     }
     return 0;
   });
@@ -87,14 +94,21 @@ export function updateShelfSortUI() {
   // 触发器上直接写当前排序名，面板关着也知道现在按什么排。
   const label = document.getElementById('shelfSortLabel');
   if (label) label.textContent = SORT_LABELS[S.shelfSort.key] || '排序';
+  // 触发器自己也是唯一的“怎么整理”提示：自定义时悬停会说明可拖封面。
+  const trigger = document.getElementById('shelfSortTrigger');
+  if (trigger) {
+    trigger.title = S.shelfSort.key === 'custom' ? '自定义顺序：拖动封面调整' : '排序';
+  }
 
   document.querySelectorAll('#shelfSortPanel .sort-option').forEach(opt => {
     const active = opt.dataset.key === S.shelfSort.key;
     opt.classList.toggle('active', active);
     const dirSpan = opt.querySelector('.so-dir');
     if (!dirSpan) return;
-    // 方向箭头只挂在激活项上；chevron-up = 正序，down = 倒序
-    dirSpan.innerHTML = active
+    // 方向箭头只挂在激活项上；chevron-up = 正序，down = 倒序。
+    // 自定义是固定手工序列，不画箭头，也不给“再点一下能翻”的暗示。
+    const showDir = active && opt.dataset.key !== 'custom';
+    dirSpan.innerHTML = showDir
       ? (S.shelfSort.dir === 'asc'
           ? '<i data-lucide="chevron-up"></i>'
           : '<i data-lucide="chevron-down"></i>')
@@ -144,7 +158,19 @@ export function initSortPanel() {
 
 export function setSort(key) {
   if (!SORT_KEYS.includes(key)) return;
+  if (_drag) endDrag();                     // 拖动中换排序会重建 DOM，先收手
   if (S.shelfSort.key === key) {
+    // 自定义是手工序列，只有 1→N；再点一次不翻方向。选中后直接收起
+    // 面板——书架本身就是可拖视图，不需要再点一次「整理」。
+    if (key === 'custom') {
+      if (S.shelfSort.dir !== 'asc') {
+        S.shelfSort.dir = 'asc';
+        saveShelfSort();
+      }
+      updateShelfSortUI();
+      closeSortPanel();
+      return;
+    }
     S.shelfSort.dir = S.shelfSort.dir === 'asc' ? 'desc' : 'asc';
   } else {
     S.shelfSort.key = key;
@@ -152,72 +178,40 @@ export function setSort(key) {
   }
   saveShelfSort();
   updateShelfSortUI();
-  loadShelf();
-  // 选「自定义」只切换视图，**不**自动进整理模式。
-  // 曾经试过「首次切到自定义且整库没排过版就自动进整理模式」，结果是
-  // 用户只想看看新排序，书架却当场没了封面倾斜、三个角标也消失 ——
-  // 看起来就是「书架坏了」。整理模式必须由面板里那枚 grip 按钮显式触发。
-}
-
-// ── 整理模式：拖动书本排自定义顺序 ────────────────────────────────
-//
-// 只在「自定义」排序下有意义。进入后整个书架退化成一块可拖拽的排序面板：
-//   · 停掉封面倾斜 —— 它同样是指针驱动的，会和拖拽抢 pointermove
-//   · 关掉 hover 抬升、入场动画、卡片角标（防止拖到一半误触删除）
-//   · 点击不再打开书
-//
-// 落位策略：拖动过程中 DOM 完全不动，只移动一条「插入位」指示条；
-// 松手时才按新顺序整体重渲染（整理模式下 shelve-in 已关，重建是瞬时的），
-// 再按 data-id 做一次 FLIP，让书本滑到新位置而不是瞬移过去。
-
-let _reorderMode = false;
-let _drag = null;            // 当前拖拽：{ el, id, pointerId, startX/Y, lastX/Y, active, raf }
-let _dropIndex = -1;         // 插入位（相对「除被拖卡片外」的扁平列表）
-let _reorderDirty = false;   // 有未落库的改动
-let _saveTimer = null;
-
-const DRAG_THRESHOLD = 4;    // px：小于它算点击，不算拖动
-const EDGE_ZONE = 60;        // px：距滚动容器上下边缘多近开始自动滚动
-const EDGE_SPEED = 9;        // px/帧
-
-export function enterShelfReorder() {
-  if (_reorderMode) return;
-  const grid = document.getElementById('shelfGrid');
-  if (!grid) return;
-  _reorderMode = true;              // 先置位：下面的 loadShelf 会走重渲染，靠它决定动画抑制
-  releaseAllTilt();                 // 先把倾斜控制器收手，别和拖拽抢指针
-  grid.classList.add('reordering', 'no-enter-anim');
-  document.body.classList.add('shelf-reordering');
-  const bar = document.getElementById('shelfReorderBar');
-  if (bar) bar.hidden = false;
-  closeSortPanel();
-  // 整理模式编辑的就是自定义顺序，视图必须先切过去 —— 否则在「书名」
-  // 视图下拖出来的顺序会被当成自定义顺序存下来，用户下次切回自定义
-  // 会看到一个自己没排过的顺序。
-  if (S.shelfSort.key !== 'custom') {
-    S.shelfSort.key = 'custom';
-    S.shelfSort.dir = SORT_DEFAULT_DIR.custom;
-    saveShelfSort();
-    updateShelfSortUI();
+  // 自定义没有方向可翻，菜单使命到选中为止：收起面板后直接拖封面。
+  if (key === 'custom') closeSortPanel();
+  _suppressEnterAnim = false;
+  if (key === 'custom' && _lastShelfBooks) {
+    // 同步按缓存重排；等网络的话，旧排序还挂在屏幕上时拖拽已经可用，
+    // 用户一拖就会把旧顺序当成自定义顺序存回去。
+    renderShelfRows(sortBooks(_lastShelfBooks));
+  } else {
     loadShelf();
   }
 }
 
-export function exitShelfReorder() {
-  if (!_reorderMode) return;
-  _reorderMode = false;
-  endDrag();
-  const grid = document.getElementById('shelfGrid');
-  // 只摘 .reordering；.no-enter-anim 故意留着（见 style.css 里的说明）
-  if (grid) grid.classList.remove('reordering');
-  document.body.classList.remove('shelf-reordering');
-  const bar = document.getElementById('shelfReorderBar');
-  if (bar) bar.hidden = true;
-  if (_reorderDirty) {
-    _reorderDirty = false;
-    saveCustomOrder();
-  }
-}
+// ── 自定义排序：直接拖动书本 ─────────────────────────────────────
+//
+// 没有独立的整理模式，也没有「完成」键：只要当前排序是自定义，卡片就
+// 可以拖。鼠标按下封面、移动超过阈值即进入拖动；短点仍然是打开书。
+// 触屏用 320ms 长按起拖，先滑动则视为滚动，取消本次拖拽。
+//
+// 落位策略：拖动过程中 DOM 完全不动，只移动一条「插入位」指示条；
+// 松手时才按新顺序整体重渲染，再按 data-id 做一次 FLIP。
+// 拖动期间才停掉倾斜、隐藏角标、放开 content-visibility——平常书架
+// 的悬停抬升、角标和入场动画都不受影响。
+
+let _drag = null;            // 当前拖拽：{ el, id, pointerId, startX/Y, lastX/Y, active, touch, armTimer, raf }
+let _dropIndex = -1;         // 插入位（相对「除被拖卡片外」的扁平列表）
+let _saveTimer = null;
+let _suppressEnterAnim = false;  // 拖动落位后抑制一次入场动画
+let _suppressClickUntil = 0;     // 拖动结束后的 click 要吞掉，避免误开书
+
+const DRAG_THRESHOLD = 8;    // px：小于它算点击，不算拖动
+const TOUCH_ARM_MS = 320;    // 触屏长按多久进入拖动
+const CLICK_GUARD_MS = 350;  // 拖动松手后多久内的 click 视为拖拽残留
+const EDGE_ZONE = 60;        // px：距滚动容器上下边缘多近开始自动滚动
+const EDGE_SPEED = 9;        // px/帧
 
 // 按 DOM 顺序取书架上当前的书籍 id。行只是布局产物，文档顺序就是扁平顺序。
 function currentOrderIds() {
@@ -236,8 +230,8 @@ function saveCustomOrder() {
   }).catch(() => { /* 下次拖动还会再存一次，不必打扰用户 */ });
 }
 
-// 每拖完一次就存一次（debounce）。攒到「完成」才存的话，拖到一半关掉
-// 页面/切走标签页的损失是完全不可见的 —— 而那时用户已经付出了排序动作。
+// 松手后 600ms 落库；连续快速拖动只发最后一次。没有「完成」键，
+// 落位就保存；关页面/切标签页也不会丢刚才那次调整。
 function scheduleSave() {
   if (_saveTimer) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => { _saveTimer = null; saveCustomOrder(); }, 600);
@@ -254,31 +248,64 @@ export function initShelfReorder() {
   // 委托在 #shelfGrid 上绑一次即可 —— 它自己从不被替换，
   // 只有 innerHTML 会被重建，所以不必像倾斜控制器那样每次重渲染重绑。
   grid.addEventListener('pointerdown', e => {
-    if (!_reorderMode || _drag) return;
+    if (S.shelfSort.key !== 'custom' || _drag) return;
     if (e.button) return;                                  // 只接左键 / 单指
     const el = e.target && e.target.closest ? e.target.closest('.scene-book') : null;
     if (!el) return;
-    e.preventDefault();                                    // 别起原生拖拽与选词
+    // 角标是独立按钮，别让拖拽抢走它的点击。
+    if (e.target.closest && e.target.closest('.book-actions')) return;
     _drag = {
       el, id: el.dataset.id, pointerId: e.pointerId,
       startX: e.clientX, startY: e.clientY,
       lastX: e.clientX, lastY: e.clientY,
-      active: false, raf: 0,
+      active: false, touch: e.pointerType === 'touch',
+      armTimer: 0, raf: 0,
     };
     // 捕获指针：拖到窗口外也不丢事件。捕获后事件仍会冒泡到 window。
     try { el.setPointerCapture(e.pointerId); } catch (err) {}
+    if (_drag.touch) {
+      _drag.armTimer = setTimeout(() => {
+        if (_drag && !_drag.active) startDrag();
+      }, TOUCH_ARM_MS);
+    }
   });
+
+  // 触屏长按已经起拖后，用非 passive 的 touchmove 阻断页面滚动；
+  // 长按之前的移动不拦，用户可以用手指滚动书架。
+  grid.addEventListener('touchmove', e => {
+    if (_drag && _drag.active) e.preventDefault();
+  }, { passive: false });
+  grid.addEventListener('dragstart', e => e.preventDefault());
 
   window.addEventListener('pointermove', onReorderMove, { passive: false });
   window.addEventListener('pointerup', onReorderUp);
-  window.addEventListener('pointercancel', onReorderUp);
+  window.addEventListener('pointercancel', cancelDrag);
   window.addEventListener('resize', endDrag);
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) endDrag();
   });
   document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && _reorderMode) exitShelfReorder();
+    if (e.key === 'Escape' && _drag) endDrag();
   });
+  // 拖动松手后的 click 是拖拽残留，不能打开书。
+  grid.addEventListener('click', e => {
+    if (Date.now() > _suppressClickUntil) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+}
+
+function startDrag() {
+  if (!_drag || _drag.active) return;
+  _drag.active = true;
+  if (_drag.armTimer) { clearTimeout(_drag.armTimer); _drag.armTimer = 0; }
+  _suppressEnterAnim = true;
+  releaseAllTilt();                 // 倾斜和拖拽都吃 pointermove，先收手
+  _drag.el.classList.add('dragging');
+  const grid = document.getElementById('shelfGrid');
+  if (grid) grid.classList.add('dragging-active');
+  document.body.classList.add('shelf-dragging');
+  if (!_drag.raf) _drag.raf = requestAnimationFrame(dragTick);
 }
 
 function onReorderMove(e) {
@@ -289,19 +316,27 @@ function onReorderMove(e) {
     const dx = e.clientX - _drag.startX;
     const dy = e.clientY - _drag.startY;
     if (dx * dx + dy * dy < DRAG_THRESHOLD * DRAG_THRESHOLD) return;  // 仍算点击
-    _drag.active = true;
-    _drag.el.classList.add('dragging');
-    const grid = document.getElementById('shelfGrid');
-    if (grid) grid.classList.add('dragging-active');
+    // 触屏上先动了 = 用户在滚书架，取消长按；桌面鼠标则直接起拖。
+    if (_drag.touch) { endDrag(); return; }
+    startDrag();
   }
   e.preventDefault();                       // 拖动时别让页面跟着滚
-  if (!_drag.raf) _drag.raf = requestAnimationFrame(dragTick);
+  if (!_drag || _drag.raf) return;
+  _drag.raf = requestAnimationFrame(dragTick);
 }
 
 function onReorderUp(e) {
   if (!_drag || e.pointerId !== _drag.pointerId) return;
-  if (_drag.active) commitDrag();
-  else endDrag();                           // 没超过阈值 = 点击，什么也不做
+  if (_drag.active) {
+    _suppressClickUntil = Date.now() + CLICK_GUARD_MS;
+    commitDrag();
+  } else {
+    endDrag();                           // 没超过阈值 = 点击
+  }
+}
+
+function cancelDrag() {
+  endDrag();
 }
 
 function dragTick() {
@@ -392,9 +427,8 @@ function commitDrag() {
   const next = ids.map(id => byId.get(id));
   if (next.some(b => !b)) return;          // 有对不上的就整体放弃，别把书架弄乱
   _lastShelfBooks = next;
-  renderShelfRows(next);                   // 整理模式下 shelve-in 已关，重建是瞬时的
+  renderShelfRows(next);                   // 拖动落位时 shelve-in 已关，重建是瞬时的
   flipFrom(before);
-  _reorderDirty = true;
   scheduleSave();
 }
 
@@ -436,13 +470,16 @@ function endDrag() {
   if (!_drag) return;
   const drag = _drag;
   _drag = null;
+  if (drag.armTimer) clearTimeout(drag.armTimer);
   if (drag.raf) cancelAnimationFrame(drag.raf);
+  try { drag.el.releasePointerCapture(drag.pointerId); } catch (err) {}
   drag.el.style.removeProperty('transform');
   drag.el.classList.remove('dragging');
   const slot = document.getElementById('shelfDropSlot');
   if (slot) slot.remove();
   const grid = document.getElementById('shelfGrid');
   if (grid) grid.classList.remove('dragging-active');
+  document.body.classList.remove('shelf-dragging');
   _dropIndex = -1;
 }
 
@@ -574,8 +611,40 @@ function currentPerRow() {
   return Math.max(3, Math.min(6, Math.floor(w / 180)));
 }
 
+// 书架卡片最宽 130px，原封面 500–1700px 宽（最大 800KB）。缩略图端点
+// 返回 400px 宽的版本，下载量约 1/8、解码量约 1/16。
+function shelfCoverUrl(id) {
+  return S.API + '/api/books/' + id + '/cover?thumb=1';
+}
+
+// 刷新后把缩略图主动排进下载队列。原生 loading="lazy" 要等卡片滚进
+// 视口附近才发请求，快速下滑时封面永远慢半拍；缩略图总量只有几百 KB，
+// 一次预热完，之后怎么滚都是缓存命中。
+let _coverPreloadToken = 0;
+let _coverPreloadKeep = [];   // 持有引用：被 GC 掉的 Image 可能连带取消请求
+function preloadShelfCovers(books) {
+  const token = ++_coverPreloadToken;
+  const kept = (_coverPreloadKeep = []);
+  const total = Math.min(books.length, 150);   // 超大书库不无限预热
+  const CONCURRENCY = 6;
+  let next = 0;
+  let active = 0;
+  function pull() {
+    while (token === _coverPreloadToken && active < CONCURRENCY && next < total) {
+      const b = books[next++];
+      active++;
+      const img = new Image();
+      img.decoding = 'async';
+      img.onload = img.onerror = function () { active--; pull(); };
+      img.src = shelfCoverUrl(b.id);
+      kept.push(img);
+    }
+  }
+  pull();
+}
+
 function sceneBookHtml(b, idx) {
-  const coverUrl = S.API + '/api/books/' + b.id + '/cover';
+  const coverUrl = shelfCoverUrl(b.id);
   const title = escapeHtml(b.title);
   const author = escapeHtml(b.author || '');
   const initials = escapeHtml(b.title.slice(0, 4));
@@ -586,7 +655,7 @@ function sceneBookHtml(b, idx) {
         <div class="scene-book-lift">
         ${ribbon}
         <div class="scene-book-inner">
-          <img src="${coverUrl}" alt="${title}" loading="lazy" decoding="async"
+          <img src="${coverUrl}" alt="${title}" loading="lazy" decoding="async" draggable="false"
                onerror="this.style.display='none';this.nextElementSibling.style.display='flex';">
           <div class="book-cover-placeholder" style="display:none"><span>${initials}</span></div>
           <i class="book-glare"></i>
@@ -731,9 +800,9 @@ function initShelfTilt() {
 
   scene.addEventListener('pointermove', e => {
     if (_reducedMotion) return;
-    // 整理模式下指针归拖拽控制器所有，倾斜彻底让位。
+    // 拖动期间指针归拖拽控制器所有，倾斜彻底让位。
     // 两个控制器都是 pointermove 驱动的，不靠事件顺序、靠这个闸门隔离。
-    if (_reorderMode) return;
+    if (_drag) return;
     // 触屏没有「悬停」语义：手指按住不放时指针不会离开，
     // 姿态会永久卡在最后一次的位置。直接不接管。
     if (e.pointerType === 'touch') return;
@@ -782,10 +851,11 @@ function renderShelfRows(books) {
   const perRow = currentPerRow();
   _lastShelfBooks = books;
   _lastPerRow = perRow;
-  // 整理模式下渲染出来的卡片不能播入场动画：CSS 动画会盖掉拖拽写的内联
-  // transform，而且每次落位重渲染都会重播一遍。退出整理模式时这个类故意
-  // 不摘，留到这里在非整理模式的下一次渲染才摘 —— 详见 style.css 的说明。
-  grid.classList.toggle('no-enter-anim', _reorderMode);
+  // 拖动落位的那次重渲染不能播入场动画：CSS 动画会盖掉拖拽写的内联
+  // transform，而且每次落位都会重播一遍。平常渲染不挂这个类，切排序 /
+  // 重载时入场动画照常恢复 —— 详见 style.css 的说明。
+  grid.classList.toggle('no-enter-anim', _suppressEnterAnim);
+  grid.classList.toggle('custom-order', S.shelfSort.key === 'custom');
   const rows = [];
   for (let i = 0; i < books.length; i += perRow) rows.push(books.slice(i, i + perRow));
   // Only long shelves benefit from content-visibility (see style.css):
@@ -810,8 +880,8 @@ ${rowBooks.map(b => sceneBookHtml(b, idx++)).join('')}
 let _shelfResizeTimer = null;
 window.addEventListener('resize', () => {
   if (!_lastShelfBooks) return;
-  // 整理模式下不重排：DOM 重建会把正在拖的那张卡换成新节点，拖拽状态直接失效
-  if (_reorderMode) return;
+  // 拖动中不重排：DOM 重建会把正在拖的那张卡换成新节点，拖拽状态直接失效
+  if (_drag) return;
   if (_shelfResizeTimer) clearTimeout(_shelfResizeTimer);
   _shelfResizeTimer = setTimeout(() => {
     if (currentPerRow() !== _lastPerRow) renderShelfRows(_lastShelfBooks);
@@ -842,6 +912,7 @@ export function pickContinueBook(books) {
 }
 
 export async function loadShelf() {
+  if (_drag) return;                        // 拖动中别重建 DOM，拖拽状态会失效
   try {
     const resp = await fetch(S.API + '/api/books');
     const data = await resp.json();
@@ -864,7 +935,7 @@ export async function loadShelf() {
     const continueSection = document.getElementById('continueSection');
     if (lastRead) {
       continueSection.style.display = 'block';
-      document.getElementById('continueCover').src = S.API + '/api/books/' + lastRead.id + '/cover';
+      document.getElementById('continueCover').src = shelfCoverUrl(lastRead.id);
       document.getElementById('continueTitle').textContent = lastRead.title;
       document.getElementById('continueAuthor').textContent = lastRead.author || '';
       const progress = lastRead.last_chapter != null
@@ -877,7 +948,10 @@ export async function loadShelf() {
     }
 
     // Shelf scene rows
-    renderShelfRows(sortBooks(data.books));
+    if (!_drag) _suppressEnterAnim = false;
+    const sorted = sortBooks(data.books);
+    renderShelfRows(sorted);
+    preloadShelfCovers(sorted);
   } catch (e) {
     console.error(e);
     document.getElementById('shelfEmpty').style.display = 'block';
@@ -885,8 +959,9 @@ export async function loadShelf() {
 }
 
 export function openBookFromShelf(bookId) {
-  // 整理模式下卡片是用来拖的，不是用来开的
-  if (_reorderMode) return;
+  // 拖动中/松手后的残留 click 不打开书；普通点击照常进入阅读。
+  if (_drag && _drag.active) return;
+  if (Date.now() < _suppressClickUntil) return;
   // 条件二：打开的不是上次读的那本书 = 读一本新书 → 阅读页开新会话。
   // 上次读的书优先取内存里的 _lastLoadedBook；刷新后它还没值，就用
   // 阅读线指针记着的 bookId 判断（同一本书仍可恢复今天的会话）。
@@ -1131,8 +1206,6 @@ window.submitScanPath = submitScanPath;
 window.importSingleFile = importSingleFile;
 window.setSort = setSort;
 window.toggleSortPanel = toggleSortPanel;
-window.enterShelfReorder = enterShelfReorder;
-window.exitShelfReorder = exitShelfReorder;
 window.loadShelf = loadShelf;
 window.toggleShelfScene = toggleShelfScene;
 window.loadShelfScene = loadShelfScene;

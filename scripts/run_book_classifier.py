@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -78,25 +79,52 @@ def _pretty(text: str) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2) if data else text
 
 
-def commit_overrides(db: BookDB, book_id: str, data: dict) -> tuple[int, int]:
+def _html_norm(html: str) -> str:
+    html = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", html or "")
+    m = re.search(r"(?is)<body[^>]*>(.*)</body>", html)
+    return re.sub(r"\s+", "", re.sub(r"<[^>]+>", "", m.group(1) if m else html))
+
+
+def _spine_texts(epub_path: str) -> list[str]:
+    """每个 spine item 的规范化正文，下标 = reader 的压缩坐标（agent 看到的）。"""
+    from file_readers.epub_reader import open_book
+    reader = open_book(Path(epub_path))
+    try:
+        reader._ensure_loaded()
+        out = []
+        for i in range(len(reader._spine_ids)):
+            try:
+                out.append(_html_norm(reader._read_spine_html(i)))
+            except Exception:
+                out.append("")
+        return out
+    finally:
+        reader.close()
+
+
+def commit_overrides(db: BookDB, book_id: str, data: dict,
+                     epub_path: str | None = None) -> tuple[int, int]:
     """把 agent 的判断写进覆盖层（``source='agent'``）。
 
     返回 (写入条数, 跳过条数)。**agent 说的是 spine 序号**（它看的是文件），
-    而覆盖层的键是 ``chapter_index`` —— v22 起 ``book_chapters.spine_index``
-    记着每个章出自哪个文件，按它翻译。一个文件被切成多章时，判断会落到它
-    切出的每一章上。
+    而覆盖层的键是 ``chapter_index``。翻译按**正文**做：agent 的序号落在
+    哪个 spine item，就把该 item 的正文里能找到「章开头」的章都算上 ——
+    DB 里存的 ``spine_index`` 是 OPF 坐标（决策 146），与 reader 的压缩坐标
+    不是一套，不能再拿它直接查表。没有 epub 时才退回旧的按列查表。
 
-    翻译表本身就是一道闸：agent 凭空补出来的序号（被跳过的空页、不存在的位置）
-    在表里查不到，自然落不下去 —— 不必再单独校验。
+    翻译本身就是一道闸：agent 凭空补出来的序号（被跳过的空页、不存在的位置）
+    找不到任何章，自然落不下去 —— 不必再单独校验。
 
     写进覆盖层而非原表：重导入只刷新原表，便利贴不丢；``source`` 又能把
     机器判断和人手判断分开，撕的时候互不牵连（见 storage/db.py）。
     """
     chapters = data.get("chapters") or {}
+    rows = db.get_chapters(book_id)
     by_spine: dict[int, list[int]] = {}
-    for ch in db.get_chapters(book_id):
+    for ch in rows:
         if ch.spine_index >= 0:
             by_spine.setdefault(ch.spine_index, []).append(ch.chapter_index)
+    spine_texts = _spine_texts(epub_path) if epub_path else []
     wrote = skipped = 0
     for key, new in chapters.items():
         try:
@@ -104,7 +132,15 @@ def commit_overrides(db: BookDB, book_id: str, data: dict) -> tuple[int, int]:
         except (TypeError, ValueError):
             skipped += 1
             continue
-        targets = by_spine.get(idx)
+        if spine_texts and 0 <= idx < len(spine_texts):
+            text = spine_texts[idx]
+            targets = [
+                ch.chapter_index for ch in rows
+                if text and len(head := re.sub(r"\s+", "", ch.content or "")[:24]) >= 10
+                and head in text
+            ]
+        else:
+            targets = by_spine.get(idx, [])
         if not targets:
             skipped += 1
             continue
@@ -214,7 +250,7 @@ def main() -> int:
                   "   先跑：python scripts/reimport_books.py <书名>")
             return 2
         old_ch, old_tf = db.clear_agent_layer(book_id)   # 全量替换，不留残影
-        wrote, skipped = commit_overrides(db, book_id, data)
+        wrote, skipped = commit_overrides(db, book_id, data, epub)
         print(f"覆盖层：清掉旧 {old_ch} 条，写入 {wrote} 条"
               f"（source='agent'），跳过 {skipped} 条越界 index")
         print(f"文本形态：清掉旧 {old_tf} 条，"

@@ -8,7 +8,7 @@ mode_constraints: "immersive, overview"
 
 # 书籍库系统
 
-书伴有一个基于 SQLite 的本地书籍库，将 EPUB/MOBI 文件解析并存储为结构化数据，支持快速章节读取和跨书全文搜索。
+留白有一个基于 SQLite 的本地书籍库，将 EPUB/MOBI 文件解析并存储为结构化数据，支持快速章节读取和跨书全文搜索。
 
 ## Workflow Guidance
 

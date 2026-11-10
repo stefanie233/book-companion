@@ -36,6 +36,36 @@ class ToolExposure(Enum):
     HIDDEN = "hidden"
 
 
+# ── 异常 → 模型可读文案 ──────────────────────────────────────────────────
+
+#: ``str(exc)`` 为空串的异常 → 给模型的解释与下一步。
+#: 真实事故（2026-10-29 17:51）：写作草稿三次超时后抛 ``asyncio.TimeoutError()``，
+#: 工具结果只剩下 ``{"error": ""}``——模型既不知道原因，也无从补救，只能停嘴。
+_EMPTY_EXC_HINTS = {
+    "TimeoutError": "请求超时：模型或网络长时间没有响应。可重试一次；"
+                    "连续超时就把这次任务拆小（例如先写半章、缩小范围）。",
+    "CancelledError": "任务被取消，没有执行完。",
+    "ClientConnectionError": "连接被对端关闭。重试一次；仍失败就稍后再试。",
+    "ServerDisconnectedError": "服务端断开了连接。重试一次。",
+    "ClientConnectorError": "连不上服务端（网络或配置问题）。检查控制台的连接配置。",
+    "StopAsyncIteration": "上游流提前结束，没有拿到结果。重试一次。",
+    "AssertionError": "内部断言失败（这是 bug）。把刚才的操作记进 writing_report。",
+}
+
+
+def describe_exception(exc: BaseException) -> str:
+    """把任意异常压成「类型名 + 原因」，保证非空。
+
+    工具结果是回灌给模型的输入：空字符串等于让它盲猜。类型名让模型能区分
+    「超时 / 被拒 / 参数错」，提示语给它一个可执行的下一步。
+    """
+    name = type(exc).__name__
+    text = str(exc).strip()
+    if not text:
+        text = _EMPTY_EXC_HINTS.get(name, "没有附带错误信息")
+    return f"{name}: {text}"
+
+
 # ── Toolset labels for render_usage_guide ────────────────────────────────
 
 TOOLSET_LABELS: dict[str, str] = {
@@ -44,13 +74,15 @@ TOOLSET_LABELS: dict[str, str] = {
     "library_edit":  "书籍库管理 — 导入书籍、拆分章节、编辑元数据、删除与回滚",
     "knowledge":     "记忆与知识 — 搜索/写入个人记忆、网络搜索、查看历史会话",
     "utility":       "实用工具 — 时间、天气、搜索更多工具",
+    "self":          "自我说明 — 功能位置、配置状态与不可用原因",
+    "profile":       "身份资料 — 记录用户称呼、性别与你自己被起的名字",
     "agent":         "代理工具 — 创建子代理处理并行任务",
     "file_ops":      "文件操作 — 直接读写文件系统（仅限必要时使用）",
 }
 
 TOOLSET_ORDER: list[str] = [
     "file_reading", "library_query", "knowledge",
-    "utility", "library_edit", "file_ops", "agent",
+    "utility", "self", "profile", "library_edit", "file_ops", "agent",
 ]
 
 
@@ -115,23 +147,8 @@ class ToolRegistry:
         try:
             return spec.execute(**args)
         except Exception as exc:
-            return json.dumps({"error": str(exc)})
-
-    async def execute_async(self, name: str, input_json: str) -> str:
-        """Execute a tool (async path). Prefers execute_async, falls back to execute."""
-        spec = self._tools.get(name)
-        if not spec:
-            return json.dumps({"error": f"Unknown tool: {name}"})
-        try:
-            args = json.loads(input_json) if input_json.strip() else {}
-        except json.JSONDecodeError:
-            return json.dumps({"error": f"Invalid JSON input for tool '{name}'"})
-        try:
-            if spec.execute_async:
-                return await spec.execute_async(**args)
-            return spec.execute(**args)
-        except Exception as exc:
-            return json.dumps({"error": str(exc)})
+            return json.dumps({"error": describe_exception(exc)},
+                              ensure_ascii=False)
 
     def get_schemas(self) -> list[dict]:
         """Return OpenAI-compatible function definitions for visible tools only."""
@@ -161,7 +178,8 @@ class ToolRegistry:
                 return await spec.execute_async(**args)
             return spec.execute(**args)
         except Exception as exc:
-            return json.dumps({"error": str(exc)})
+            return json.dumps({"error": describe_exception(exc)},
+                              ensure_ascii=False)
 
     def get_permission_requirements(self) -> dict[str, PermissionMode]:
         """Return mapping of tool_name → required permission mode."""
@@ -183,6 +201,7 @@ class ToolRegistry:
         toolsets: list[str] | None = None,
         exclude_tools: set[str] | None = None,
         exclude_exposure: list[ToolExposure] | None = None,
+        include_tools: set[str] | None = None,
     ) -> "ToolRegistry":
         """Return a new ToolRegistry filtered by toolset, exclusions, and exposure.
 
@@ -192,6 +211,9 @@ class ToolRegistry:
         - ``exclude_tools`` → always excluded regardless of toolset
         - ``exclude_exposure`` → exclude tools with these exposure levels
           (e.g. ``[ToolExposure.DIRECT_MODEL_ONLY, ToolExposure.HIDDEN]`` for sub-agents)
+        - ``include_tools`` → name allowlist applied last; ``None`` = no allowlist.
+          用于「整个 toolset 里只放行一两个工具」的子代理（写作研究员只该看
+          检索，不该看落库/改稿）。
         """
         exclude = exclude_tools or set()
         exclude_exp = exclude_exposure or []
@@ -203,6 +225,8 @@ class ToolRegistry:
             if toolsets is not None and spec.toolset not in toolsets:
                 continue
             if exclude_exp and spec.exposure in exclude_exp:
+                continue
+            if include_tools is not None and name not in include_tools:
                 continue
             new_registry.register(spec)
         return new_registry

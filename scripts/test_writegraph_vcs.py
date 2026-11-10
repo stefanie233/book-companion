@@ -65,7 +65,7 @@ def _setup():
 def test_commit_and_status() -> None:
     db, svc, work = _setup()
     st = svc.vcs_status(work)
-    check("状态：无 HEAD 时两章都算新增", st["counts"]["added"], 2)
+    check("状态：无 HEAD 时两章都算新增", st["chapter_counts"]["added"], 2)
     check("状态：初始不干净", st["clean"], False)
 
     c1 = svc.vcs_commit(work, "初稿")
@@ -75,7 +75,7 @@ def test_commit_and_status() -> None:
 
     svc.save_content(work, 1, "第二稿\n第二行")
     st = svc.vcs_status(work)
-    check("状态：正文改动被列出", st["counts"]["changed"], 1)
+    check("状态：正文改动被列出", st["chapter_counts"]["changed"], 1)
     check("状态：账本没动", st["ledger_dirty"], False)
 
     ch1 = svc.chapter(work, 1)
@@ -93,7 +93,7 @@ def test_commit_and_status() -> None:
 
     diff = svc.vcs_diff(work, from_ref=c1["id"], to_ref=c2["id"],
                         chapter_id=ch1["id"], text=True)
-    check("差异：一章正文变了", diff["counts"]["changed"], 1)
+    check("差异：一章正文变了", diff["chapter_counts"]["changed"], 1)
     check("差异：文本里有新增行", "+第二稿" in diff["text_diff"], True)
     check("差异：合同变更被列出",
           len(diff["ledger"]["contracts"]["added"]), 1)
@@ -250,7 +250,7 @@ def test_partial_commit() -> None:
           tree[1]["content_hash"] != svc.chapter(work, 1)["content_hash"], True)
 
     st = svc.vcs_status(work)
-    check("部分提交：未提交的章仍然是脏的", st["counts"]["changed"], 1)
+    check("部分提交：未提交的章仍然是脏的", st["chapter_counts"]["changed"], 1)
     svc.vcs_commit(work, "再提交第一章")
     check("部分提交：补完就干净了", svc.vcs_status(work)["clean"], True)
 

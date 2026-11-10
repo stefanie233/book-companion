@@ -41,7 +41,7 @@ def _build_author_card(config, db, book_id: str, role_ref: str,
 
     ``role_ref`` 是 ``author_id``：给了就先按 id 取（它跨重导不变），
     没给才退回按名字解析。解析失败**不返回空串** —— 空 role_card 会让
-    ``_build_reading_prompt`` 悄悄退回书伴人格，而用户明明选了扮演。
+    ``_build_reading_prompt`` 悄悄退回留白人格，而用户明明选了扮演。
     改为给一张「台账里没有这个人」的卡片：扮演照常，但明确告诉模型
     **不要凭训练数据编造他的生平**（那正是作者层存在的理由）。
     """
@@ -131,7 +131,7 @@ def _build_reading_prompt(runtime, mode: str = "immersive", role_card: str = "",
       SOUL identity replaced by role card. Only SOUL's "## 边界" section
       is kept as a safety floor beneath the role card.
     """
-    from persona import load_persona
+    from persona import load_persona, onboarding_directive
 
     parts: list[str] = []
     is_role_play = bool(role_card)
@@ -167,9 +167,14 @@ def _build_reading_prompt(runtime, mode: str = "immersive", role_card: str = "",
         # Normal mode: full SOUL
         if runtime and hasattr(runtime, "config"):
             parts.append(load_persona(runtime.config))
+            # 初次见面引导：只在用户还没报上称呼时注入（每轮现算）。
+            # 扮演模式走上面的 role card 分支，不会问用户名字。
+            onboarding = onboarding_directive(runtime.config)
+            if onboarding:
+                parts.append(onboarding)
         else:
             parts.append(
-                "你是「书伴」，一个阅读陪伴助手。你陪用户一起读书，像朋友一样聊书中的人和事。"
+                "你是一个阅读陪伴助手。你陪用户一起读书，像朋友一样聊书中的人和事。"
             )
 
     # Interaction-mode overview (companion modes only — role-play is a persona)

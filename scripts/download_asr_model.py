@@ -1,4 +1,4 @@
-"""Download SenseVoiceSmall ONNX model for Book Companion ASR.
+"""Download SenseVoiceSmall ONNX model for Liubai ASR.
 
 Downloads only the 6 essential files (~231 MB total) from two ModelScope repos,
 avoiding the 936 MB PyTorch weight in the base repo.

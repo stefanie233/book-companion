@@ -212,8 +212,17 @@ def test_migration() -> None:
         _make_v1(path)
         adb = AuthorsDB(path)
         c = adb.get_conn()
-        check("迁移：版本=3", c.execute(
-            "SELECT MAX(version) FROM schema_version").fetchone()[0], 3)
+        check("迁移：版本=5", c.execute(
+            "SELECT MAX(version) FROM schema_version").fetchone()[0], 5)
+        ok("迁移：攻略表已建", c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='author_exploration_plan'").fetchone() is not None)
+        ok("迁移：观察表已建", c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='author_observations'").fetchone() is not None)
+        ok("迁移：钩子表已建", c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='author_hooks'").fetchone() is not None)
         check("迁移：语料行数不变", c.execute(
             "SELECT COUNT(*) FROM author_corpus").fetchone()[0], 1)
         row = c.execute("SELECT * FROM author_corpus WHERE id=7").fetchone()

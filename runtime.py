@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
+import chat_context
 from compact import (
     CompactionConfig,
     CompactionResult,
@@ -25,7 +26,7 @@ from compact import (
 )
 from context_files import discover_instruction_files, render_instruction_files
 from hooks import HookContext, HookPipeline
-from persona import load_persona
+from persona import load_persona, onboarding_directive
 from config import Config
 from content import ContentBlock, ConversationMessage, TokenUsage
 from memory_store import MemoryStore
@@ -37,6 +38,50 @@ from provider_store import config_for
 import usage_log
 
 logger = logging.getLogger(__name__)
+
+
+# ── 流式请求的超时口径 ──────────────────────────────────────────────────
+# ``total`` 是整条流的总预算，``sock_read`` 是两次收包之间的空闲上限。
+# 旧口径只有 ``total=120``：对话没问题，但写作一章是几千字的长流，2500 字
+# 正文 + 推理链必然撞线。2026-10-29 实测三次重试全超时，工具只拿到空错误。
+# 长的生成类调用改成「总时长不限、空闲有界」——真的卡住仍会超时，
+# 只是不再惩罚「一直在出字但还没写完」。
+#: ``connect`` 单独钉住：``total=None`` 时它没有兜底，DNS/TCP 卡住会一直挂着。
+_STREAM_TIMEOUT_LONG = {"total": None, "sock_read": 120, "connect": 30}
+_STREAM_TIMEOUT_DEFAULT = {"total": 120, "sock_read": 60, "connect": 30}
+
+#: 1 次首发 + 2 次重试。
+_STREAM_ATTEMPTS = 3
+
+#: 走长超时的调用点前缀。写作的正文/结算/修订都在这条线上。
+_STREAM_LONG_PREFIXES = ("writing",)
+
+
+def _stream_timeout(scenario: str):
+    """按调用点挑超时口径。返回 aiohttp.ClientTimeout。"""
+    import aiohttp
+
+    spec = (_STREAM_TIMEOUT_LONG
+            if str(scenario or "").startswith(_STREAM_LONG_PREFIXES)
+            else _STREAM_TIMEOUT_DEFAULT)
+    return aiohttp.ClientTimeout(**spec)
+
+
+class StreamTruncated(RuntimeError):
+    """输出撞上 ``max_tokens`` 上限（``finish_reason == "length"``）。
+
+    与 bookgraph 的 ``is_truncated`` 同一条判据（决策 62）：撞上限时端点
+    可能回半截正文，也可能推理吃光额度回空 —— 两种都不是「模型说完了」。
+    同样的预算重试是白费，只有加预算才有用，所以由**调用方**决定重试。
+    """
+
+    def __init__(self, scenario: str = "", chars: int = 0) -> None:
+        self.scenario = scenario
+        self.chars = chars
+        super().__init__(
+            f"输出被截断：撞上 max_tokens 上限（调用点 {scenario or 'chat'}，"
+            f"已收到 {chars} 字符）。同样预算重试没有用——要么提高预算重来，"
+            "要么把这次任务拆小。")
 
 
 # ── Traits (Python Protocols) ───────────────────────────────────────────
@@ -111,6 +156,7 @@ class OpenAIClient:
         tools: list[dict],
         cancel_event: asyncio.Event | None = None,
         scenario: str = "",
+        max_tokens: int | None = None,
     ) -> AsyncGenerator[tuple[str, list[dict], TokenUsage | None], None]:
         """Stream LLM response chunks asynchronously.
 
@@ -118,7 +164,8 @@ class OpenAIClient:
         Retries up to 2 times on transient network errors.
 
         ``scenario`` picks the routed endpoint (provider_store.config_for);
-        empty = the global config.
+        empty = the global config. ``max_tokens`` 不传就用端点的默认额度；
+        撞额度时抛 ``StreamTruncated``（不重试）。
         """
         import aiohttp
 
@@ -136,6 +183,8 @@ class OpenAIClient:
         }
         if tools:
             body["tools"] = tools
+        if max_tokens:
+            body["max_tokens"] = int(max_tokens)
 
         headers = {
             "Authorization": f"Bearer {cfg.api_key}",
@@ -145,7 +194,7 @@ class OpenAIClient:
 
         last_exc: Exception | None = None
         last_usage: TokenUsage | None = None
-        for attempt in range(3):  # 1 initial + 2 retries
+        for attempt in range(_STREAM_ATTEMPTS):  # 1 initial + 2 retries
             if attempt > 0:
                 await asyncio.sleep(attempt)
             try:
@@ -154,7 +203,7 @@ class OpenAIClient:
                         f"{cfg.api_base}/chat/completions",
                         json=body,
                         headers=headers,
-                        timeout=aiohttp.ClientTimeout(total=120),
+                        timeout=_stream_timeout(scenario),
                     ) as resp:
                         if resp.status != 200:
                             error_text = await resp.text()
@@ -163,6 +212,8 @@ class OpenAIClient:
                         text_parts: list[str] = []
                         tool_calls_acc: dict[int, dict] = {}
                         reasoning_open = False    # track <think> tag state
+                        finish = ""               # 端点的 finish_reason
+                        stream_chars = 0          # 已收到的字符数（报截断用）
                         last_usage = None         # per-attempt: only a fully
                                                   # consumed stream yields usage
 
@@ -210,6 +261,11 @@ class OpenAIClient:
                                     yield "", _build_tool_calls(tool_calls_acc), usage
                                 continue
                             delta = choices[0].get("delta", {})
+                            # finish_reason 只在收尾那个 chunk 上出现；
+                            # "length" = 撞 max_tokens（bookgraph 同款判据）。
+                            _fr = choices[0].get("finish_reason")
+                            if _fr:
+                                finish = str(_fr)
 
                             text_delta = ""
                             # Capture reasoning/thinking content (DeepSeek)
@@ -245,6 +301,7 @@ class OpenAIClient:
                                     if func.get("arguments"):
                                         tool_calls_acc[idx]["arguments"] += func["arguments"]
 
+                            stream_chars += len(text_delta)
                             # Usage was parsed above the choices guard.
                             yield text_delta, _build_tool_calls(tool_calls_acc), usage
 
@@ -259,14 +316,29 @@ class OpenAIClient:
                         tokens_in=last_usage.input_tokens,
                         tokens_out=last_usage.output_tokens,
                     )
-                return  # success
+                if finish != "length":
+                    return  # success
+                truncated_chars = stream_chars
             except Exception as exc:
                 last_exc = exc
                 if cancel_event and cancel_event.is_set():
                     return
                 continue
+            # 撞上限不重试：同样的预算再来一遍只会再撞一次，
+            # 重试与否、加多少预算由调用方决定。
+            raise StreamTruncated(scenario=scenario, chars=truncated_chars)
 
         usage_log.record(model=cfg.model, status="error")  # all retries exhausted
+        if last_exc is None:
+            raise RuntimeError("流式请求失败：没有拿到任何响应")
+        # 空消息异常（``TimeoutError()`` 的 ``str()`` 就是空串）原样抛出去，
+        # 工具层只能得到 ``{"error": ""}``——模型既不知道原因也没法补救。
+        # 这里补上调用点与可执行的下一步，让上层至少有话可说。
+        if not str(last_exc).strip():
+            raise RuntimeError(
+                f"流式请求连续 {_STREAM_ATTEMPTS} 次失败："
+                f"{type(last_exc).__name__}（调用点 {scenario or 'chat'}）。"
+                "可重试一次；仍失败就把这次任务拆小。") from last_exc
         raise last_exc  # type: ignore[misc]
 
     async def complete(
@@ -582,6 +654,10 @@ class ConversationRuntime:
         """
         self._streaming = True
         self._compacted_this_turn = 0
+        # 身份变更日志据此记录「从哪次对话得到」；finally 里恢复，
+        # 避免子代理的 session 覆盖父回合的归属。
+        import identity_log
+        _identity_token = identity_log.enter_session(self.session.session_id)
         try:
             # pre_turn hook
             await self.hook_pipeline.dispatch("pre_turn", HookContext(
@@ -630,18 +706,8 @@ class ConversationRuntime:
                         "content": _block,
                     })
 
-            # ── Ephemeral context: transient info for this turn only ─────
-            # Injected as a user message (not system prompt) so it doesn't
-            # break prefix caching.  The <ephemeral-context> tag tells the
-            # model this is per-turn metadata, not conversation history.
-            _ephemeral_text = (
-                "<ephemeral-context>\n"
-                f"Current date: {time.strftime('%Y-%m-%d')}\n"
-                f"Current time: {time.strftime('%H:%M:%S')}\n"
-                "</ephemeral-context>"
-            )
-            _injected_parts.append(_ephemeral_text)
-            api_messages.append({"role": "user", "content": _ephemeral_text})
+            # 输入时间不再单独发一条 ephemeral 消息：它挂在每条 user
+            # 消息后面（chat_context.with_input_time），历史里也带着。
             _post_inject = len(api_messages)  # context-meter boundary
             _injected_text = "\n\n".join(_injected_parts)
 
@@ -941,6 +1007,7 @@ class ConversationRuntime:
                     pass
 
         finally:
+            identity_log.exit_session(_identity_token)
             self._streaming = False
             await self.hook_pipeline.dispatch("post_turn", HookContext(
                 user_input=user_input, session_id=self.session.session_id,
@@ -1032,7 +1099,7 @@ class ConversationRuntime:
           6. Frozen memory blocks (MEMORY.md / persona.md / USER.md)
 
         Ephemeral (per-turn, injected as user message, not here):
-          - Current date / time → <ephemeral-context>
+          - 输入时间 → 挂在每条 user 消息末尾（不再单独发 ephemeral 条）
           - ContextBrief 小纸条   → <memory-context>
         """
         static_parts: list[str] = []
@@ -1045,6 +1112,11 @@ class ConversationRuntime:
 
         # A. Identity — personality, voice, judgment, boundaries (SOUL.md)
         static_parts.append(load_persona(self.config))
+        # 首次启用：用户还没报上称呼时，邀请 agent 自然地问一次。
+        # 每轮现算，资料一填上就不再出现。
+        onboarding = onboarding_directive(self.config)
+        if onboarding:
+            static_parts.append(onboarding)
 
         # B. Available skills (L0: name + description, always visible)
         if self._skills_enabled:
@@ -1168,6 +1240,10 @@ class ConversationRuntime:
 
         # Simple text message
         text = msg.first_text() or ""
+        if msg.role == "user" and text and int(msg.time_created or 0):
+            # 每轮输入后面挂本地时间（周几 + 时区），换算由代码做。
+            # 没有时间戳的旧消息不补当前时间。
+            text = chat_context.with_input_time(text, msg.time_created)
         return {"role": msg.role, "content": text}
 
 

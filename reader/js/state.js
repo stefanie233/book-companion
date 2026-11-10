@@ -1,4 +1,4 @@
-/* Book Companion — shared application state.
+/* Liubai — shared application state.
  *
  * All mutable shared state lives here. Modules import { S } and use
  * S.currentBook / S.currentMode / etc.  Assignments work because S is
@@ -30,6 +30,10 @@ export const S = {
   currentChapter: 0,
   currentChunk: 0,
   totalChunks: 0,
+  // 全书进度：chapter_index → 本章之前的 chunk 累计；bookChunkTotal 是全书总数。
+  // selectBook() 从 /context 的 structure 算好后写入，chunk/native 两种模式共用。
+  bookChunkOffsets: null,
+  bookChunkTotal: 0,
   prevAnchor: null,
   nextAnchor: null,
   renderMode: 'chunk',            // 'chunk' (fallback text view) | 'native' (epub.js scrolled)
@@ -56,7 +60,15 @@ export const S = {
   visibleChapters: [],
 
   // ── Chat / mode ───────────────────────────────────────────────
+  agentName: '留白',              // 主题页可改；由 /api/agent 同步
+  agentAvatarUrl: '',             // 用户上传的 agent 头像；空 = 不显示
+  userName: '',                   // 自己的称呼；/api/user 同步，空 = 未设置
+  userGender: '',                 // 自己的性别：'' 未设置 / 'male' / 'female'
+  userAvatarUrl: '',              // 自己的头像；空 = 不显示
   currentMode: 'immersive',
+  // 写作页子模式：standard=高效 / detail=细致（决策 161）。只在空白会话
+  // 里由预选药丸设置，开始对话后固定；之后只能由 agent 经作者授权切换。
+  writingMode: 'standard',
   currentCharacterName: '',
   currentRoleKind: 'character',   // 'character'=图谱实体 | 'author'=作者层
   currentRoleRef: '',             // author 时是 author_id（稳定主键）

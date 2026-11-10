@@ -128,9 +128,9 @@
 {
     "verdict": "upheld | challenged | inconclusive",
     "fixes": [
-        {"id": "E7", "action": "reverse", "why": "被冷落的是沈砚：原文是掌柜挨个点名，独独没喊他。", "evidence": "掌柜把伙计挨个叫了一遍，独独没喊他。"},
+        {"id": "E7", "action": "reverse", "why": "被冷落的是人物A：原文是掌柜挨个点名，独独没喊他。", "evidence": "掌柜把伙计挨个叫了一遍，独独没喊他。"},
         {"id": "O3", "action": "retype", "patch": {"event_type": "perspective", "subject": "同铺的伙计"}, "why": "「偷懒」只是伙计的揣测，叙述者从未确证。", "evidence": "“师父跟前那人，从早到晚没动过手。”"},
-        {"id": "E2", "action": "drop", "why": "正文里没有「祁元郎」这个写法，本批通篇是「祁元朗」。", "evidence": ""}
+        {"id": "E2", "action": "drop", "why": "正文里没有「人物B」的另一种写法，本批通篇用同一个写法。", "evidence": ""}
     ],
     "summary": "一句话：这批断言整体可不可信，主要问题在哪"
 }

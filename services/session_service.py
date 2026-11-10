@@ -64,13 +64,17 @@ class SessionService:
     def list(self, *, limit: int = 100, offset: int = 0,
              root_only: bool = False, search: str | None = None,
              project_id: str | None = None,
-             character_name: str | None = None) -> list[SessionInfo]:
+             character_name: str | None = None,
+             mode: str | None = None,
+             exclude_mode: str | None = None,
+             work_id: str | None = None) -> list[SessionInfo]:
         """List sessions (metadata only, no messages)."""
         rows = self._db.list_sessions(
             limit=limit, offset=offset,
             root_only=root_only, search=search,
             project_id=project_id,
             character_name=character_name,
+            mode=mode, exclude_mode=exclude_mode, work_id=work_id,
         )
         return [self._row_to_info(r) for r in rows]
 
@@ -88,9 +92,12 @@ class SessionService:
         """Batch count direct children for multiple parents."""
         return self._db.count_children_batch(parent_ids)
 
-    def search_content(self, query: str, limit: int = 10) -> list[dict]:
+    def search_content(self, query: str, limit: int = 10,
+                       mode: str | None = None,
+                       exclude_mode: str | None = None) -> list[dict]:
         """Full-text search across session messages (FTS5 + LIKE fallback)."""
-        return self._db.search_session_content(query, limit=limit)
+        return self._db.search_session_content(
+            query, limit=limit, mode=mode, exclude_mode=exclude_mode)
 
     def load_messages(self, session_id: str, *,
                       dispatch_hooks: bool = True) -> Session | None:
@@ -157,6 +164,29 @@ class SessionService:
 
         return session
 
+    # ── Compaction checkpoints ────────────────────────────────────────────
+
+    def latest_compaction(self, session_id: str) -> dict | None:
+        """最近一次压缩的 checkpoint（前缀摘要 + 覆盖到第几条历史）。"""
+        return self._db.latest_compaction(session_id)
+
+    def record_compaction(self, session_id: str, ck) -> None:
+        """持久化一次压缩。``ck`` 是 context_compaction.CompactionCheckpoint。
+
+        摘要必须逐字稳定：它进每次请求的前缀，重写会让缓存从摘要处整段
+        失效。所以这里只插入，不更新旧行。
+        """
+        self._db.insert_compaction(
+            session_id,
+            seq=int(getattr(ck, "seq", 0) or 0),
+            raw_count=int(getattr(ck, "raw_count", 0) or 0),
+            summary=str(getattr(ck, "summary", "") or ""),
+            dropped_count=int(getattr(ck, "dropped_count", 0) or 0),
+            tokens_before=int(getattr(ck, "tokens_before", 0) or 0),
+            tokens_after=int(getattr(ck, "tokens_after", 0) or 0),
+            trigger=str(getattr(ck, "trigger", "auto") or "auto"),
+        )
+
     def save(self, session: Session) -> None:
         """Full persist: upsert session metadata + all messages."""
         # on_session_save hook (fire synchronously since hooks may be async)
@@ -206,6 +236,7 @@ class SessionService:
     def append_message(self, session_id: str, message: ConversationMessage,
                         *, mode: str | None = None, title: str | None = None,
                         project_id: str | None = None,
+                        work_id: str | None = None,
                         character_name: str | None = None,
                         role_kind: str | None = None,
                         role_ref: str | None = None) -> str:
@@ -216,8 +247,8 @@ class SessionService:
 
         Updates session's message_count and time_updated along the way.
         If the session row doesn't exist yet, ``mode``, ``title``,
-        ``project_id``, ``character_name``, ``role_kind`` and ``role_ref``
-        are written in the initial INSERT.
+        ``project_id``/``work_id``, ``character_name``, ``role_kind`` and
+        ``role_ref`` are written in the initial INSERT.
         """
         # Ensure session row exists (it may have been created in-memory
         # only, deferred from create() to avoid empty-session clutter).
@@ -225,6 +256,7 @@ class SessionService:
             self._db.insert_session(SessionRow(
                 id=session_id,
                 project_id=project_id or "",
+                work_id=work_id or "",
                 mode=mode or "immersive",
                 title=title,
                 character_name=character_name or "",
@@ -355,6 +387,11 @@ class SessionService:
         srow = SessionRow(
             id=child.session_id,
             project_id=parent_row.project_id if parent_row else "",
+            work_id=parent_row.work_id if parent_row else "",
+            writing_mode=(getattr(parent_row, "writing_mode", "standard")
+                          if parent_row else "standard"),
+            auto_mode_switch=(int(getattr(parent_row, "auto_mode_switch", 0))
+                              if parent_row else 0),
             character_name=parent_row.character_name if parent_row else "",
             model=child.model,
             mode=child.mode,
@@ -557,6 +594,9 @@ class SessionService:
         return SessionInfo(
             id=row.id,
             project_id=row.project_id,
+            work_id=row.work_id or "",
+            writing_mode=getattr(row, "writing_mode", "standard") or "standard",
+            auto_mode_switch=int(getattr(row, "auto_mode_switch", 0) or 0),
             title=row.title,
             model=row.model,
             mode=row.mode,

@@ -97,8 +97,11 @@ def compact_session(session: Session, config: CompactionConfig) -> CompactionRes
         mode=session.mode,
         prompt_history=list(session.prompt_history),
     )
-    if session._persistence_path:
-        new_session._persistence_path = session._persistence_path
+    # 子代理用裸 Session()（没有持久化路径）；不能直接取属性，否则一旦
+    # 触发压缩就 AttributeError —— 子代理的错误只会变成一句空泛的失败。
+    path = getattr(session, "_persistence_path", None)
+    if path:
+        new_session._persistence_path = path
 
     return CompactionResult(
         summary=summary,

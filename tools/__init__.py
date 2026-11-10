@@ -9,13 +9,19 @@ from __future__ import annotations
 from permissions import PermissionMode
 from tools.author import _deepen_store, _deepen_task, _remember_page
 from tools.builtin import create_builtin_registry
-from tools.registry import ToolExposure, ToolSpec, ToolRegistry
+from tools.registry import (
+    ToolExposure,
+    ToolSpec,
+    ToolRegistry,
+    describe_exception,
+)
 
 __all__ = [
     "PermissionMode",
     "ToolExposure",
     "ToolSpec",
     "ToolRegistry",
+    "describe_exception",
     "create_builtin_registry",
     "_deepen_store",
     "_deepen_task",

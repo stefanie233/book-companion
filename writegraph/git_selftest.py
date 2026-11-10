@@ -22,7 +22,7 @@ PROMPT = (
 )
 
 STEPS: list[dict[str, Any]] = [
-    # ── A 基础：提交 / 单章历史 / 修正 ──────────────────────────────────
+    # ── A 基础：存档 / 单章历史 / 修正 ──────────────────────────────────
     {
         "id": "A1", "phase": "A 基础",
         "title": "建立自测工作区",
@@ -50,7 +50,7 @@ STEPS: list[dict[str, Any]] = [
     },
     {
         "id": "A3", "phase": "A 基础",
-        "title": "工作区改动与提交",
+        "title": "工作区改动与存档",
         "do": [
             {"tool": "writing_replace_text",
              "args": {"chapter_index": 1, "anchor_quote": "风从码头来",
@@ -63,7 +63,7 @@ STEPS: list[dict[str, Any]] = [
         ],
         "pass": [
             "替换后 status.clean=false，changes.changed 里正好 1 章",
-            "提交返回 status.clean=true，commit.message 以 A3 开头",
+            "存档返回 status.clean=true，commit.message 以 A3 开头",
         ],
     },
     {
@@ -84,7 +84,7 @@ STEPS: list[dict[str, Any]] = [
     },
     {
         "id": "A5", "phase": "A 基础",
-        "title": "修正上一次提交（amend）",
+        "title": "修正上一次存档（amend）",
         "do": [
             {"tool": "writing_replace_text",
              "args": {"chapter_index": 1, "anchor_quote": "他数着潮声",
@@ -101,7 +101,7 @@ STEPS: list[dict[str, Any]] = [
             "history 仍然是 2 条，没有被 amend 出第三条",
             "HEAD 的 message 以 A5 开头，且包含刚补的正文",
             "clean=true",
-            "reflog 里有一条 reason=amend，from 是旧提交 id",
+            "reflog 里有一条 reason=amend，from 是旧存档 id",
         ],
     },
     # ── B 分支 / 差异 / 合并 ────────────────────────────────────────────
@@ -124,7 +124,7 @@ STEPS: list[dict[str, Any]] = [
         ],
         "pass": [
             "branch_create 返回 switched=true、status.branch=岔路A",
-            "提交返回 clean=true；最后这次 status 里 branches 的岔路A "
+            "存档返回 clean=true；最后这次 status 里 branches 的岔路A "
             "is_head=true",
         ],
     },
@@ -160,20 +160,20 @@ STEPS: list[dict[str, Any]] = [
     },
     {
         "id": "B4", "phase": "B 分支与合并",
-        "title": "摘取岔路的一次提交（cherry-pick）",
+        "title": "摘取岔路的一次存档（cherry-pick）",
         "do": [
             {"tool": "writing_git", "args": {"action": "log",
                                              "work_id": "$seed.work_id",
                                              "all_branches": True}},
             {"tool": "writing_git_change",
              "args": {"action": "cherry_pick", "work_id": "$seed.work_id",
-                      "commit_id": "$B4.岔路A最新提交id"}},
+                      "commit_id": "$B4.岔路A最新存档id"}},
         ],
         "pass": [
             "摘取返回的 chapters 里第 1 章正文=「岔路甲」"
             "（看 head/tail，不用再读整章）",
             "返回 commit.kind=cherry-pick，status.clean=true",
-            "岔路A 的提交仍在（前面的 log --all 里能看到）",
+            "岔路A 的存档仍在（前面的 log --all 里能看到）",
         ],
     },
     {
@@ -184,7 +184,7 @@ STEPS: list[dict[str, Any]] = [
              "args": {"action": "branch_create", "work_id": "$seed.work_id",
                       "name": "快进路", "switch": True}},
             {"tool": "writing_replace_text",
-             "args": {"chapter_index": 2, "anchor_quote": "老周没有抬头",
+             "args": {"chapter_index": 2, "anchor_quote": "配角没有抬头",
                       "replacement": "快进戊"}},
             {"tool": "writing_git_change",
              "args": {"action": "commit", "work_id": "$seed.work_id",
@@ -200,7 +200,7 @@ STEPS: list[dict[str, Any]] = [
             "合并返回 fast_forward=true，status.clean=true",
             "合并返回的 chapters 里第 2 章正文=「快进戊」"
             "（看 head/tail，不用再读整章）",
-            "main 的 head 与 快进路 的 tip 是同一个提交"
+            "main 的 head 与 快进路 的 tip 是同一个存档"
             "（status.branch / status.head 能核对）",
         ],
     },
@@ -289,7 +289,7 @@ STEPS: list[dict[str, Any]] = [
     },
     {
         "id": "C3", "phase": "C 撤销与恢复",
-        "title": "撤销某一次提交（revert）",
+        "title": "撤销某一次存档（revert）",
         "do": [
             {"tool": "writing_replace_text",
              "args": {"chapter_index": 2, "anchor_quote": "快进戊",
@@ -307,11 +307,11 @@ STEPS: list[dict[str, Any]] = [
         "pass": [
             "第一次 revert 返回的 chapters 里第 2 章回到「快进戊」",
             "返回的 commit.kind=revert、parent_id 非空（历史没被抹掉，"
-            "是新提交反向撤销）",
-            "再次撤销同一提交返回错误「已经撤销过了」，不是再产生一条空提交",
+            "是新存档反向撤销）",
+            "再次撤销同一存档返回错误「已经撤销过了」，不是再产生一条空存档",
         ],
-        "note": "$C3.commit.id 是「C3：这一版要撤销」那条提交的 id"
-                "（第一次 revert 返回的是新提交，别拿错）；不要为了取号再查 log。",
+        "note": "$C3.commit.id 是「C3：这一版要撤销」那条存档的 id"
+                "（第一次 revert 返回的是新存档，别拿错）；不要为了取号再查 log。",
     },
     {
         "id": "C4", "phase": "C 撤销与恢复",
@@ -335,13 +335,13 @@ STEPS: list[dict[str, Any]] = [
             "返回的 commit.kind=restore，status.clean=true",
             "再次回滚到同一版返回「已经在目标状态上」",
         ],
-        "note": "C4.commit.parent_id 是「C4：这一版写坏了」那条提交的"
+        "note": "C4.commit.parent_id 是「C4：这一版写坏了」那条存档的"
                 " parent_id（= 改坏之前的 HEAD；第一次 restore 的返回值别拿）；"
                 "不要再查 log，也不用读整章。",
     },
     {
         "id": "C5", "phase": "C 撤销与恢复",
-        "title": "只丢弃一章的未提交改动",
+        "title": "只丢弃一章的未存档改动",
         "do": [
             {"tool": "writing_replace_text",
              "args": {"chapter_index": 3, "anchor_quote": "主线庚",
@@ -390,9 +390,9 @@ STEPS: list[dict[str, Any]] = [
             "stash_pop 返回的 chapters 里「船期写在木牌上（暂存）」回来，"
             "同时「快进戊（暂存后）」没被退回",
             "stash_list 变空；stash_pop 的 status.clean=false、"
-            "counts.changed=1（暂存内容回到工作区，尚未提交——pop 不是丢弃）",
+            "counts.changed=1（暂存内容回到工作区，尚未存档——pop 不是丢弃）",
         ],
-        "note": "这一条专门盯「整树覆盖」回归：恢复暂存不能把暂存之后提交的改动吃掉。",
+        "note": "这一条专门盯「整树覆盖」回归：恢复暂存不能把暂存之后存档的改动吃掉。",
     },
     {
         "id": "D2", "phase": "D 收尾",
@@ -491,13 +491,13 @@ STEPS: list[dict[str, Any]] = [
             {"tool": "writing_replace_text",
              "args": {"chapter_index": 1,
                       "anchor_quote": "他数着潮声",
-                      "replacement": "他数着潮声（检查点路提交）"}},
+                      "replacement": "他数着潮声（检查点路存档）"}},
             {"tool": "writing_git_change",
              "args": {"action": "commit", "work_id": "$seed.work_id",
-                      "message": "D5：检查点路先提交"}},
+                      "message": "D5：检查点路先存档"}},
             {"tool": "writing_replace_text",
              "args": {"chapter_index": 1,
-                      "anchor_quote": "他数着潮声（检查点路提交）",
+                      "anchor_quote": "他数着潮声（检查点路存档）",
                       "replacement": "他数着潮声（未保存）"}},
             {"tool": "writing_git_change",
              "args": {"action": "branch_switch", "work_id": "$seed.work_id",
@@ -509,7 +509,7 @@ STEPS: list[dict[str, Any]] = [
                                              "work_id": "$seed.work_id"}},
         ],
         "pass": [
-            "branch_switch 成功切回 main；切走前的未提交改动被自动提交成"
+            "branch_switch 成功切回 main；切走前的未存档改动被自动存档成"
             "检查点（留在检查点路）",
             "force 删除检查点路后，返回 recovered_tag=lost-检查点路",
             "tags 里有 lost-检查点路，指向那个检查点；不能静默丢掉未保存改动",
@@ -567,7 +567,7 @@ def plan(phase: str = "", step: str = "") -> dict[str, Any]:
                 f"未知阶段：{phase}；可选 A / B / C / D（"
                 + "、".join(_PHASES.values()) + "）")
     out = {
-        "goal": "按「作者会怎么用」验证写作 git：提交、分支、合并、冲突、"
+        "goal": "按「作者会怎么用」验证写作 git：存档、分支、合并、冲突、"
                 "撤销、回滚、暂存、标签、reflog，以及每条指令的失败保护。",
         "rules": [
             "只在 selftest_seed 新建的临时作品里操作",

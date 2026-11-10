@@ -156,6 +156,19 @@ def _unit_checks() -> None:
                      "content": '{"now":1}'}, repr(api[2]))
     check("重建：中断注记拼在用户消息前",
           api[4]["content"].startswith("上一轮被打断"), repr(api[4]))
+    check("重建：没有时间戳的用户消息不挂时间",
+          api[0]["content"] == "第一问", repr(api[0]))
+
+    # ── 输入时间：本地可读（周几 + UTC 偏移），不要求模型换算 ──
+    stamped_msgs = [ConversationMessage(
+        role="user", time_created=1_700_000_000_000,
+        blocks=[ContentBlock(type="text", text="带时间的问句")])]
+    stamped = chat_context.session_messages_to_api(stamped_msgs)[0]["content"]
+    check("输入时间：挂在用户消息末尾",
+          stamped.startswith("带时间的问句\n\n（输入时间："), stamped)
+    check("输入时间：含周几与 UTC",
+          "周" in stamped and "UTC" in stamped, stamped)
+    check("输入时间：空文本不挂", chat_context.with_input_time("") == "", True)
 
     # ── 预算裁剪：在回合边界切，不切开 call/output ─────────────
     long_msgs = [
